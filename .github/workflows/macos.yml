@@ -20,13 +20,35 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: macos-14
+    # macos-15 is the current Apple Silicon image with Xcode 16 / Swift 6.
+    # macos-14 is deprecated and can resolve to Swift 5.10, which cannot
+    # build this package's swift-tools-version: 6.0 manifest.
+    runs-on: macos-15
     env:
       RELEASE_VERSION: ${{ startsWith(github.ref_name, 'v') && github.ref_name || inputs.version }}
       BUILD_NUMBER: ${{ github.run_number }}
       SHOULD_PUBLISH: ${{ github.event_name == 'push' || inputs.publish == true }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select and verify Swift 6 toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_app="$(ls -d /Applications/Xcode_16*.app /Applications/Xcode.app 2>/dev/null | head -1 || true)"
+          if [[ -z "$xcode_app" ]]; then
+            echo "Xcode 16 is required for swift-tools-version 6.0." >&2
+            ls -d /Applications/Xcode*.app 2>/dev/null || true
+            exit 1
+          fi
+          sudo xcode-select --switch "$xcode_app/Contents/Developer"
+          xcodebuild -version
+          swift --version
+          swift_major="$(swift --version | sed -nE 's/.*Swift version ([0-9]+).*/\1/p' | head -1)"
+          if [[ -z "$swift_major" || "$swift_major" -lt 6 ]]; then
+            echo "Swift 6 or newer is required; detected: $(swift --version)" >&2
+            exit 1
+          fi
 
       - name: Resolve release version
         id: version
