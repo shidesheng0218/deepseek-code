@@ -10,7 +10,7 @@ on:
         required: true
         default: "0.1.0"
       publish:
-        description: "Sign, notarize and publish a GitHub Release"
+        description: "Publish a GitHub Release; signing and notarization are optional"
         required: true
         type: boolean
         default: false
@@ -40,8 +40,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Release version: $version"
 
-      - name: Import Developer ID certificate
-        if: env.SHOULD_PUBLISH == 'true'
+      - name: Import Developer ID certificate when configured
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -49,8 +48,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -z "$APPLE_CERTIFICATE_BASE64" && -z "$APPLE_CERTIFICATE_PASSWORD" && -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            echo "No Developer ID certificate configured; this run will publish a GitHub ad-hoc build."
+            echo "HAS_DEVELOPER_ID=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
           if [[ -z "$APPLE_CERTIFICATE_BASE64" || -z "$APPLE_CERTIFICATE_PASSWORD" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
-            echo "Missing Developer ID signing secrets." >&2
+            echo "Developer ID secrets are incomplete; provide all three or none." >&2
             exit 1
           fi
           keychain_password="$(openssl rand -hex 24)"
@@ -66,6 +70,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain_path"
           echo "APPLE_CODESIGN_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
           echo "DEEPSEEK_BUILD_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "HAS_DEVELOPER_ID=1" >> "$GITHUB_ENV"
 
       - name: Run Swift checks
         run: npm test
@@ -73,26 +78,28 @@ jobs:
       - name: Verify persistent SSH terminal loopback
         run: ./scripts/verify-ssh-loopback-terminal.sh
 
-      - name: Package signed DMG
-        if: env.SHOULD_PUBLISH == 'true'
+      - name: Package GitHub DMG
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          RELEASE_VERSION="${{ steps.version.outputs.version }}" \
-          BUILD_NUMBER="$BUILD_NUMBER" \
-          APPLE_CODESIGN_IDENTITY="$APPLE_CODESIGN_IDENTITY" \
-          NOTARIZE=1 \
-          "$GITHUB_WORKSPACE/scripts/package-macos-release.sh"
-
-      - name: Package unsigned test DMG
-        if: env.SHOULD_PUBLISH != 'true'
-        run: |
-          RELEASE_VERSION="${{ steps.version.outputs.version }}" \
-          BUILD_NUMBER="$BUILD_NUMBER" \
-          ALLOW_ADHOC_RELEASE=1 \
-          "$GITHUB_WORKSPACE/scripts/package-macos-release.sh"
+          set -euo pipefail
+          package_args=(
+            "RELEASE_VERSION=${{ steps.version.outputs.version }}"
+            "BUILD_NUMBER=$BUILD_NUMBER"
+          )
+          if [[ "${HAS_DEVELOPER_ID:-0}" == "1" ]]; then
+            package_args+=("APPLE_CODESIGN_IDENTITY=$APPLE_CODESIGN_IDENTITY")
+            if [[ -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
+              package_args+=("NOTARIZE=1")
+            else
+              package_args+=("NOTARIZE=0")
+            fi
+          else
+            package_args+=("DISTRIBUTION_LABEL=github-adhoc")
+          fi
+          env "${package_args[@]}" "$GITHUB_WORKSPACE/scripts/package-macos-release.sh"
 
       - name: Verify DMG and checksums
         env:

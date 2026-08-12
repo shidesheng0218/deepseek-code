@@ -11,12 +11,11 @@ if [[ ! -x "$PACKAGE_SCRIPT" ]]; then
   exit 1
 fi
 
-if RELEASE_VERSION=9.8.7 BUILD_NUMBER=123 RELEASE_OUTPUT_DIR="$WORK_DIR/unsigned" "$PACKAGE_SCRIPT" >/dev/null 2>&1; then
-  echo "Release packager accepted an unsigned production build" >&2
+if REQUIRE_DEVELOPER_ID_SIGNATURE=1 RELEASE_VERSION=9.8.7 BUILD_NUMBER=123 RELEASE_OUTPUT_DIR="$WORK_DIR/strict" "$PACKAGE_SCRIPT" >/dev/null 2>&1; then
+  echo "Release packager accepted a strict unsigned build" >&2
   exit 1
 fi
 
-ALLOW_ADHOC_RELEASE=1 \
 RELEASE_VERSION=9.8.7 \
 BUILD_NUMBER=123 \
 RELEASE_OUTPUT_DIR="$WORK_DIR/unsigned" \
@@ -34,6 +33,16 @@ hdiutil imageinfo "$DMG" >/dev/null
 grep -F "DeepSeek-Code-9.8.7-arm64.dmg" "$CHECKSUMS" >/dev/null
 grep -F '"marketingVersion": "9.8.7"' "$METADATA" >/dev/null
 grep -F '"buildNumber": "123"' "$METADATA" >/dev/null
-grep -F '"distribution": "local-adhoc-test"' "$METADATA" >/dev/null
+grep -F '"distribution": "github-adhoc"' "$METADATA" >/dev/null
+
+RELEASE_VERSION=9.8.7 \
+BUILD_NUMBER=124 \
+RELEASE_OUTPUT_DIR="$WORK_DIR/github-adhoc" \
+DISTRIBUTION_LABEL=github-adhoc \
+"$PACKAGE_SCRIPT"
+
+GITHUB_METADATA="$WORK_DIR/github-adhoc/release-metadata.json"
+grep -F '"buildNumber": "124"' "$GITHUB_METADATA" >/dev/null
+grep -F '"distribution": "github-adhoc"' "$GITHUB_METADATA" >/dev/null
 
 echo "GitHub release packaging checks passed"

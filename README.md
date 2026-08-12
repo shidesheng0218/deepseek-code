@@ -46,7 +46,7 @@ swift run DeepSeekCode
 
 构建产物位于 `dist/DeepSeek Code.app`；设置 `APPLE_CODESIGN_IDENTITY` 后脚本会执行 Hardened Runtime 签名。
 
-当前 SwiftUI 工程可使用 Command Line Tools 编译。正式用户下载版不走 App Store，而是通过 GitHub Releases 发布 `.dmg`：
+当前 SwiftUI 工程可使用 Command Line Tools 编译。用户下载版不走 App Store，而是通过 GitHub Releases 发布 `.dmg`：
 
 ```bash
 RELEASE_VERSION=0.1.0 \
@@ -62,13 +62,13 @@ NOTARIZE=1 \
 - `SHA256SUMS.txt`：下载完整性校验；
 - `release-metadata.json`：版本、构建号、签名/公证状态。
 
-没有 Developer ID 时只能使用 `ALLOW_ADHOC_RELEASE=1` 生成开发测试包。该包不适合作为普通用户正式下载版，macOS 可能显示“无法验证开发者”；不要把它标记为正式 Release。
+没有 Developer ID 时也可以发布 GitHub Release。该包会标记为 `github-adhoc`，用户首次打开可能需要右键“打开”，或在“系统设置 → 隐私与安全性”中确认。配置 Developer ID 后，包会标记为 `developer-id-signed-unnotarized`；同时配置公证凭据后，包会标记为 `developer-id-notarized`。
 
-GitHub Actions 在推送 `v*.*.*` 标签时自动执行 Swift 检查、SSH 回环验证、Developer ID 签名、公证、DMG 打包和 GitHub Release 上传。仓库需要配置以下 Secrets：
+GitHub Actions 在推送 `v*.*.*` 标签时自动执行 Swift 检查、SSH 回环验证、DMG 打包和 GitHub Release 上传。Developer ID 签名和 Apple 公证是可选增强项：
 
 `APPLE_CERTIFICATE_BASE64`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_TEAM_ID`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`。
 
-其中 `.p12` 证书只以 Base64 Secret 保存，不要提交到仓库。也可以将公证凭据改为 runner Keychain 中的 `NOTARYTOOL_KEYCHAIN_PROFILE`，避免使用 Apple ID 专用密码。
+其中 `.p12` 证书只以 Base64 Secret 保存，不要提交到仓库。没有这些 Secrets 时，Actions 仍会发布 `github-adhoc` 下载包；只配置证书会发布已签名但未公证的包；配置证书和 Apple 公证凭据才会发布公证包。
 
 本地发布工件可用以下命令验收：
 

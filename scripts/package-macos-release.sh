@@ -5,8 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_VERSION="${RELEASE_VERSION:-}"
 BUILD_NUMBER="${BUILD_NUMBER:-}"
 RELEASE_OUTPUT_DIR="${RELEASE_OUTPUT_DIR:-$ROOT_DIR/dist/release}"
-ALLOW_ADHOC_RELEASE="${ALLOW_ADHOC_RELEASE:-0}"
 NOTARIZE="${NOTARIZE:-0}"
+REQUIRE_DEVELOPER_ID_SIGNATURE="${REQUIRE_DEVELOPER_ID_SIGNATURE:-0}"
+DISTRIBUTION_LABEL="${DISTRIBUTION_LABEL:-}"
 
 if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
   echo "RELEASE_VERSION must be a SemVer-like value such as 0.1.0." >&2
@@ -18,14 +19,13 @@ if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-if [[ "$ALLOW_ADHOC_RELEASE" != "1" && -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
-  echo "Refusing to create a distributable release without a Developer ID signature." >&2
-  echo "Set APPLE_CODESIGN_IDENTITY, or use ALLOW_ADHOC_RELEASE=1 only for local testing." >&2
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNATURE" == "1" && -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+  echo "A Developer ID signature is required by this invocation." >&2
   exit 1
 fi
 
-if [[ "$NOTARIZE" == "1" && "$ALLOW_ADHOC_RELEASE" == "1" ]]; then
-  echo "An ad-hoc signed build cannot be notarized." >&2
+if [[ "$NOTARIZE" == "1" && -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+  echo "Notarization requires APPLE_CODESIGN_IDENTITY." >&2
   exit 1
 fi
 
@@ -42,7 +42,7 @@ trap 'rm -rf "$DMG_ROOT"' EXIT
 
 BUILD_VERSION_OVERRIDE="$BUILD_NUMBER" \
 MARKETING_VERSION="$RELEASE_VERSION" \
-REQUIRE_DEVELOPER_ID_SIGNATURE="$([[ "$ALLOW_ADHOC_RELEASE" == "1" ]] && echo 0 || echo 1)" \
+REQUIRE_DEVELOPER_ID_SIGNATURE="$REQUIRE_DEVELOPER_ID_SIGNATURE" \
 APPLE_CODESIGN_IDENTITY="${APPLE_CODESIGN_IDENTITY:-}" \
 "$ROOT_DIR/scripts/build-macos-app.sh"
 
@@ -81,12 +81,14 @@ hdiutil create \
   -ov \
   "$DMG_PATH" >/dev/null
 
-if [[ "$ALLOW_ADHOC_RELEASE" == "1" ]]; then
-  DISTRIBUTION="local-adhoc-test"
+if [[ -n "$DISTRIBUTION_LABEL" ]]; then
+  DISTRIBUTION="$DISTRIBUTION_LABEL"
 elif [[ "$NOTARIZED" == "true" ]]; then
   DISTRIBUTION="developer-id-notarized"
-else
+elif [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
   DISTRIBUTION="developer-id-signed-unnotarized"
+else
+  DISTRIBUTION="github-adhoc"
 fi
 
 (
