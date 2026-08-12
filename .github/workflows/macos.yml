@@ -127,7 +127,18 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/release/* --clobber
           else
-            gh release create "$tag" dist/release/* --generate-notes --title "DeepSeek Code ${{ steps.version.outputs.version }}"
+            distribution="$(python3 - <<'PY'
+          import json
+          with open('dist/release/release-metadata.json', encoding='utf-8') as f:
+              print(json.load(f)['distribution'])
+          PY
+          )"
+            case "$distribution" in
+              developer-id-notarized) title="DeepSeek Code ${{ steps.version.outputs.version }}";;
+              developer-id-signed-unnotarized) title="DeepSeek Code ${{ steps.version.outputs.version }} (Signed)";;
+              *) title="DeepSeek Code ${{ steps.version.outputs.version }} (Community)";;
+            esac
+            gh release create "$tag" dist/release/* --generate-notes --title "$title"
           fi
 
       - name: Clean temporary keychain

@@ -4,6 +4,19 @@
 
 > 这是一个非官方开源项目，与 DeepSeek 无隶属关系。
 
+## 下载使用
+
+普通用户不需要安装 Node、Swift，也不需要运行终端命令：
+
+1. 打开 [GitHub Releases](https://github.com/shidesheng0218/deepseek-code/releases/latest)。
+2. 下载 `DeepSeek-Code-<version>-arm64.dmg`。
+3. 打开 DMG，把 **DeepSeek Code.app** 拖到 **Applications**，然后双击启动。
+4. 首次启动如果 macOS 提示无法验证开发者，右键 App 选择“打开”，确认一次即可；这只适用于未配置 Apple Developer ID 的社区构建。
+
+启动后只需配置 **Base URL、API Key 和项目目录**。开发工具链和发布流程由项目维护者处理，用户不需要配置证书、公证或 GitHub Actions。
+
+当前 Release 是 Apple Silicon（arm64）版本，要求 macOS 14 或更高版本。
+
 ## 当前产品真源
 
 正式产品是 **SwiftUI + DeepSeekCodeCore 的原生 macOS App**，面向 Apple Silicon、macOS 14+。
