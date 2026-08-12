@@ -1,0 +1,93 @@
+{
+  "tools": [
+    {
+      "name": "network.authorize",
+      "purpose": "Evaluate an outbound request against persisted domain grants and return an auditable allow, approval-required, or block decision.",
+      "category": "security",
+      "inputs": [
+        {"name": "scope", "type": "string", "description": "Network capability", "required": true, "enum": ["model_provider", "web_search", "web_fetch", "browser", "mcp", "github", "ssh", "scheduled"]},
+        {"name": "url", "type": "string", "description": "Absolute request URL", "required": true, "pattern": "^https?://"},
+        {"name": "operation", "type": "string", "description": "Read, write, upload, login, or delivery operation", "required": true, "enum": ["read", "write", "upload", "login", "delivery"]}
+      ],
+      "outputs": [{"name": "decision", "type": "string", "description": "allow, require_approval, or block"}],
+      "error_conditions": ["Unsafe URL scheme", "Private address", "Expired grant", "Budget exceeded"],
+      "side_effects": ["Writes a redacted authorization event"],
+      "idempotent": true,
+      "rate_limits": {"requests_per_minute": 240, "requests_per_hour": 5000, "burst_limit": 30},
+      "dependencies": ["network_policy_store", "permission_broker"],
+      "examples": [{"description": "External documentation fetch", "input": {"scope": "web_fetch", "url": "https://docs.example.com/guide", "operation": "read"}, "expected_output": {"decision": "require_approval"}}],
+      "security_requirements": ["Redact query values", "Do not log credentials", "Block SSRF targets"]
+    },
+    {
+      "name": "web.search",
+      "purpose": "Search a configured public search provider and return normalized result evidence.",
+      "category": "network",
+      "inputs": [
+        {"name": "query", "type": "string", "description": "Search query", "required": true, "min_length": 1, "max_length": 500},
+        {"name": "max_results", "type": "integer", "description": "Maximum normalized results", "required": false, "default": 8, "minimum": 1, "maximum": 20},
+        {"name": "provider", "type": "string", "description": "Configured provider identifier", "required": false}
+      ],
+      "outputs": [{"name": "results", "type": "array", "description": "Normalized title, URL, snippet, and source metadata"}],
+      "error_conditions": ["No approved provider", "Rate limited", "Malformed provider response"],
+      "side_effects": ["Stores cacheable redacted search evidence"],
+      "idempotent": true,
+      "rate_limits": {"requests_per_minute": 20, "requests_per_hour": 200, "burst_limit": 4},
+      "dependencies": ["network_runtime", "search_provider_registry"],
+      "examples": [{"description": "Search framework docs", "input": {"query": "SwiftUI NavigationSplitView documentation", "max_results": 5}, "expected_output": {"results": []}}],
+      "security_requirements": ["L2 approval for untrusted domains", "No credential forwarding", "Prompt-injection labeling"]
+    },
+    {
+      "name": "web.fetch",
+      "purpose": "Fetch a public document, enforce redirect and size limits, extract readable text, and return source evidence.",
+      "category": "network",
+      "inputs": [
+        {"name": "url", "type": "string", "description": "Approved public HTTPS URL", "required": true, "pattern": "^https://"},
+        {"name": "max_bytes", "type": "integer", "description": "Response ceiling", "required": false, "default": 524288, "minimum": 1024, "maximum": 2097152}
+      ],
+      "outputs": [{"name": "document", "type": "object", "description": "URL, content type, extracted text, redirect chain, hash, and timestamps"}],
+      "error_conditions": ["SSRF target", "Redirect escape", "Content too large", "Unsupported content type"],
+      "side_effects": ["Stores cacheable document evidence"],
+      "idempotent": true,
+      "rate_limits": {"requests_per_minute": 12, "requests_per_hour": 120, "burst_limit": 3},
+      "dependencies": ["network_runtime", "content_extractor"],
+      "examples": [{"description": "Read a release note", "input": {"url": "https://example.com/release-notes"}, "expected_output": {"document": {}}}],
+      "security_requirements": ["L2 approval", "Sanitize HTML", "Never execute page scripts"]
+    },
+    {
+      "name": "ssh.execute",
+      "purpose": "Execute a structured remote Tool Host request without sending model credentials or raw shell text.",
+      "category": "remote",
+      "inputs": [
+        {"name": "host_id", "type": "string", "description": "Previously fingerprint-verified SSH host", "required": true},
+        {"name": "tool", "type": "string", "description": "Registered remote tool name", "required": true},
+        {"name": "arguments", "type": "object", "description": "Validated structured tool arguments", "required": true}
+      ],
+      "outputs": [{"name": "result", "type": "object", "description": "Redacted remote output and process evidence"}],
+      "error_conditions": ["Fingerprint changed", "Tunnel lost", "Remote operation indeterminate"],
+      "side_effects": ["May change the selected remote workspace"],
+      "idempotent": false,
+      "rate_limits": {"requests_per_minute": 60, "requests_per_hour": 1000, "burst_limit": 10},
+      "dependencies": ["ssh_connection_manager", "permission_broker", "event_store"],
+      "examples": [{"description": "Read a remote file", "input": {"host_id": "dev-box", "tool": "read_file", "arguments": {"path": "README.md"}}, "expected_output": {"result": {}}}],
+      "security_requirements": ["Fingerprint pinning", "No API key forwarding", "Needs-attention on disconnect"]
+    },
+    {
+      "name": "github.delivery",
+      "purpose": "Perform an approved push, PR, CI status, or review operation and return delivery evidence.",
+      "category": "delivery",
+      "inputs": [
+        {"name": "operation", "type": "string", "description": "GitHub delivery operation", "required": true, "enum": ["view_pr", "view_checks", "push", "create_pr", "reply_review"]},
+        {"name": "repository", "type": "string", "description": "Repository identity", "required": true},
+        {"name": "payload", "type": "object", "description": "Operation-specific validated arguments", "required": true}
+      ],
+      "outputs": [{"name": "evidence", "type": "object", "description": "PR URL, CI/review status, and sanitized logs"}],
+      "error_conditions": ["gh unauthenticated", "Push rejected", "CI unavailable", "External write denied"],
+      "side_effects": ["May push commits, create PRs, or send comments"],
+      "idempotent": false,
+      "rate_limits": {"requests_per_minute": 30, "requests_per_hour": 300, "burst_limit": 5},
+      "dependencies": ["github_cli_or_mcp", "verification_graph", "network_policy"],
+      "examples": [{"description": "Inspect CI", "input": {"operation": "view_checks", "repository": "owner/repo", "payload": {"pr": 12}}, "expected_output": {"evidence": {}}}],
+      "security_requirements": ["L2 approval for writes", "L4 block force push", "Never log gh token"]
+    }
+  ]
+}

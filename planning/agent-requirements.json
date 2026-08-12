@@ -1,0 +1,56 @@
+{
+  "goal": "Build a DeepSeek-first macOS coding agent whose verified task completion, local transparency, Chinese UX, and cost efficiency exceed Claude Code Desktop while remaining safe and recoverable.",
+  "tasks": [
+    "Understand repository and user intent",
+    "Create editable plan and obtain approval",
+    "Implement multi-file code changes",
+    "Run tests, lint, build, and repair failures",
+    "Validate web UI in an isolated browser",
+    "Review diff and apply line-level feedback",
+    "Commit, push, and continue from CI or review feedback",
+    "Persist checkpoints, context, cost, and recovery state"
+  ],
+  "constraints": {
+    "max_response_time": 3000,
+    "budget_per_task": 1.0,
+    "quality_threshold": 0.9,
+    "concurrent_tasks": 3,
+    "data_retention_days": 3650,
+    "security_level": "high",
+    "compliance_requirements": ["local-first", "BYOK", "auditability"]
+  },
+  "team_size": 3,
+  "description": "A native macOS local-first coding agent that can understand a repository, plan, edit, test, validate in a browser, review, recover, and deliver changes. It must use one write-owning main agent with bounded read-only specialists, DeepSeek-native model routing, strict tool contracts, checkpoints, budgets, and human approval for risky actions.",
+  "performance_requirements": {
+    "high_throughput": false,
+    "fault_tolerance": true,
+    "low_latency": true,
+    "scalability": "small desktop installation with up to three concurrent sessions",
+    "availability": 0.99
+  },
+  "safety_requirements": [
+    "One write owner per workspace",
+    "Path and symlink escape prevention",
+    "Approval for high-risk commands and network access",
+    "Sandbox required for Auto mode",
+    "Checkpoint before mutation",
+    "Secret redaction and Keychain-only API keys",
+    "Audit every tool call and permission decision"
+  ],
+  "integration_requirements": [
+    "DeepSeek OpenAI-compatible and Anthropic-compatible APIs",
+    "Native macOS Keychain and SQLite event store",
+    "Git and managed Worktrees",
+    "PTY terminal and isolated browser controller",
+    "Skills, MCP, Hooks, GitHub CLI/MCP, SSH Tool Host",
+    "macOS notifications and signed auto-updating app"
+  ],
+  "scale_requirements": {
+    "initial_users": 1,
+    "peak_concurrent_users": 1,
+    "data_volume_gb": 50,
+    "requests_per_hour": 120,
+    "geographic_regions": ["local"],
+    "growth_projection": "personal developer product with optional open-source community"
+  }
+}

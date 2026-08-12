@@ -1,0 +1,74 @@
+import { describe, expect, test } from 'vitest';
+import { AgentExecutor } from '../../src/core/agent-executor';
+
+describe('agent executor', () => {
+  test('emits an auditable event for each tool and completes after the model responds', async () => {
+    const events: string[] = [];
+    let call = 0;
+    const executor = new AgentExecutor({
+      mode: 'accept_edits',
+      model: {
+        stream: async function* () {
+          call += 1;
+          if (call === 1) yield { type: 'tool_call', id: 'read-1', name: 'read_file', arguments: { path: 'README.md' } } as const;
+          else yield { type: 'text_delta', text: '完成' } as const;
+        }
+      },
+      tools: { read_file: async () => 'README content' },
+      onEvent: (event) => events.push(event.type)
+    });
+
+    await executor.run('s1', '读取 README');
+
+    expect(events).toEqual(['tool_requested', 'tool_started', 'tool_completed', 'assistant_text', 'completed']);
+  });
+
+  test('stops at an approval request instead of pretending the tool ran', async () => {
+    const executor = new AgentExecutor({
+      mode: 'manual',
+      model: { stream: async function* () { yield { type: 'tool_call', id: 'patch-1', name: 'apply_patch', arguments: {} } as const; } },
+      tools: { apply_patch: async () => 'changed' }
+    });
+
+    const result = await executor.run('s1', '修改文件');
+
+    expect(result.status).toBe('waiting_approval');
+    expect(result.messages.at(-1)?.content).toContain('APPROVAL_REQUIRED');
+  });
+
+  test('passes command text into the permission classifier before execution', async () => {
+    const executor = new AgentExecutor({
+      mode: 'auto',
+      model: { stream: async function* () { yield { type: 'tool_call', id: 'cmd-1', name: 'run_command', arguments: { command: 'npm install react' } } as const; } },
+      tools: { run_command: async () => 'installed' }
+    });
+
+    const result = await executor.run('s1', '安装依赖');
+
+    expect(result.status).toBe('waiting_approval');
+  });
+
+  test('feeds a tool result back into the model before completing the task', async () => {
+    const requests: Array<{ role: string; content: string }> = [];
+    let call = 0;
+    const executor = new AgentExecutor({
+      mode: 'accept_edits',
+      model: {
+        stream: async function* (messages) {
+          requests.push(...messages.filter((message) => message.role === 'tool' || message.role === 'user'));
+          call += 1;
+          if (call === 1) yield { type: 'tool_call', id: 'read-1', name: 'read_file', arguments: { path: 'README.md' } } as const;
+          else yield { type: 'text_delta', text: '已读取 README，任务可以继续。' } as const;
+        }
+      },
+      tools: {
+        read_file: async (input) => ({ ok: true, content: `content:${String(input.path)}` })
+      }
+    });
+
+    const result = await executor.run('s1', '读取 README 并总结项目');
+
+    expect(result.text).toContain('已读取 README');
+    expect(requests).toContainEqual({ role: 'tool', content: 'content:README.md', toolCallId: 'read-1' });
+  });
+});

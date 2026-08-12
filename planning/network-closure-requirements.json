@@ -1,0 +1,60 @@
+{
+  "goal": "Turn DeepSeek Code's partial outbound capabilities into one local-first, auditable, recoverable network control plane for model providers, web research, Browser, MCP, GitHub, SSH, and Scheduled Tasks.",
+  "description": "The desktop Agent must allow useful online development workflows without leaking credentials, bypassing approval, losing evidence, or replaying unknown side effects. One main Agent remains the sole writer; read-only network workers return structured evidence.",
+  "tasks": [
+    "Classify and authorize every outbound operation by capability, destination, risk, and approval grant",
+    "Route model streaming, web search/fetch, Browser, MCP HTTP, GitHub CLI/API, SSH tunnels, and scheduled executions through shared lifecycle events",
+    "Persist network grants, request evidence, usage, retries, cancellation, and indeterminate outcomes in SQLite",
+    "Provide per-domain allow-once, session, project, and deny controls with an inspectable UI",
+    "Support multiple web-search providers and content extraction without hard-coding one external service",
+    "Register SSH Tool Hosts into live Sessions while keeping model API keys and audit data local",
+    "Return GitHub PR, CI, and review results into the Verification Graph and repair workflow",
+    "Ensure Scheduled Tasks only run pre-authorized low-risk online actions and stop for new side effects",
+    "Provide network cost, latency, rate-limit, and failure observability with safe degradation",
+    "Recover safely after application, provider, MCP, GitHub, browser, or SSH failures"
+  ],
+  "constraints": {
+    "max_response_time": 2000,
+    "budget_per_task": 0.25,
+    "quality_threshold": 0.9,
+    "concurrent_tasks": 3,
+    "data_retention_days": 30,
+    "security_level": "high",
+    "compliance_requirements": ["local-first", "BYOK", "credential-minimization", "auditability"]
+  },
+  "team_size": 4,
+  "performance_requirements": {
+    "high_throughput": false,
+    "fault_tolerance": true,
+    "low_latency": true,
+    "scalability": "single-user desktop",
+    "availability": 0.95
+  },
+  "safety_requirements": [
+    "Deny non-HTTP(S) and private-network web requests unless explicitly scoped to a local development target",
+    "Never persist API keys, OAuth tokens, SSH private keys, or unredacted authorization headers",
+    "Require approval for external domains, uploads, login, publishing, push, PR creation, and non-idempotent calls",
+    "Do not automatically replay indeterminate writes or network side effects",
+    "Enforce per-session budgets, output caps, redirect checks, rate limits, and cancellation",
+    "Record redacted request metadata and verification evidence for every network operation"
+  ],
+  "integration_requirements": [
+    "SQLite Event Store and Verification Graph",
+    "macOS Keychain",
+    "SwiftUI network access and evidence UI",
+    "Tool Registry, Permission Broker, Hook Runner, and Session Orchestrator",
+    "DeepSeek/OpenAI-compatible provider adapter",
+    "MCP stdio and Streamable HTTP",
+    "GitHub CLI or GitHub MCP",
+    "SSH Tool Host and local Browser Controller",
+    "LaunchAgent Scheduler and macOS notifications"
+  ],
+  "scale_requirements": {
+    "initial_users": 1,
+    "peak_concurrent_users": 1,
+    "data_volume_gb": 2,
+    "requests_per_hour": 500,
+    "geographic_regions": ["local-mac"],
+    "growth_projection": "feature-depth before user-scale"
+  }
+}
