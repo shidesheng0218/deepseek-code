@@ -124,6 +124,9 @@ public struct ProcessSSHRemoteTransport: SSHRemoteTransport {
             process.standardInput = input
             process.standardOutput = output
             process.standardError = errors
+            // Draining must start before the process runs, otherwise remote
+            // responses larger than the 64KB pipe buffer block ssh forever.
+            let drainer = ProcessOutputDrainer(stdout: output, stderr: errors)
             try process.run()
             try input.fileHandleForWriting.write(contentsOf: JSONEncoder().encode(request) + Data([0x0A]))
             try input.fileHandleForWriting.close()
@@ -133,8 +136,9 @@ public struct ProcessSSHRemoteTransport: SSHRemoteTransport {
                 process.terminate()
                 return RemoteToolResponse(id: request.id, ok: false, output: "SSH 请求超时", indeterminate: true)
             }
-            let stdout = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            let stderr = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let drained = drainer.joined()
+            let stdout = String(decoding: drained.stdout, as: UTF8.self)
+            let stderr = String(decoding: drained.stderr, as: UTF8.self)
             guard process.terminationStatus == 0 else {
                 return RemoteToolResponse(id: request.id, ok: false, output: stderr.isEmpty ? stdout : stderr, indeterminate: false)
             }

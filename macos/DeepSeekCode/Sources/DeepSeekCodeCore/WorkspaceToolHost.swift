@@ -268,7 +268,9 @@ public final class WorkspaceToolHost: @unchecked Sendable {
         process.standardOutput = output
         process.standardError = errors
         process.environment = sanitizedEnvironment()
-
+        // Draining must start before the process runs: a process producing
+        // more than the ~64KB pipe buffer blocks forever while we wait.
+        let drainer = ProcessOutputDrainer(stdout: output, stderr: errors)
         let completion = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in completion.signal() }
         try process.run()
@@ -277,8 +279,9 @@ public final class WorkspaceToolHost: @unchecked Sendable {
             _ = completion.wait(timeout: .now() + 2)
             throw WorkspaceToolError.commandTimedOut
         }
-        let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let drained = drainer.joined()
+        let stdout = String(data: drained.stdout, encoding: .utf8) ?? ""
+        let stderr = String(data: drained.stderr, encoding: .utf8) ?? ""
         return CommandOutput(command: command, stdout: stdout, stderr: stderr, exitCode: process.terminationStatus, risk: CommandPolicy.classify(command))
     }
 

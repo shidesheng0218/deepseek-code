@@ -110,6 +110,10 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
                 causationID: input.id
             )
         } catch is CancellationError {
+            // A stopped run must never leave its input promoted, otherwise the
+            // next start would silently replay the cancelled prompt and the
+            // newest user message could never run.
+            _ = try? repository.cancelSessionInput(id: input.id)
             _ = try? repository.appendDurable(
                 sessionID: session.id,
                 type: "daemon_execution_stopped",
@@ -117,6 +121,9 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
                 commandID: "daemon-stop-\(runID)"
             )
         } catch {
+            // A failed run also consumes its input so a retry does not replay
+            // the failed prompt while newer user messages are pending.
+            _ = try? repository.markSessionInputConsumed(id: input.id)
             _ = try? repository.appendDurable(
                 sessionID: session.id,
                 type: "agent_failed",
@@ -165,5 +172,8 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
         guard activeRunIDs[sessionID] == runID else { return }
         activeRunIDs.removeValue(forKey: sessionID)
         tasks.removeValue(forKey: sessionID)
+        // A stopped control can never be resumed; drop it so the next start
+        // builds a fresh control instead of failing at the first boundary.
+        controls.removeValue(forKey: sessionID)
     }
 }

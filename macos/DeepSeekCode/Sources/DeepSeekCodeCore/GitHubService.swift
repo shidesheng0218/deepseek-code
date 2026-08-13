@@ -55,6 +55,10 @@ public struct ProcessGitHubCommandRunner: GitHubCommandRunning {
             process.currentDirectoryURL = workingDirectory
             process.standardOutput = output
             process.standardError = errors
+            // Draining must start before the process runs, otherwise large
+            // outputs (e.g. `gh run view --log-failed`) fill the 64KB pipe
+            // buffer and the process blocks forever.
+            let drainer = ProcessOutputDrainer(stdout: output, stderr: errors)
             try process.run()
             let deadline = Date().addingTimeInterval(timeout)
             while process.isRunning && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
@@ -62,8 +66,9 @@ public struct ProcessGitHubCommandRunner: GitHubCommandRunning {
                 process.terminate()
                 throw UnifiedRuntimeError.remote("GitHub CLI 请求超时")
             }
-            let stdout = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            let stderr = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let drained = drainer.joined()
+            let stdout = String(decoding: drained.stdout, as: UTF8.self)
+            let stderr = String(decoding: drained.stderr, as: UTF8.self)
             guard process.terminationStatus == 0 else { throw UnifiedRuntimeError.remote(stderr.isEmpty ? stdout : stderr) }
             return stdout
         }.value

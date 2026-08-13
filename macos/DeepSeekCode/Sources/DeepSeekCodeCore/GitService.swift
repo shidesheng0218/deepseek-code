@@ -103,7 +103,7 @@ public final class GitService: @unchecked Sendable {
             }
     }
 
-    private func run(arguments: [String]) throws -> (stdout: String, stderr: String, exitCode: Int32) {
+    private func run(arguments: [String], timeout: TimeInterval = 60) throws -> (stdout: String, stderr: String, exitCode: Int32) {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -112,10 +112,18 @@ public final class GitService: @unchecked Sendable {
         process.currentDirectoryURL = root
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        let drainer = ProcessOutputDrainer(stdout: stdoutPipe, stderr: stderrPipe)
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
         try process.run()
-        process.waitUntilExit()
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            _ = finished.wait(timeout: .now() + 2)
+            throw GitError(command: arguments.joined(separator: " "), detail: "Git 命令超时（\(Int(timeout))s）")
+        }
+        let output = drainer.joined()
+        let stdout = String(data: output.stdout, encoding: .utf8) ?? ""
+        let stderr = String(data: output.stderr, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else { throw GitError(command: arguments.joined(separator: " "), detail: stderr) }
         return (stdout, stderr, process.terminationStatus)
     }

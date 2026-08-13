@@ -1454,7 +1454,7 @@ public struct WebToolHost: ToolHost {
             throw UnifiedRuntimeError.invalidArguments
         }
         switch tool.name {
-        case "web_search":
+        case "web.search":
             let query = (arguments["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !query.isEmpty else { throw UnifiedRuntimeError.invalidArguments }
             let context = NetworkContext(sessionID: sessionID, projectID: projectID, purpose: .researchSearch, requestedBy: "main-agent")
@@ -1468,7 +1468,7 @@ public struct WebToolHost: ToolHost {
                 ),
                 context: context
             )
-        case "web_fetch":
+        case "web.fetch":
             guard let rawURL = arguments["url"] as? String,
                   let url = URL(string: rawURL) else { throw UnifiedRuntimeError.invalidArguments }
             return try await fetch(url: url, context: NetworkContext(sessionID: sessionID, projectID: projectID, purpose: .researchFetch, requestedBy: "main-agent"))

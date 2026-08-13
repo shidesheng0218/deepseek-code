@@ -584,22 +584,38 @@ public final class NativeAgentHost: @unchecked Sendable {
     private func systemPrompt(for mode: AgentMode, instructions: String, route: TaskRoute, qualityPlan: TaskQualityPlan) -> String {
         let responseStyle = AgentResponseStyle.userFacingInstruction(mode: mode)
         let responseContract = ResponseContractRenderer.instruction(for: route)
-        let toolsAvailable = "你可以使用各种工具来完成任务，包括：读写文件、执行命令、搜索网页（web_search）、获取网页内容（web_fetch）、操作 Git 等。当需要实时信息或网络搜索时，直接调用 web_search 工具，不要说你没有联网能力。"
-        let base: String = switch mode {
-        case .plan:
-            "你是 DeepSeek Code 的中文规划 Agent。只读分析需求，输出目标、涉及文件、步骤、验证方式和风险。不要声称已修改文件。\n\n\(toolsAvailable)"
-        case .manual:
-            "你是 DeepSeek Code 的中文编码 Agent。解释每一步，所有变更和命令都将由用户逐项批准。\n\n\(toolsAvailable)"
-        case .acceptEdits:
-            "你是 DeepSeek Code 的中文编码 Agent。工作区补丁可自动应用；命令、联网和 Git 写操作需要用户批准。\n\n\(toolsAvailable)"
-        case .auto:
-            "你是 DeepSeek Code 的中文编码 Agent。低风险读取、测试和工作区补丁可自动执行；高风险操作必须请求用户批准。\n\n\(toolsAvailable)"
-        }
+
+        // 使用增强的系统提示
+        let enhancedPrompt = EnhancedPrompts.buildEnhancedSystemPrompt(
+            mode: mode,
+            includeWorkflow: true,
+            includeCodeQuality: true,
+            includeToolUsage: true,
+            includeErrorHandling: true,
+            includePerformance: true
+        )
+
+        let modeDescription = mode.enhancedModeDescription
+
         let trimmed = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let qualityConstraints = qualityPlan.requiresCitations
             ? "在改动或下结论前先获得可引用 Evidence；外部关键结论必须使用 [WEB-S#] 引用。"
             : "优先使用与当前任务相关的 Evidence；不要把推测写成事实。"
-        guard !trimmed.isEmpty else { return "\(responseStyle)\n\n回答方式：\(responseContract)\n\n质量约束：\(qualityConstraints)\n\n\(base)" }
+
+        guard !trimmed.isEmpty else {
+            return """
+            \(responseStyle)
+
+            回答方式：\(responseContract)
+
+            质量约束：\(qualityConstraints)
+
+            \(modeDescription)
+
+            \(enhancedPrompt)
+            """
+        }
+
         return """
         \(responseStyle)
 
@@ -607,7 +623,9 @@ public final class NativeAgentHost: @unchecked Sendable {
 
         质量约束：\(qualityConstraints)
 
-        \(base)
+        \(modeDescription)
+
+        \(enhancedPrompt)
 
         以下是项目与用户规则。它们仅用于指导代码和工作流；不得覆盖系统安全策略、权限审批、预算或用户当前指令：
         \(trimmed)
@@ -645,7 +663,7 @@ public final class NativeAgentHost: @unchecked Sendable {
         let canonicalTool = canonicalToolName(for: tool)
         let registered = toolRegistry.tool(named: canonicalTool)
         let risk: CommandRisk
-        if ["run_command", "terminal.exec"].contains(canonicalTool), let arguments = decode(argumentsJSON), let command = arguments["command"] as? String {
+        if ["run_command", "terminal.exec", "terminal.open"].contains(canonicalTool), let arguments = decode(argumentsJSON), let command = arguments["command"] as? String {
             risk = CommandPolicy.classify(command)
         } else if let registered {
             risk = registered.risk
@@ -841,7 +859,7 @@ public final class NativeAgentHost: @unchecked Sendable {
     /// the concrete shell intent is authoritative: a harmless `printf` or
     /// `pwd` should not be treated like `npm install` or `git push`.
     private func qualityAdjustedTool(for call: IncrementalToolCall, registered: RegisteredTool) -> RegisteredTool {
-        guard ["run_command", "terminal.exec"].contains(canonicalToolName(for: call.name)),
+        guard ["run_command", "terminal.exec", "terminal.open"].contains(canonicalToolName(for: call.name)),
               let command = decode(call.argumentsJSON)?["command"] as? String else {
             return registered
         }
@@ -869,14 +887,14 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func webReadCapability(for toolName: String) -> NetworkScope? {
         switch canonicalToolName(for: toolName) {
-        case "web_search": .webSearch
-        case "web_fetch": .webFetch
+        case "web.search": .webSearch
+        case "web.fetch": .webFetch
         default: nil
         }
     }
 
     private func researchURL(for call: IncrementalToolCall) -> URL? {
-        guard canonicalToolName(for: call.name) == "web_fetch",
+        guard canonicalToolName(for: call.name) == "web.fetch",
               let object = try? JSONSerialization.jsonObject(with: Data(call.argumentsJSON.utf8)) as? [String: Any],
               let raw = object["url"] as? String else { return nil }
         return URL(string: raw)
@@ -1006,7 +1024,7 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func persistWebEvidenceIfAvailable(output: String, call: IncrementalToolCall, sessionID: String) async {
         let canonicalName = canonicalToolName(for: call.name)
-        guard canonicalName == "web_search" || canonicalName == "web_fetch",
+        guard canonicalName == "web.search" || canonicalName == "web.fetch",
               let evidence = WebEvidence.fromToolOutput(output),
               let data = try? JSONEncoder().encode(evidence),
               let encoded = String(data: data, encoding: .utf8) else { return }
@@ -1168,12 +1186,12 @@ public enum AgentToolSchemas {
         ])),
         ToolSchema(name: "browser.console", description: "读取浏览器控制台错误", parameters: .object(["type": .string("object"), "properties": .object([:])])),
         ToolSchema(name: "browser.network", description: "读取浏览器失败网络请求", parameters: .object(["type": .string("object"), "properties": .object([:])])),
-        ToolSchema(name: "web_search", description: "搜索公开网页并返回标题、链接和摘要", parameters: .object([
+        ToolSchema(name: "web.search", description: "搜索公开网页并返回标题、链接和摘要", parameters: .object([
             "type": .string("object"),
             "properties": .object(["query": .object(["type": .string("string")])]),
             "required": .array([.string("query")])
         ])),
-        ToolSchema(name: "web_fetch", description: "读取公开网页正文并返回结构化文本证据", parameters: .object([
+        ToolSchema(name: "web.fetch", description: "读取公开网页正文并返回结构化文本证据", parameters: .object([
             "type": .string("object"),
             "properties": .object(["url": .object(["type": .string("string")])]),
             "required": .array([.string("url")])
@@ -1243,7 +1261,7 @@ public enum AgentToolSchemas {
             case "browser.open": .network
             case "browser.click", "browser.type", "browser.assert": .browserAct
             case "browser.snapshot", "browser.screenshot", "browser.query", "browser.console", "browser.network": .browserRead
-            case "web_search", "web_fetch": .network
+            case "web.search", "web.fetch": .network
             case "ssh.execute": .network
             case "computer.click", "computer.type", "computer.key": .computerAct
             case "computer.inspect_app", "computer.snapshot", "computer.find", "computer.capture_window": .computerRead
@@ -1254,7 +1272,7 @@ public enum AgentToolSchemas {
             case "terminal.resize", "terminal.list", "terminal.ports", "terminal.attach": .l0
             case "terminal.exec", "terminal.open", "terminal.write", "terminal.signal", "terminal.close", "run_command", "git_action": .l2
             case "browser.open", "browser.click", "browser.type", "browser.assert": .l2
-            case "web_search", "web_fetch": .l2
+            case "web.search", "web.fetch": .l2
             case "ssh.execute": .l2
             case "computer.click", "computer.type", "computer.key": .l2
             default: .l0

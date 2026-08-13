@@ -63,10 +63,14 @@ public final class AttachmentStore: AttachmentDataProvider, @unchecked Sendable 
         let sourceData = try Data(contentsOf: sourceURL)
         let hash = Self.sha256(sourceData)
         let blobURL = directory.appendingPathComponent("\(hash).blob")
-        if !FileManager.default.fileExists(atPath: blobURL.path) {
+        let blobExisted = FileManager.default.fileExists(atPath: blobURL.path)
+        if !blobExisted {
             let sealed = try seal(sourceData)
             try sealed.write(to: blobURL, options: .atomic)
         }
+        lock.lock()
+        addBlobReference(hash: hash, blobExistedBeforeImport: blobExisted)
+        lock.unlock()
         return AttachmentRef(
             filename: sourceURL.lastPathComponent,
             kind: Self.kind(for: sourceURL, data: sourceData),
@@ -126,7 +130,60 @@ public final class AttachmentStore: AttachmentDataProvider, @unchecked Sendable 
     public func delete(_ attachment: AttachmentRef) throws {
         let resolvedURL = resolveURL(attachment.localURL)
         guard resolvedURL.path.hasPrefix(directory.path + "/") else { return }
+        let hash = resolvedURL.deletingPathExtension().lastPathComponent
+        lock.lock()
+        let remaining = dropBlobReference(hash: hash)
+        lock.unlock()
+        guard remaining == 0 else { return }
         try? FileManager.default.removeItem(at: resolvedURL)
+    }
+
+    /// Blobs are content-addressed: two attachments with identical content
+    /// share one encrypted blob. A small on-disk refcount index keeps `delete`
+    /// from destroying the shared blob while another attachment still uses it.
+    private var refcountIndexURL: URL {
+        directory.appendingPathComponent("refcounts.json", isDirectory: false)
+    }
+
+    private func addBlobReference(hash: String, blobExistedBeforeImport: Bool) {
+        var refcounts = loadRefcounts()
+        if blobExistedBeforeImport, refcounts[hash] == nil {
+            // Legacy blob with unknown users (imported before refcounting
+            // existed). Leave it unmanaged so it is never deleted; the next
+            // import of the same content starts counting from one.
+            return
+        }
+        refcounts[hash, default: 0] += 1
+        writeRefcounts(refcounts)
+    }
+
+    /// Returns the remaining reference count. A blob with no recorded
+    /// reference (legacy content imported before refcounting existed) is
+    /// conservatively treated as still in use and is never deleted.
+    private func dropBlobReference(hash: String) -> Int {
+        var refcounts = loadRefcounts()
+        guard let current = refcounts[hash], current > 0 else { return 1 }
+        let remaining = current - 1
+        if remaining == 0 {
+            refcounts.removeValue(forKey: hash)
+        } else {
+            refcounts[hash] = remaining
+        }
+        writeRefcounts(refcounts)
+        return remaining
+    }
+
+    private func loadRefcounts() -> [String: Int] {
+        guard let data = try? Data(contentsOf: refcountIndexURL),
+              let value = try? JSONDecoder().decode([String: Int].self, from: data) else {
+            return [:]
+        }
+        return value
+    }
+
+    private func writeRefcounts(_ refcounts: [String: Int]) {
+        guard let data = try? JSONEncoder().encode(refcounts) else { return }
+        try? data.write(to: refcountIndexURL, options: .atomic)
     }
 
     private func key() throws -> SymmetricKey {

@@ -53,7 +53,7 @@ public enum VerificationEvidenceClassifier {
                 return .build
             }
             return .command
-        case "web_search", "web_fetch":
+        case "web.search", "web.fetch":
             return .network
         default:
             return .checkpoint

@@ -1,5 +1,61 @@
 import Foundation
 
+/// Drains a Process's stdout/stderr pipes on background threads. A process
+/// producing more than the ~64KB pipe buffer blocks forever while the parent
+/// waits for it; draining concurrently guarantees the parent's wait can
+/// complete and no output is truncated.
+public final class ProcessOutputDrainer: @unchecked Sendable {
+    private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var stdoutData = Data()
+    private var stderrData = Data()
+
+    public init(stdout: Pipe, stderr: Pipe) {
+        let stdoutThread = Thread { [weak self] in
+            let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            self?.storeStdout(data)
+            self?.leave()
+        }
+        let stderrThread = Thread { [weak self] in
+            let data = stderr.fileHandleForReading.readDataToEndOfFile()
+            self?.storeStderr(data)
+            self?.leave()
+        }
+        stdoutThread.name = "DeepSeekCode.stdout-drain"
+        stderrThread.name = "DeepSeekCode.stderr-drain"
+        group.enter()
+        group.enter()
+        stdoutThread.start()
+        stderrThread.start()
+    }
+
+    /// Blocks until both pipes reach EOF (normally right after the process
+    /// exits) and returns the drained data. Falls back to whatever has been
+    /// read so far after `timeout` so a stubborn process can never hang us.
+    public func joined(timeout: TimeInterval = 5) -> (stdout: Data, stderr: Data) {
+        _ = group.wait(timeout: .now() + timeout)
+        lock.lock()
+        defer { lock.unlock() }
+        return (stdoutData, stderrData)
+    }
+
+    private func storeStdout(_ data: Data) {
+        lock.lock()
+        stdoutData = data
+        lock.unlock()
+    }
+
+    private func storeStderr(_ data: Data) {
+        lock.lock()
+        stderrData = data
+        lock.unlock()
+    }
+
+    private func leave() {
+        group.leave()
+    }
+}
+
 public struct ProjectInstructions: Sendable, Equatable {
     public let text: String
     public let sources: [String]

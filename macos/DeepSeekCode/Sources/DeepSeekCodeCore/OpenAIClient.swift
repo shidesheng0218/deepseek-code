@@ -387,6 +387,9 @@ public final class OpenAICompatibleClient: @unchecked Sendable {
     ) throws -> Bool {
         guard line.hasPrefix("data:") else { return false }
         let data = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+        // SSE keep-alives and padding lines carry an empty payload; they must
+        // not abort the stream via a JSON decode error.
+        guard !data.isEmpty else { return false }
         do {
             let event = try OpenAIStreamDecoder.parse(data: data)
             continuation.yield(event)

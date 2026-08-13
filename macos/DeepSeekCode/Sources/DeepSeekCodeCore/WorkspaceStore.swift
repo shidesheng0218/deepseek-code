@@ -1844,6 +1844,18 @@ public final class WorkspaceStore {
                         decision: decision
                     )
                     _ = try await sendDaemon(.approvalResolve, payload: payload, client: client)
+                    // followDaemonSession exits when it sees an approval; the
+                    // resolve above resumes the run, so polling must restart
+                    // or the GUI never sees the remaining events.
+                    if let worker = agentWorkers.first(where: { $0.sessionID == selectedSessionID && $0.kind == .main }),
+                       agentRunTasks[selectedSessionID] == nil {
+                        let workerID = worker.id
+                        let sessionID = selectedSessionID
+                        agentRunTasks[sessionID] = Task { [weak self] in
+                            guard let self else { return }
+                            await self.followDaemonSession(sessionID: sessionID, workerID: workerID, client: client)
+                        }
+                    }
                 } else {
                     print("→ [APPROVAL] Using Supervisor path")
                     // 直接调用恢复逻辑，确保 Agent 能够继续执行

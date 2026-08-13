@@ -126,21 +126,15 @@ public final class ResilientSecretStore: SecretStore, @unchecked Sendable {
     }
 
     public func save(reference: String, value: String) throws {
-        var primaryError: Error?
+        // The fallback is a plaintext local JSON file. Never mirror secrets
+        // into it when the Keychain succeeds, otherwise provider API keys
+        // silently leak onto disk for no resilience benefit.
         do {
             try primary.save(reference: reference, value: value)
-        } catch {
-            primaryError = error
-        }
-
-        do {
-            try fallback.save(reference: reference, value: value)
             return
         } catch {
-            if primaryError == nil { throw error }
+            try fallback.save(reference: reference, value: value)
         }
-
-        if let primaryError { throw primaryError }
     }
 
     public func load(reference: String) throws -> String? {

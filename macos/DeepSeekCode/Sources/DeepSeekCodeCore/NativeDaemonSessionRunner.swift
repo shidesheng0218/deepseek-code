@@ -240,7 +240,7 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
     private func supportedTools() -> [RegisteredTool] {
         var supportedNames: Set<String> = [
             "list_directory", "read_file", "search_workspace", "workspace_read_evidence",
-            "apply_patch", "inspect_git", "lsp_query", "web_search", "web_fetch"
+            "apply_patch", "inspect_git", "lsp_query", "web.search", "web.fetch"
         ]
         if terminalHost != nil {
             supportedNames.formUnion(AgentToolSchemas.registry.allTools().map(\.name).filter { $0 == "run_command" || $0.hasPrefix("terminal.") })

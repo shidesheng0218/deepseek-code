@@ -34,9 +34,13 @@ public enum ShellIntentAnalyzer {
         let redirection = lower.contains(">") || lower.contains("<")
         let unmatchedQuotes = quoteBalance(value) != 0
         let tokens = tokenize(value)
-        let commands = tokens.filter { !$0.isEmpty && !$0.contains("=") && !$0.hasPrefix("-") && $0 != "|" && $0 != ";" && $0 != "&&" && $0 != "||" }
-        let commandNames = commands.enumerated().compactMap { index, token -> String? in
-            if index == 0 || tokens[safe: max(0, index - 1)] == "|" || tokens[safe: max(0, index - 1)] == ";" || tokens[safe: max(0, index - 1)] == "&&" || tokens[safe: max(0, index - 1)] == "||" {
+        // Command names are resolved over the raw token stream so the
+        // previous-token operator check lines up with the actual array
+        // indices (filtering first would shift indices and silently drop
+        // commands chained after `&&`/`||`/`|`/`;`).
+        let commandNames = tokens.enumerated().compactMap { index, token -> String? in
+            guard !token.isEmpty, !token.contains("="), !token.hasPrefix("-"), token != "|", token != ";", token != "&&", token != "||" else { return nil }
+            if index == 0 || ["|", ";", "&&", "||"].contains(tokens[safe: max(0, index - 1)] ?? "") {
                 return token.lowercased()
             }
             return nil
@@ -103,22 +107,35 @@ public enum ShellIntentAnalyzer {
         var current = ""
         var quote: Character?
         var escaped = false
+        var index = value.startIndex
         func flush() {
             if !current.isEmpty { tokens.append(current); current = "" }
         }
-        for character in value {
-            if escaped { current.append(character); escaped = false; continue }
-            if character == "\\" { escaped = true; continue }
+        while index < value.endIndex {
+            let character = value[index]
+            if escaped { current.append(character); escaped = false; index = value.index(after: index); continue }
+            if character == "\\" { escaped = true; index = value.index(after: index); continue }
             if let activeQuote = quote {
                 if character == activeQuote { quote = nil } else { current.append(character) }
+                index = value.index(after: index)
                 continue
             }
-            if character == "'" || character == "\"" { quote = character; continue }
-            if character == " " || character == "\t" || character == "\n" { flush(); continue }
+            if character == "'" || character == "\"" { quote = character; index = value.index(after: index); continue }
+            if character == " " || character == "\t" || character == "\n" { flush(); index = value.index(after: index); continue }
             if "|;&<>".contains(character) {
-                flush(); tokens.append(String(character)); continue
+                flush()
+                let next = value.index(after: index)
+                if next < value.endIndex, (character == "&" || character == "|"), value[next] == character {
+                    tokens.append(String(character) + String(character))
+                    index = value.index(after: next)
+                } else {
+                    tokens.append(String(character))
+                    index = next
+                }
+                continue
             }
             current.append(character)
+            index = value.index(after: index)
         }
         flush()
         return tokens
