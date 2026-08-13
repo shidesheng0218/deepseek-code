@@ -35,6 +35,14 @@ grep -F '"marketingVersion": "9.8.7"' "$METADATA" >/dev/null
 grep -F '"buildNumber": "123"' "$METADATA" >/dev/null
 grep -F '"distribution": "github-adhoc"' "$METADATA" >/dev/null
 
+MOUNT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/deepseek-code-cli-release.XXXXXX")"
+hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT_DIR" >/dev/null
+[[ -x "$MOUNT_DIR/DeepSeek Code.app/Contents/Resources/deepseekd" ]]
+[[ -x "$MOUNT_DIR/DeepSeek Code.app/Contents/Resources/deepseek" ]]
+[[ -x "$MOUNT_DIR/DeepSeek Code.app/Contents/Resources/deepseek-worker" ]]
+hdiutil detach "$MOUNT_DIR" -quiet
+rmdir "$MOUNT_DIR"
+
 RELEASE_VERSION=9.8.7 \
 BUILD_NUMBER=124 \
 RELEASE_OUTPUT_DIR="$WORK_DIR/github-adhoc" \

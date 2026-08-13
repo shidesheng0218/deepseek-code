@@ -99,7 +99,14 @@ public enum TaskRouter {
         let contains = { (values: [String]) in values.contains { lower.contains($0.lowercased()) } }
         let repair = contains(["修复", "报错", "错误", "bug", "fix", "failing", "failure"])
         let review = contains(["review", "审查", "代码审查", "diff"])
-        let research = contains(["联网", "官方文档", "搜索", "网页", "资料", "查一下", "查询", "research", "documentation", "web"])
+        // Time-sensitive public facts must not fall into the generic direct
+        // answer route. Keep this intentionally bounded: a bare “今天” or
+        // “当前项目” is not a web-research request, while market quotes,
+        // weather, news, sports and exchange rates are.
+        let liveDataDomain = contains(["股市", "股票", "a股", "港股", "美股", "指数", "市场", "汇率", "金价", "油价", "天气", "新闻", "比分", "赛程"])
+        let liveDataSignal = contains(["行情", "实时", "价格", "汇率", "比分", "赛程", "天气预报"])
+        let temporalLookup = contains(["最新", "今天", "今日", "当前", "现在"]) && liveDataDomain
+        let research = contains(["联网", "官方文档", "搜索", "网页", "资料", "查一下", "查询", "research", "documentation", "web"]) || liveDataSignal || temporalLookup
         // “页面” alone is a normal UI feature request, not a browser-test
         // requirement. Escalate only on an explicit browser/evidence signal.
         let browser = contains(["浏览器", "截图", "dom", "console", "playwright", "browser"])
@@ -113,6 +120,7 @@ public enum TaskRouter {
         var reasons: [String] = []
         if repair { reasons.append("包含修复或错误信号") }
         if research { reasons.append("包含联网研究信号") }
+        if liveDataSignal || temporalLookup { reasons.append("包含时效性公开信息信号") }
         if browser { reasons.append("包含浏览器验证信号") }
         if delivery { reasons.append("包含交付或 CI 信号") }
         if input.hasAttachments { reasons.append("包含附件") }
@@ -174,19 +182,19 @@ public enum ResponseContractRenderer {
     public static func instruction(for route: TaskRoute) -> String {
         switch route.responseContract {
         case .directAnswer:
-            "直接给出结论。默认不超过三段；仅在必要时给一个最小示例。"
+            "自然短答：先给结论，默认一到三段；只在确实能帮助理解时给一个最小示例。不要使用固定栏目。"
         case .projectFinding:
-            "输出：结论、依据文件或 Evidence、不确定项、建议下一步。不要把推测写成事实。"
+            "像项目交接一样回答：先说结论，再点出关键依据文件或 Evidence；有不确定项再说，不要把推测写成事实。"
         case .executionPlan:
-            "输出：目标、计划变更、涉及文件、验证方式、需要审批的操作。未执行前不得声称完成。"
+            "给一份简短可执行计划：目标、预计改哪里、怎么验证、哪些操作需要审批。未执行前不得声称完成。"
         case .researchConclusion:
-            "输出：结论、可引用来源、适用范围、冲突或风险。每个外部关键结论必须引用来源 ID。"
+            "像研究备忘一样回答：先给结论，再用自然句嵌入来源 ID；说明适用范围以及明显冲突或风险。每个外部关键结论必须引用来源 ID。"
         case .repairReport:
-            "输出：根因、变更、验证结果、仍存风险。测试或浏览器验证失败时不得称已修复。"
+            "像修复交接一样回答：先说结果，再交代根因、关键变更、验证结果和仍存风险。可用短小标题，但不要机械堆模板。测试或浏览器验证失败时不得称已修复。"
         case .reviewFindings:
-            "只报告有证据的问题；按严重级别、文件、行号、证据和建议组织；没有问题时明确说明范围。"
+            "像代码审查评论一样回答：只报告有证据的问题；包含严重级别、文件位置、证据和建议。没有问题时明确说明审查范围。"
         case .deliveryReport:
-            "输出：已交付内容、PR/CI/验证证据、未完成项、豁免项和下一步。"
+            "像发布交接一样回答：先说是否可交付，再说明已交付内容、验证/PR/CI 证据、未完成项或豁免项和下一步。"
         }
     }
 }

@@ -176,6 +176,17 @@ public struct TaskContract: Codable, Equatable, Sendable {
         self.webResearch = webResearch
     }
 
+    /// Delivery is an explicit workflow, not the default end state for every
+    /// chat turn. Read-only questions and research may still produce evidence,
+    /// but they must not be marked `Needs repair` merely because they have no
+    /// diff, Browser check, PR or CI requirement.
+    public var requiresDeliveryGate: Bool {
+        !requiredChanges.isEmpty
+            || !requiredTests.isEmpty
+            || !requiredBrowserChecks.isEmpty
+            || delivery != nil
+    }
+
     /// Compatibility contract for sessions created before the strict delivery
     /// workflow existed. It keeps the user's goal and budget while requiring a
     /// real diff only when the agent actually edits the workspace.

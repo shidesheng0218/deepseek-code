@@ -73,6 +73,22 @@ public enum TerminalHelperMethod {
     public static let writeProtected = "write_protected"
 }
 
+/// macOS `sockaddr_un` has a very short path limit. Application Support and
+/// test roots can easily exceed it, so the Helper uses a deterministic,
+/// per-root fallback under `/tmp` while retaining a 0600 descriptor/token in
+/// its private runtime directory. This is the same local-only model as
+/// `deepseekd`; it never opens a TCP listener.
+public enum TerminalHelperPaths {
+    public static func socketPath(root: URL) -> String {
+        let candidate = root.appendingPathComponent("host.sock", isDirectory: false).path
+        if candidate.utf8.count < 100 { return candidate }
+        let digest = SHA256.hash(data: Data(root.standardizedFileURL.path.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "/tmp/deepseek-terminal-\(digest.prefix(24)).sock"
+    }
+}
+
 /// One-request-per-connection Unix domain transport. The Helper process keeps
 /// the PTY alive; connections are intentionally short-lived so reconnecting
 /// after an App crash cannot duplicate a request or strand a pipe.
@@ -192,7 +208,7 @@ public actor TerminalHelperProcessManager {
     public init(executableURL: URL, root: URL) {
         self.executableURL = executableURL
         self.root = root
-        socketPath = root.appendingPathComponent("host.sock").path
+        socketPath = TerminalHelperPaths.socketPath(root: root)
         descriptorURL = root.appendingPathComponent("host.json")
     }
 

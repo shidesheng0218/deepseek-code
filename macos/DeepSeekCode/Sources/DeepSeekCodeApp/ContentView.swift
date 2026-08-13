@@ -778,7 +778,7 @@ private struct ConversationTimelineRow: View {
                                 .controlSize(.mini)
                         }
                     }
-                    Text(entry.text)
+                    Text(try! AttributedString(markdown: entry.text, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
                         .font(.system(size: WorkspaceTypography.bodySize))
                         .foregroundStyle(.primary)
                         .textSelection(.enabled)
@@ -791,6 +791,7 @@ private struct ConversationTimelineRow: View {
                 )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .id(entry.id + "_" + String(entry.text.count))
         case .tool, .verification:
             ConversationEventRow(entry: entry)
         case .approval:
@@ -890,8 +891,7 @@ private struct ConversationApprovalRow: View {
 
     private var approval: PendingToolApproval? {
         guard entry.state == .waiting,
-              let pending = store.pendingApproval,
-              entry.text.hasPrefix(pending.tool) else { return nil }
+              let pending = store.pendingApproval else { return nil }
         return pending
     }
 
@@ -907,22 +907,14 @@ private struct ConversationApprovalRow: View {
                     Text(entry.title)
                         .font(.system(size: 12, weight: .semibold))
                     Text(entry.text)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: WorkspaceTypography.metaSize))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 AppBadge(title: entry.state == .waiting ? "待处理" : (entry.state == .completed ? "已允许" : "已拒绝"), tint: entry.state == .waiting ? .orange : (entry.state == .completed ? .green : .red))
             }
 
-            if let approval {
-                Text(approval.argumentsJSON)
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .lineLimit(4)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(Color.orange.opacity(0.055), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            if approval != nil {
                 HStack(spacing: 7) {
                     Button("拒绝") { store.resolvePendingApproval(.deny) }
                         .buttonStyle(AppSecondaryButtonStyle())

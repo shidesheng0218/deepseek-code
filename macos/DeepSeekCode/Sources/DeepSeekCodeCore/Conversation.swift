@@ -112,6 +112,41 @@ public enum ConversationStatusPresentation {
 }
 
 public enum ConversationProjector {
+    public static func approvalTitle(for tool: String) -> String {
+        switch canonicalToolDisplayKind(tool) {
+        case "web": return "需要确认外部网页访问"
+        case "terminal": return "需要确认命令执行"
+        case "git": return "需要确认 Git 操作"
+        case "browser": return "需要确认浏览器操作"
+        default: return "需要你确认"
+        }
+    }
+
+    public static func approvalText(tool: String, risk: String?) -> String {
+        let suffix = risk.map { "（\($0)）" } ?? ""
+        switch canonicalToolDisplayKind(tool) {
+        case "web":
+            return "这个请求需要访问新的外部网站\(suffix)。确认后我会继续处理。"
+        case "terminal":
+            return "这个请求需要执行本地命令\(suffix)。确认后我会继续处理。"
+        case "git":
+            return "这个请求涉及 Git 或外部交付操作\(suffix)。确认后我会继续处理。"
+        case "browser":
+            return "这个请求需要操作浏览器\(suffix)。确认后我会继续处理。"
+        default:
+            return "这个请求需要你确认\(suffix)。确认后我会继续处理。"
+        }
+    }
+
+    private static func canonicalToolDisplayKind(_ tool: String) -> String {
+        let lower = tool.lowercased()
+        if lower.contains("web") { return "web" }
+        if lower.contains("terminal") || lower == "run_command" { return "terminal" }
+        if lower.contains("git") || lower.contains("github") { return "git" }
+        if lower.contains("browser") { return "browser" }
+        return "tool"
+    }
+
     /// Projection refreshes are allowed to receive overlapping deltas. Keep
     /// the first stable entry for an ID so SwiftUI never renders duplicate
     /// cards when an observer and a full refresh arrive together.
@@ -123,19 +158,22 @@ public enum ConversationProjector {
         }
     }
 
-    /// Compatibility projection for existing SwiftUI timeline views. Stable
-    /// part IDs prevent duplicate cards when the projection refreshes.
+    /// Primary chat projection. Tool calls, token usage and internal steps
+    /// remain in the durable Parts/Evidence projections, but are deliberately
+    /// excluded from the default conversation so users see the request,
+    /// meaningful Assistant response, required approvals and delivery state
+    /// rather than implementation names such as `web_search`.
     public static func timeline(parts: [SessionPart]) -> [ConversationEntry] {
         let entries = parts.sorted {
             $0.firstSequence == $1.firstSequence ? $0.id < $1.id : $0.firstSequence < $1.firstSequence
-        }.map { part in
+        }.compactMap { part -> ConversationEntry? in
             let kind: ConversationEntryKind
             switch part.kind {
             case .user: kind = .user
-            case .assistantText, .reasoning, .step, .patch: kind = .assistant
-            case .toolCall: kind = .tool
+            case .assistantText: kind = .assistant
             case .approval: kind = .approval
-            case .workerResult, .verification, .usage: kind = .verification
+            case .reasoning, .toolCall, .step, .patch, .workerResult, .verification, .usage:
+                return nil
             }
             let state: ConversationEntryState
             switch part.state {
@@ -146,11 +184,13 @@ public enum ConversationProjector {
             case .failed: state = .failed
             case .info: state = .info
             }
+            let title = kind == .approval ? approvalTitle(for: part.text) : part.title
+            let text = kind == .approval ? approvalText(tool: part.text, risk: nil) : part.text
             return ConversationEntry(
                 id: part.id,
                 kind: kind,
-                title: part.title,
-                text: part.text,
+                title: title,
+                text: text,
                 state: state,
                 toolCallID: part.toolCallID,
                 createdAt: part.createdAt
@@ -197,24 +237,6 @@ public enum ConversationProjector {
             return (try? JSONDecoder().decode([AttachmentRef].self, from: data)) ?? []
         }
 
-        func appendVerification(event: SessionEvent, title: String, text: String, state: ConversationEntryState = .completed) {
-            entries.append(ConversationEntry(id: "verification-\(event.id.uuidString)", kind: .verification, title: title, text: text, state: state, createdAt: event.timestamp))
-        }
-
-        func updateLatestTool(_ tool: String, callID: String?, state: ConversationEntryState, text: String) {
-            let index = entries.lastIndex {
-                guard $0.kind == .tool, $0.title == tool else { return false }
-                if let callID { return $0.toolCallID == callID }
-                return $0.state == .running
-            }
-            guard let index else {
-                entries.append(ConversationEntry(kind: .tool, title: tool, text: text, state: state, toolCallID: callID))
-                return
-            }
-            entries[index].state = state
-            entries[index].text = text
-        }
-
         for event in events.sorted(by: { $0.sequence < $1.sequence }) {
             switch event.type {
             case "user_message":
@@ -229,92 +251,33 @@ public enum ConversationProjector {
                 } else {
                     entries.append(ConversationEntry(id: "assistant-\(event.id.uuidString)", kind: .assistant, title: "DeepSeek", text: text, createdAt: event.timestamp))
                 }
-            case "tool_requested":
-                let tool = event.payload["tool"] ?? "工具"
-                entries.append(ConversationEntry(id: "tool-\(event.id.uuidString)", kind: .tool, title: tool, text: "准备执行", state: .running, toolCallID: event.payload["callID"], createdAt: event.timestamp))
-            case "tool_started":
-                let tool = event.payload["tool"] ?? "工具"
-                updateLatestTool(tool, callID: event.payload["callID"], state: .running, text: "执行中")
-            case "tool_completed":
-                let tool = event.payload["tool"] ?? "工具"
-                let succeeded = event.payload["ok"] == "true"
-                updateLatestTool(tool, callID: event.payload["callID"], state: succeeded ? .completed : .failed, text: succeeded ? "已完成" : "执行失败")
-            case "tool_blocked":
-                let tool = event.payload["tool"] ?? "工具"
-                updateLatestTool(tool, callID: event.payload["callID"], state: .failed, text: "已被权限策略阻止")
-            case "terminal_requested", "terminal_started", "terminal_resized", "terminal_signal", "terminal_attached", "terminal_detached", "terminal_portDiscovered":
-                let detail = event.payload["detail"] ?? event.payload["terminalID"] ?? "Terminal"
-                let title = event.type == "terminal_requested" ? "Terminal 请求" : "Terminal"
-                let state: ConversationEntryState = event.type == "terminal_requested" ? .running : .info
-                appendVerification(event: event, title: title, text: detail, state: state)
-            case "terminal_input", "terminal_protectedInputCompleted":
-                appendVerification(event: event, title: "Terminal 输入", text: event.payload["detail"] ?? "输入已发送", state: .completed)
-            case "terminal_protectedInputRequired":
-                appendVerification(event: event, title: "需要用户接管", text: "终端正在等待敏感输入", state: .waiting)
-            case "terminal_output", "terminal_output_persisted":
-                appendVerification(event: event, title: "Terminal 输出", text: event.payload["detail"] ?? "输出已接收", state: .info)
-            case "terminal_completed":
-                appendVerification(event: event, title: "Terminal 完成", text: event.payload["detail"] ?? "命令完成", state: .completed)
-            case "terminal_failed":
-                appendVerification(event: event, title: "Terminal 失败", text: event.payload["detail"] ?? "命令失败", state: .failed)
-            case "terminal_indeterminate":
-                appendVerification(event: event, title: "Terminal 状态未知", text: event.payload["reason"] ?? "未自动重放，请检查终端", state: .waiting)
+            case "tool_requested", "tool_started", "tool_completed", "tool_blocked", "tool_failed", "tool_indeterminate":
+                // Internal tool lifecycle remains in the event log and
+                // Evidence inspector. It is intentionally absent from the
+                // primary conversation stream.
+                continue
+            case let type where type.hasPrefix("terminal_"):
+                continue
             case "approval_requested":
                 let tool = event.payload["tool"] ?? "工具"
-                let risk = event.payload["risk"].map { " · \($0)" } ?? ""
-                entries.append(ConversationEntry(id: "approval-\(event.id.uuidString)", kind: .approval, title: "需要审批", text: "\(tool)\(risk)", state: .waiting, createdAt: event.timestamp))
+                entries.append(ConversationEntry(id: "approval-\(event.id.uuidString)", kind: .approval, title: approvalTitle(for: tool), text: approvalText(tool: tool, risk: event.payload["risk"]), state: .waiting, createdAt: event.timestamp))
             case "approval_resolved":
                 if let index = entries.lastIndex(where: { $0.kind == .approval && $0.state == .waiting }) {
                     let allowed = event.payload["decision"] != ApprovalDecision.deny.rawValue
                     entries[index].state = allowed ? .completed : .failed
-                    entries[index].text += allowed ? " · 已允许" : " · 已拒绝"
+                    entries[index].text = allowed ? "已确认，我会继续处理。" : "已拒绝，我不会执行这一步。"
                 }
-            case "verification_gate_evaluated":
-                let passed = event.payload["passed"] == "true"
-                let text = passed ? "修改、验证与交付证据已齐全" : (event.payload["missing"]?.replacingOccurrences(of: "|", with: " · ") ?? "仍缺少验证证据")
-                entries.append(ConversationEntry(id: "gate-\(event.id.uuidString)", kind: .verification, title: passed ? "交付门禁已通过" : "仍需完成", text: text, state: passed ? .completed : .waiting, createdAt: event.timestamp))
-            case "handoff_applied":
-                entries.append(ConversationEntry(id: "handoff-\(event.id.uuidString)", kind: .verification, title: "Handoff 已应用", text: event.payload["files"] ?? "变更已安全应用", state: .completed, createdAt: event.timestamp))
-            case "worker_session_created":
-                entries.append(ConversationEntry(id: "worker-session-\(event.id.uuidString)", kind: .verification, title: "只读 Worker 已创建", text: event.payload["workerKind"] ?? "Worker", state: .running, createdAt: event.timestamp))
-            case "worker_evidence_adopted":
-                entries.append(ConversationEntry(id: "worker-evidence-\(event.id.uuidString)", kind: .verification, title: "Worker Evidence 已采纳", text: event.payload["evidenceIDs"] ?? "已采纳摘要", state: .completed, createdAt: event.timestamp))
-            case "worker_session_needs_attention", "agent_worker_needs_attention":
-                entries.append(ConversationEntry(id: "worker-attention-\(event.id.uuidString)", kind: .verification, title: "Worker 需要处理", text: event.payload["reason"] ?? "应用重启后未自动恢复", state: .waiting, createdAt: event.timestamp))
-            case "github_pr_created":
-                entries.append(ConversationEntry(id: "pr-\(event.id.uuidString)", kind: .verification, title: "Pull Request 已创建", text: event.payload["url"] ?? "GitHub 交付已创建", state: .completed, createdAt: event.timestamp))
-            case "github_ci_evidence":
-                let state = event.payload["state"] ?? "pending"
-                let result: ConversationEntryState = state == "passed" ? .completed : (state == "failed" ? .failed : .running)
-                entries.append(ConversationEntry(id: "ci-\(event.id.uuidString)", kind: .verification, title: "GitHub Actions CI", text: event.payload["detail"] ?? state, state: result, createdAt: event.timestamp))
-            case "browser_evidence_recorded":
-                entries.append(ConversationEntry(id: "browser-\(event.id.uuidString)", kind: .verification, title: "浏览器验证", text: "已记录 DOM、控制台、网络与截图证据", state: .completed, createdAt: event.timestamp))
-            case "research_started":
-                appendVerification(event: event, title: "联网研究", text: "开始研究 \(event.payload["goal"] ?? "")", state: .running)
-            case "web_search_completed":
-                let succeeded = event.payload["succeeded"] == "true"
-                let provider = event.payload["providerID"] ?? "provider"
-                let query = event.payload["query"] ?? "搜索"
-                let count = event.payload["resultCount"] ?? "0"
-                appendVerification(event: event, title: "联网搜索", text: "\(query) · \(provider) · \(count) 条结果", state: succeeded ? .completed : .failed)
-            case "web_source_selected":
-                appendVerification(event: event, title: "选定来源", text: "\(event.payload["sourceCount"] ?? "0") 个来源")
-            case "web_fetch_completed":
-                let succeeded = event.payload["succeeded"] != "false"
-                let url = event.payload["url"] ?? "网页"
-                let status = event.payload["status"] ?? "0"
-                appendVerification(event: event, title: "网页抓取", text: "\(url) · HTTP \(status)", state: succeeded ? .completed : .failed)
-            case "web_citation_recorded":
-                appendVerification(event: event, title: "引用片段", text: event.payload["quote"] ?? event.payload["sourceID"] ?? "citation")
-            case "research_conflict_detected":
-                appendVerification(event: event, title: "研究冲突", text: event.payload["reason"] ?? "研究存在冲突", state: .failed)
-            case "research_summary_generated":
-                let succeeded = event.payload["succeeded"] == "true"
-                appendVerification(event: event, title: "联网研究结论", text: event.payload["summary"] ?? "Research summary", state: succeeded ? .completed : .failed)
-            case "research_failed":
-                appendVerification(event: event, title: "研究失败", text: event.payload["reason"] ?? "研究失败", state: .failed)
             case "agent_failed":
-                appendVerification(event: event, title: "执行失败", text: event.payload["message"] ?? "Agent 启动失败", state: .failed)
+                let message = event.payload["message"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "这次处理没有完成。"
+                guard !message.isEmpty else { continue }
+                entries.append(ConversationEntry(
+                    id: "assistant-failure-\(event.id.uuidString)",
+                    kind: .assistant,
+                    title: "DeepSeek",
+                    text: message,
+                    state: .failed,
+                    createdAt: event.timestamp
+                ))
             default:
                 continue
             }

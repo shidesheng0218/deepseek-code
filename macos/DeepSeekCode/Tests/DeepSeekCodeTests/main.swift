@@ -29,6 +29,8 @@ struct DeepSeekCodeChecks {
         precondition(runtimeIdentity.sourceOfTruth == "swift-native")
         precondition(runtimeIdentity.displayLabel.contains(runtimeIdentity.buildID))
         precondition(AgentResponseStyle.userFacingInstruction(mode: .acceptEdits).contains("先直接回答"))
+        precondition(AgentResponseStyle.userFacingInstruction(mode: .acceptEdits).contains("像有经验的同事"))
+        precondition(AgentResponseStyle.userFacingInstruction(mode: .acceptEdits).contains("不要暴露内部工具名"))
         let directRoute = TaskRouter.route(TaskRoutingInput(prompt: "Swift actor 是什么？", mode: .acceptEdits))
         precondition(directRoute.kind == .directAnswer)
         precondition(!directRoute.needsWorkspace && !directRoute.needsHighReasoning)
@@ -69,6 +71,12 @@ struct DeepSeekCodeChecks {
             evidence: QualityEvidenceState(citationCount: 1)
         )
         precondition(completeRepair.passed)
+        let mechanicalInternalResponse = ResponseQualityValidator.validate(
+            "web_fetch 已完成，deepseek-v4-flash 输出 92 tokens。Delivered。",
+            contract: ResponseContract(kind: .directAnswer, requiredSections: [], maximumParagraphs: 3),
+            evidence: QualityEvidenceState()
+        )
+        precondition(!mechanicalInternalResponse.passed)
         let qualityEval = QualityStrategyEvaluator.run(QualityStrategyEvalSuite.v1)
         precondition(qualityEval.total == 60)
         precondition(qualityEval.failedCaseIDs.isEmpty, "策略基准失败：\(qualityEval.failedCaseIDs.joined(separator: ","))")
@@ -254,9 +262,8 @@ struct DeepSeekCodeChecks {
             SessionEvent(type: "assistant_text", payload: ["text": "已定位问题。"]),
             SessionEvent(type: "approval_requested", payload: ["tool": "run_command", "risk": "L1"])
         ])
-        precondition(conversationTimeline.map(\.kind) == [.user, .tool, .assistant, .approval])
-        precondition(conversationTimeline[1].state == .completed)
-        precondition(conversationTimeline[3].state == .waiting)
+        precondition(conversationTimeline.map(\.kind) == [.user, .assistant, .approval])
+        precondition(conversationTimeline[2].state == .waiting)
         let partTimeline = SessionPartProjector.project(events: [
             SessionEvent(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, sequence: 1, type: "user_message", payload: ["text": "修复登录"]),
             SessionEvent(id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!, sequence: 2, type: "assistant_text", payload: ["text": "我先定位"]),
@@ -273,8 +280,8 @@ struct DeepSeekCodeChecks {
         precondition(partTimeline[2].state == .completed)
         precondition(partTimeline[2].eventIDs.count == 3)
         let projectedEntries = ConversationProjector.timeline(parts: partTimeline)
-        precondition(projectedEntries.map(\.kind) == [.user, .assistant, .tool])
-        precondition(projectedEntries[2].toolCallID == "call-read")
+        precondition(projectedEntries.map(\.kind) == [.user, .assistant])
+        precondition(partTimeline[2].toolCallID == "call-read")
         let runningConversationStatus = ConversationStatusPresentation.descriptor(for: .running)
         precondition(runningConversationStatus.title == "处理中")
         precondition(runningConversationStatus.colorToken == "mint")
@@ -291,24 +298,20 @@ struct DeepSeekCodeChecks {
             SessionEvent(type: "tool_completed", payload: ["tool": "read_file", "callID": "call-a", "ok": "true"]),
             SessionEvent(type: "tool_completed", payload: ["tool": "read_file", "callID": "call-b", "ok": "false"])
         ])
-        precondition(repeatedToolTimeline.count == 2)
-        precondition(repeatedToolTimeline[0].state == .completed)
-        precondition(repeatedToolTimeline[1].state == .failed)
+        precondition(repeatedToolTimeline.isEmpty)
         let terminalTimeline = ConversationProjector.timeline(events: [
             SessionEvent(type: "terminal_started", payload: ["terminalID": "term-1", "detail": "pid 42"]),
             SessionEvent(type: "terminal_completed", payload: ["terminalID": "term-1", "detail": "exit 0"])
         ])
-        precondition(terminalTimeline.count == 2)
-        precondition(terminalTimeline.allSatisfy { $0.kind == .verification })
-        precondition(terminalTimeline[1].state == .completed)
+        precondition(terminalTimeline.isEmpty)
         let failedRunTimeline = ConversationProjector.timeline(events: [
             SessionEvent(type: "user_message", payload: ["text": "开始执行"]),
             SessionEvent(type: "agent_failed", payload: ["message": "请先在 Settings 配置 Base URL 和 API Key"])
         ])
         precondition(failedRunTimeline.count == 2)
-        precondition(failedRunTimeline[1].kind == .verification)
+        precondition(failedRunTimeline[1].kind == .assistant)
         precondition(failedRunTimeline[1].state == .failed)
-        precondition(failedRunTimeline[1].title == "执行失败")
+        precondition(failedRunTimeline[1].title == "DeepSeek")
         precondition(failedRunTimeline[1].text.contains("Base URL"))
         precondition(DeepSeekModelCatalog.isLegacy("deepseek-chat"))
         precondition(DeepSeekModelCatalog.model(for: .complexCoding) == DeepSeekModelCatalog.proModel)
@@ -1577,6 +1580,8 @@ struct DeepSeekCodeChecks {
         let qualityAgent = NativeAgentHost(client: qualityAgentClient, eventStore: events, repository: repository)
         for try await _ in qualityAgent.run(AgentRunRequest(sessionID: qualitySession.id, prompt: "修复登录状态错误", mode: .acceptEdits, model: DeepSeekModelCatalog.proModel)) {}
         precondition(qualityAgentClient.recordedRequests.first?.messages.first?.content.contains("根因") == true)
+        precondition(qualityAgentClient.recordedRequests.first?.messages.first?.content.contains("像有经验的同事") == true)
+        precondition(qualityAgentClient.recordedRequests.first?.messages.first?.content.contains("输出合同：") == false)
         let qualityAgentEvents = try repository.events(sessionID: qualitySession.id)
         precondition(qualityAgentEvents.contains { $0.type == "quality_plan_created" && $0.payload["modelTier"] == QualityModelTier.capable.rawValue })
         precondition(qualityAgentEvents.contains { $0.type == "quality_context_selected" })

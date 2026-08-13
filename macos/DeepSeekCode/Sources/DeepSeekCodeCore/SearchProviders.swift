@@ -300,27 +300,74 @@ public struct DuckDuckGoSearchProvider: SearchProvider {
     }
 
     public func search(request: WebSearchRequest, context: NetworkContext) async throws -> WebSearchResponse {
+        print("→ [DDG] Searching: \(request.query)")
+
         var components = URLComponents(string: "https://html.duckduckgo.com/html/")!
         components.queryItems = [URLQueryItem(name: "q", value: request.query)]
         var urlRequest = URLRequest(url: components.url!)
         urlRequest.httpMethod = "GET"
         urlRequest.timeoutInterval = 30
-        urlRequest.setValue("DeepSeek Code/1.0", forHTTPHeaderField: "User-Agent")
-        urlRequest.setValue("text/html", forHTTPHeaderField: "Accept")
+
+        // 使用真实浏览器 User-Agent，避免被识别为爬虫
+        urlRequest.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        urlRequest.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        urlRequest.setValue("en-US,en;q=0.9,zh-CN;q=0.8", forHTTPHeaderField: "Accept-Language")
+
         let (data, _) = try await runtime.data(for: urlRequest, scope: .webSearch, context: context, maxBytes: 512_000)
         let html = String(decoding: data, as: UTF8.self)
-        let pattern = #"result__a[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?result__snippet[^>]*>(.*?)</a>|result__a[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?result__snippet[^>]*>(.*?)</div>"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
-            return WebSearchResponse(providerID: id, results: [])
+
+        // 尝试多个 pattern，提高解析成功率
+        let patterns = [
+            // Pattern 1: 原始格式
+            #"result__a[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?result__snippet[^>]*>(.*?)</a>|result__a[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?result__snippet[^>]*>(.*?)</div>"#,
+            // Pattern 2: 宽松格式
+            #"<a[^>]*class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?<a[^>]*class=\"result__snippet\"[^>]*>(.*?)</a>"#,
+            // Pattern 3: 更宽松（适应结构变化）
+            #"result__a\"[^>]*href=\"([^\"]+)\">(.*?)</a>.*?result__snippet\">(.*?)</(?:a|div)>"#,
+        ]
+
+        var rawResults: [WebSearchResult] = []
+
+        for (index, pattern) in patterns.enumerated() {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+                continue
+            }
+
+            let range = NSRange(html.startIndex..<html.endIndex, in: html)
+            let matches = regex.matches(in: html, range: range).prefix(request.maxResults)
+
+            rawResults = matches.compactMap { match in
+                let url = Self.capture(match, html: html, index: 1) ?? Self.capture(match, html: html, index: 4)
+                let title = Self.capture(match, html: html, index: 2) ?? Self.capture(match, html: html, index: 5)
+                let snippet = Self.capture(match, html: html, index: 3) ?? Self.capture(match, html: html, index: 6)
+                guard let url, let title else { return nil }
+
+                return WebSearchResult(
+                    title: Self.stripHTML(title),
+                    url: Self.cleanURL(url),
+                    snippet: Self.stripHTML(snippet ?? ""),
+                    providerID: id
+                )
+            }
+
+            if !rawResults.isEmpty {
+                print("✅ [DDG] Pattern \(index + 1) matched \(rawResults.count) results")
+                break
+            }
         }
-        let range = NSRange(html.startIndex..<html.endIndex, in: html)
-        let rawResults: [WebSearchResult] = regex.matches(in: html, range: range).prefix(request.maxResults).compactMap { match in
-            let url = Self.capture(match, html: html, index: 1) ?? Self.capture(match, html: html, index: 4)
-            let title = Self.capture(match, html: html, index: 2) ?? Self.capture(match, html: html, index: 5)
-            let snippet = Self.capture(match, html: html, index: 3) ?? Self.capture(match, html: html, index: 6)
-            guard let url, let title else { return nil }
-            return WebSearchResult(title: Self.stripHTML(title), url: url, snippet: Self.stripHTML(snippet ?? ""), providerID: id)
+
+        if rawResults.isEmpty {
+            print("⚠️ [DDG] No results parsed (HTML: \(html.count) chars)")
+            #if DEBUG
+            let timestamp = Int(Date().timeIntervalSince1970)
+            if let tempDir = FileManager.default.temporaryDirectory as URL? {
+                let debugFile = tempDir.appendingPathComponent("ddg-\(timestamp).html")
+                try? html.write(to: debugFile, atomically: true, encoding: .utf8)
+                print("→ [DDG] Debug: \(debugFile.path)")
+            }
+            #endif
         }
+
         let retrievedAt = Date()
         return WebSearchResponse(providerID: id, results: WebSourceNormalizer.normalize(rawResults, providerID: id, retrievedAt: retrievedAt), retrievedAt: retrievedAt)
     }
@@ -341,11 +388,44 @@ public struct DuckDuckGoSearchProvider: SearchProvider {
         return String(html[swiftRange])
     }
 
+    private static func cleanURL(_ url: String) -> String {
+        // 处理 DuckDuckGo 重定向：//duckduckgo.com/l/?uddg=...
+        if url.contains("duckduckgo.com/l/?uddg=") {
+            if let uddgRange = url.range(of: "uddg=") {
+                let afterUddg = url[uddgRange.upperBound...]
+                if let ampRange = afterUddg.range(of: "&") {
+                    let encoded = String(afterUddg[..<ampRange.lowerBound])
+                    return encoded.removingPercentEncoding ?? url
+                } else {
+                    return String(afterUddg).removingPercentEncoding ?? url
+                }
+            }
+        }
+
+        // 补全协议
+        if url.hasPrefix("//") {
+            return "https:" + url
+        }
+
+        return url.replacingOccurrences(of: "&amp;", with: "&")
+    }
+
     private static func stripHTML(_ value: String) -> String {
-        value
+        var result = value
             .replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "&nbsp;", with: " ")
-            .replacingOccurrences(of: "&amp;", with: "&")
+
+        // 更完整的 HTML 实体解码
+        let entities: [String: String] = [
+            "&nbsp;": " ", "&amp;": "&", "&quot;": "\"", "&apos;": "'",
+            "&lt;": "<", "&gt;": ">", "&#39;": "'", "&ndash;": "–",
+            "&mdash;": "—", "&hellip;": "…", "&rsquo;": "'", "&lsquo;": "'"
+        ]
+
+        for (entity, char) in entities {
+            result = result.replacingOccurrences(of: entity, with: char)
+        }
+
+        return result
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -396,14 +476,60 @@ public struct BingSearchProvider: SearchProvider {
     }
 
     private static func parseResults(_ html: String) -> [ParsedResult] {
-        let pattern = #"<li[^>]*class=\"[^\"]*\bb_algo\b[^\"]*\"[^>]*>.*?<h2[^>]*>\s*<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?<div[^>]*class=\"b_caption\"[^>]*>.*?<p[^>]*>(.*?)</p>"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else { return [] }
-        let range = NSRange(html.startIndex..<html.endIndex, in: html)
-        return regex.matches(in: html, range: range).compactMap { match in
-            guard let url = capture(match, html: html, index: 1),
-                  let title = capture(match, html: html, index: 2) else { return nil }
-            return ParsedResult(title: stripHTML(title), url: url.replacingOccurrences(of: "&amp;", with: "&"), snippet: stripHTML(capture(match, html: html, index: 3) ?? ""))
+        var results: [ParsedResult] = []
+
+        // 尝试多个 pattern，因为 Bing 页面结构经常变化
+        let patterns = [
+            // Pattern 1: 标准的 b_algo 格式
+            #"<li[^>]*class=\"[^\"]*\bb_algo\b[^\"]*\"[^>]*>.*?<h2[^>]*>\s*<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?<div[^>]*class=\"b_caption\"[^>]*>.*?<p[^>]*>(.*?)</p>"#,
+            // Pattern 2: 新版格式（带 id）
+            #"<li[^>]*id=\"[^\"]*b_algo[^\"]*\"[^>]*>.*?<h2[^>]*>.*?<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?<p[^>]*>(.*?)</p>"#,
+            // Pattern 3: 更宽松的格式
+            #"<h2[^>]*>.*?<a[^>]*href=\"(https?://[^\"]+)\"[^>]*>(.*?)</a>.*?</h2>.*?<p[^>]*>(.*?)</p>"#
+        ]
+
+        for (index, pattern) in patterns.enumerated() {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+                print("⚠️ [SEARCH] Bing regex pattern \(index + 1) failed to compile")
+                continue
+            }
+            let range = NSRange(html.startIndex..<html.endIndex, in: html)
+            let matches = regex.matches(in: html, range: range).compactMap { (match: NSTextCheckingResult) -> ParsedResult? in
+                guard let url = capture(match, html: html, index: 1),
+                      let title = capture(match, html: html, index: 2) else { return nil }
+                let snippet = capture(match, html: html, index: 3) ?? ""
+                return ParsedResult(
+                    title: stripHTML(title),
+                    url: url.replacingOccurrences(of: "&amp;", with: "&"),
+                    snippet: stripHTML(snippet)
+                )
+            }
+
+            if !matches.isEmpty {
+                print("✅ [SEARCH] Bing pattern \(index + 1) matched \(matches.count) results")
+                results.append(contentsOf: matches)
+                break
+            }
         }
+
+        // 如果所有 pattern 都失败，记录调试信息
+        if results.isEmpty {
+            print("⚠️ [SEARCH] Bing HTML parsing failed - all patterns returned 0 results")
+            print("→ [SEARCH] HTML length: \(html.count) characters")
+
+            // 在调试模式下保存 HTML 用于分析
+            #if DEBUG
+            let timestamp = Int(Date().timeIntervalSince1970)
+            if let tempDir = FileManager.default.temporaryDirectory as URL?,
+               let htmlData = html.data(using: .utf8) {
+                let debugFile = tempDir.appendingPathComponent("bing-debug-\(timestamp).html")
+                try? htmlData.write(to: debugFile)
+                print("→ [SEARCH] Debug HTML saved to: \(debugFile.path)")
+            }
+            #endif
+        }
+
+        return results
     }
 
     private static func capture(_ match: NSTextCheckingResult, html: String, index: Int) -> String? {

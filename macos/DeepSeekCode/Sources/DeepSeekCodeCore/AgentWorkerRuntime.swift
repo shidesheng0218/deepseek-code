@@ -213,7 +213,7 @@ public actor DurableChildAgentRuntime: ChildAgentRuntime {
                     workerID: record.workerID,
                     workerSessionID: record.id
                 )
-                _ = try coordinator.adopt(id: record.id, result: result)
+                _ = try coordinator.storeResult(id: record.id, result: result)
                 return result
             } catch is CancellationError {
                 _ = try? coordinator.transition(id: record.id, state: .stopped)
@@ -275,6 +275,7 @@ public actor DurableChildAgentRuntime: ChildAgentRuntime {
 public enum WorkerSessionState: String, Codable, CaseIterable, Sendable {
     case queued
     case running
+    case awaitingAdoption
     case completed
     case failed
     case stopped
@@ -359,6 +360,17 @@ public final class WorkerSessionCoordinator: @unchecked Sendable {
     }
 
     public func adopt(id: String, result: WorkerResultEnvelope) throws -> WorkerSessionRecord {
+        guard let record = try repository.workerSession(id: id) else { throw WorkerSessionError.notFound }
+        guard record.state == .awaitingAdoption || record.result == nil else {
+            throw WorkerSessionError.alreadyAdopted
+        }
+        return try finalizeAdoption(record: record, result: result)
+    }
+
+    /// Stores a completed read-only result without making it part of the
+    /// parent Agent context. Only the Supervisor's explicit `adopt` action
+    /// records `worker_evidence_adopted` and changes it to completed.
+    public func storeResult(id: String, result: WorkerResultEnvelope) throws -> WorkerSessionRecord {
         guard var record = try repository.workerSession(id: id) else { throw WorkerSessionError.notFound }
         guard result.workerID == record.workerID, result.sessionID == record.parentSessionID else {
             throw WorkerSessionError.resultMismatch
@@ -367,12 +379,12 @@ public final class WorkerSessionCoordinator: @unchecked Sendable {
             throw WorkerSessionError.emptyResult
         }
         record.result = result
-        record.state = result.errorMessage == nil ? .completed : .failed
+        record.state = result.errorMessage == nil ? .awaitingAdoption : .failed
         record.updatedAt = Date()
         try repository.saveWorkerSession(record)
         try repository.appendDurable(
             sessionID: record.parentSessionID,
-            type: "worker_evidence_adopted",
+            type: "worker_result_ready",
             payload: [
                 "workerSessionID": id,
                 "workerID": record.workerID,
@@ -381,6 +393,31 @@ public final class WorkerSessionCoordinator: @unchecked Sendable {
             ]
         )
         return record
+    }
+
+    private func finalizeAdoption(record: WorkerSessionRecord, result: WorkerResultEnvelope) throws -> WorkerSessionRecord {
+        guard result.workerID == record.workerID, result.sessionID == record.parentSessionID else {
+            throw WorkerSessionError.resultMismatch
+        }
+        guard !result.evidenceIDs.isEmpty || !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw WorkerSessionError.emptyResult
+        }
+        var updated = record
+        updated.result = result
+        updated.state = result.errorMessage == nil ? .completed : .failed
+        updated.updatedAt = Date()
+        try repository.saveWorkerSession(updated)
+        try repository.appendDurable(
+            sessionID: updated.parentSessionID,
+            type: "worker_evidence_adopted",
+            payload: [
+                "workerSessionID": updated.id,
+                "workerID": updated.workerID,
+                "evidenceIDs": result.evidenceIDs.joined(separator: ","),
+                "outputHash": result.outputHash
+            ]
+        )
+        return updated
     }
 }
 
@@ -391,6 +428,7 @@ public enum WorkerSessionError: LocalizedError, Sendable {
     case resultMismatch
     case emptyResult
     case effectNotAllowed
+    case alreadyAdopted
 
     public var errorDescription: String? {
         switch self {
@@ -400,6 +438,7 @@ public enum WorkerSessionError: LocalizedError, Sendable {
         case .resultMismatch: "Worker 结果与 Session 身份不匹配"
         case .emptyResult: "Worker 必须返回摘要或 Evidence"
         case .effectNotAllowed: "只读 Worker 不能声明写入、网络或外部副作用"
+        case .alreadyAdopted: "Worker 结果已经被采纳"
         }
     }
 }

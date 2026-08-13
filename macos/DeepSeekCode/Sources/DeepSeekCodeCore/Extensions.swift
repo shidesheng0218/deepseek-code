@@ -63,7 +63,13 @@ public enum SkillError: LocalizedError, Sendable {
 
 public enum SkillCatalog {
     public static func discover(globalDirectory: URL? = nil, projectDirectory: URL) throws -> [SkillDescriptor] {
-        var roots: [(URL, String)] = [(projectDirectory.appendingPathComponent(".deepseek/skills", isDirectory: true), "project")]
+        var roots: [(URL, String)] = [
+            (projectDirectory.appendingPathComponent(".deepseek/skills", isDirectory: true), "project"),
+            // Claude-compatible Skills are prompt-only modules. They are
+            // discovered alongside native Skills but never gain permissions
+            // or executable capabilities through discovery alone.
+            (projectDirectory.appendingPathComponent(".claude/skills", isDirectory: true), "claude-project")
+        ]
         if let globalDirectory { roots.append((globalDirectory, "user")) }
         var result: [SkillDescriptor] = []
         for (root, scope) in roots {

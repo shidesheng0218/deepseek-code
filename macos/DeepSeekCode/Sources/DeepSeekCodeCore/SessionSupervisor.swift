@@ -30,6 +30,28 @@ public actor SessionSupervisor: DurableSessionSupervisor {
             delivery: input.delivery,
             parts: input.parts
         )
+        // Inbox admission is also the single durable source for the user
+        // timeline. The deterministic command ID prevents a retried client
+        // request from creating a duplicate conversation turn.
+        let attachments = input.parts.compactMap { part -> AttachmentRef? in
+            switch part {
+            case let .image(attachment), let .document(attachment): return attachment
+            default: return nil
+            }
+        }
+        let attachmentsJSON = (try? String(data: JSONEncoder().encode(attachments), encoding: .utf8)) ?? "[]"
+        _ = try repository.appendDurable(
+            sessionID: input.sessionID,
+            type: "user_message",
+            payload: [
+                "inputID": record.id,
+                "text": SecretRedactor.redact(input.parts.plainText),
+                "attachments": attachments.map(\.id).joined(separator: ","),
+                "attachmentsJSON": attachmentsJSON
+            ],
+            commandID: "harness-user-message-\(record.id)",
+            causationID: record.id
+        )
         let commandID = "harness-admit-\(input.idempotencyKey)"
         _ = try repository.appendDurable(
             sessionID: input.sessionID,
@@ -79,12 +101,28 @@ public actor SessionSupervisor: DurableSessionSupervisor {
     }
 
     public func resolveApproval(sessionID: String, approvalID: String, decision: ApprovalDecision) async throws {
-        guard let approval = try repository.approval(id: approvalID) else { throw HarnessSupervisorError.approvalNotFound }
-        guard approval.sessionID == sessionID else { throw HarnessSupervisorError.approvalSessionMismatch }
-        guard approval.decision == .pending else { throw HarnessSupervisorError.approvalAlreadyResolved }
-        if let executionDriver = driver(for: sessionID) {
-            try await executionDriver.resolveApproval(sessionID: sessionID, approvalID: approvalID, decision: decision)
+        print("→ [SUPERVISOR] resolveApproval called: sessionID=\(sessionID), approvalID=\(approvalID), decision=\(decision)")
+
+        guard let approval = try repository.approval(id: approvalID) else {
+            print("❌ [SUPERVISOR] Approval not found")
+            throw HarnessSupervisorError.approvalNotFound
         }
+        guard approval.sessionID == sessionID else {
+            print("❌ [SUPERVISOR] Session ID mismatch")
+            throw HarnessSupervisorError.approvalSessionMismatch
+        }
+        guard approval.decision == .pending else {
+            print("❌ [SUPERVISOR] Approval already resolved")
+            throw HarnessSupervisorError.approvalAlreadyResolved
+        }
+
+        if let executionDriver = driver(for: sessionID) {
+            print("→ [SUPERVISOR] ExecutionDriver found, calling resolveApproval")
+            try await executionDriver.resolveApproval(sessionID: sessionID, approvalID: approvalID, decision: decision)
+        } else {
+            print("⚠️ [SUPERVISOR] ExecutionDriver is nil - only updating database")
+        }
+
         // Native Agent resume persists this transition itself so the resumed
         // tool call and its approval share one causal event chain. Lightweight
         // drivers used by Control Plane/tests do not, therefore the
@@ -98,6 +136,9 @@ public actor SessionSupervisor: DurableSessionSupervisor {
                 commandID: "harness-approval-\(approvalID)-\(decision.rawValue)",
                 causationID: approvalID
             )
+            print("✅ [SUPERVISOR] Database updated successfully")
+        } else {
+            print("→ [SUPERVISOR] Approval already resolved by driver, skipping database update")
         }
     }
 

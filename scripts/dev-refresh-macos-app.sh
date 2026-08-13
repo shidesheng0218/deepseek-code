@@ -9,6 +9,9 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 "$ROOT_DIR/scripts/build-macos-app.sh"
 
 pkill -f "$APP_DST/Contents/MacOS/DeepSeekCode" 2>/dev/null || true
+pkill -f "$APP_DST/Contents/Resources/deepseekd" 2>/dev/null || true
+pkill -f "$APP_DST/Contents/Resources/deepseek-worker" 2>/dev/null || true
+pkill -f "$APP_DST/Contents/Resources/DeepSeekCodeToolHost" 2>/dev/null || true
 APP_STAGE="/Applications/.DeepSeek Code.app.stage.$$"
 APP_BACKUP="/Applications/.DeepSeek Code.app.previous"
 rm -rf "$APP_STAGE" "$APP_BACKUP"

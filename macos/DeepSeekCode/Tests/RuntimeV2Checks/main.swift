@@ -72,13 +72,134 @@ struct DeepSeekCodeRuntimeV2Checks {
         // Conversation text must never collapse into a one-character-wide
         // column when CJK text is rendered inside a flexible timeline row.
         precondition(WorkspaceDesignTokens.conversationMessageMinWidth >= 320)
+        precondition(AgentResponseStyle.userFacingInstruction(mode: .acceptEdits).contains("像有经验的同事"))
+        precondition(AgentResponseStyle.userFacingInstruction(mode: .acceptEdits).contains("不要暴露内部工具名"))
+        let mechanicalInternalResponse = ResponseQualityValidator.validate(
+            "web_fetch 已完成，deepseek-v4-flash 输出 92 tokens。Delivered。",
+            contract: ResponseContract(kind: .directAnswer, requiredSections: [], maximumParagraphs: 3),
+            evidence: QualityEvidenceState()
+        )
+        precondition(!mechanicalInternalResponse.passed)
+        precondition(!TaskContract.compatibility(prompt: "明天北京的天气如何").requiresDeliveryGate)
+        precondition(TaskContract(goal: "修复登录", requiredChanges: ["App.swift"]).requiresDeliveryGate)
         // If one public HTML search endpoint is unavailable, the default
         // runtime must have a second no-key provider to try.
         let builtInSearchProviders = WebToolHost().searchProviders.map(\.id)
         precondition(builtInSearchProviders.contains("duckduckgo"))
         precondition(builtInSearchProviders.contains("bing"))
+        // A direct-answer plan controls only the pre-tool fast path. Once a
+        // model explicitly calls a read-only web tool it must advance to the
+        // Research Grant / SSRF gate instead of failing as DIRECT_ANSWER_PATH.
+        let directPlan = TaskQualityPlanner.plan(route: TaskRouter.route(TaskRoutingInput(prompt: "Swift actor 是什么？", mode: .acceptEdits)))
+        let explicitWebSearch = RegisteredTool(name: "web.search", description: "search", parameters: .object([:]), effect: .network, risk: .l2, timeoutMilliseconds: 10_000, maxOutputBytes: 32_000, idempotent: true, supportsCancellation: true)
+        precondition(ToolDecisionPolicy.decide(for: explicitWebSearch, plan: directPlan, evidence: QualityEvidenceState()) == .execute)
+        // GUI delegates only fully daemon-capable tasks. Browser/attachments,
+        // SSH and configured extension hosts stay on the foreground path
+        // until those capabilities have an equivalent durable daemon host.
+        precondition(DaemonExecutionEligibility.isEligible(
+            target: .local,
+            parts: [.text("读取项目结构")],
+            route: TaskRouter.route(TaskRoutingInput(prompt: "读取项目结构", mode: .acceptEdits, hasProject: true)),
+            hasEnabledHooks: false,
+            hasEnabledMCP: false
+        ))
+        precondition(!DaemonExecutionEligibility.isEligible(
+            target: .ssh,
+            parts: [.text("读取项目结构")],
+            route: TaskRouter.route(TaskRoutingInput(prompt: "读取项目结构", mode: .acceptEdits, hasProject: true)),
+            hasEnabledHooks: false,
+            hasEnabledMCP: false
+        ))
+        precondition(!DaemonExecutionEligibility.isEligible(
+            target: .local,
+            parts: [.text("打开浏览器验证")],
+            route: TaskRouter.route(TaskRoutingInput(prompt: "打开浏览器验证", mode: .acceptEdits, hasProject: true)),
+            hasEnabledHooks: false,
+            hasEnabledMCP: false
+        ))
+        precondition(!DaemonExecutionEligibility.isEligible(
+            target: .local,
+            parts: [.text("读取项目结构")],
+            route: TaskRouter.route(TaskRoutingInput(prompt: "读取项目结构", mode: .acceptEdits, hasProject: true)),
+            hasEnabledHooks: true,
+            hasEnabledMCP: false
+        ))
+        let liveMarketRoute = TaskRouter.route(TaskRoutingInput(prompt: "今天股市行情怎么样？", mode: .acceptEdits))
+        precondition(liveMarketRoute.kind == .research)
+        precondition(liveMarketRoute.needsResearch)
+        precondition(TaskQualityPlanner.plan(route: liveMarketRoute).requiresCitations)
+        // Provider reasoning is retained in the durable event log for audit,
+        // but it is not a user-facing chat message.
+        let visibleParts = SessionPartProjector.project(events: [
+            SessionEvent(sequence: 1, type: "user_message", payload: ["text": "今天股市行情怎么样？"]),
+            SessionEvent(sequence: 2, type: "assistant_reasoning", payload: ["text": "internal analysis"]),
+            SessionEvent(sequence: 3, type: "tool_requested", payload: ["tool": "web_search", "callID": "weather-search"]),
+            SessionEvent(sequence: 4, type: "tool_completed", payload: ["tool": "web_search", "callID": "weather-search", "ok": "true"]),
+            SessionEvent(sequence: 5, type: "assistant_text", payload: ["text": "我正在查询最新行情。"])
+        ])
+        precondition(!visibleParts.contains { $0.kind == .reasoning })
+        // Tool executions remain durable Session Parts for Evidence, but the
+        // default conversation must not expose internal names such as
+        // web_search / web_fetch as chat cards.
+        precondition(visibleParts.contains { $0.kind == .toolCall && $0.title == "web_search" })
+        let primaryConversation = ConversationProjector.timeline(parts: visibleParts)
+        precondition(primaryConversation.map(\.kind) == [.user, .assistant])
+        precondition(primaryConversation.map(\.text) == ["今天股市行情怎么样？", "我正在查询最新行情。"])
+        let noisyRuntimeConversation = ConversationProjector.timeline(events: [
+            SessionEvent(sequence: 1, type: "user_message", payload: ["text": "明天北京的天气如何"]),
+            SessionEvent(sequence: 2, type: "tool_requested", payload: ["tool": "web_fetch", "callID": "fetch-1"]),
+            SessionEvent(sequence: 3, type: "tool_completed", payload: ["tool": "web_fetch", "callID": "fetch-1", "ok": "true"]),
+            SessionEvent(sequence: 4, type: "web_search_completed", payload: ["query": "北京天气", "providerID": "bing", "resultCount": "0", "succeeded": "true"]),
+            SessionEvent(sequence: 5, type: "web_fetch_completed", payload: ["url": "https://weather.com.cn", "status": "200", "succeeded": "true"]),
+            SessionEvent(sequence: 6, type: "usage_recorded", payload: ["model": "deepseek-v4-flash", "output": "93"]),
+            SessionEvent(sequence: 7, type: "assistant_text", payload: ["text": "目前没拿到可靠天气源，我建议换一个公开天气源再查。"]),
+            SessionEvent(sequence: 8, type: "verification_gate_evaluated", payload: ["passed": "false", "missing": "Browser|CI"])
+        ])
+        precondition(noisyRuntimeConversation.map(\.kind) == [.user, .assistant])
+        precondition(!noisyRuntimeConversation.contains { $0.text.contains("web_fetch") || $0.title.contains("交付门禁") || $0.text.contains("tokens") })
+        // A failed tool card must retain a localized, actionable diagnostic
+        // instead of collapsing every failure into the unhelpful “执行失败”.
+        let failedSearchParts = SessionPartProjector.project(events: [
+            SessionEvent(sequence: 1, type: "tool_requested", payload: ["tool": "web_search", "callID": "search-1"]),
+            SessionEvent(sequence: 2, type: "tool_completed", payload: [
+                "tool": "web_search",
+                "callID": "search-1",
+                "ok": "false",
+                "code": "SEARCH_PROVIDER_UNAVAILABLE",
+                "message": "搜索服务暂时不可用，请稍后重试。"
+            ])
+        ])
+        precondition(failedSearchParts.last?.state == .failed)
+        precondition(failedSearchParts.last?.text == "搜索服务暂时不可用，请稍后重试。")
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("deepseek-runtime-v2-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
+
+        let claudeRoot = root.appendingPathComponent("claude-project", isDirectory: true)
+        let claudeFeature = claudeRoot.appendingPathComponent("Sources/Feature", isDirectory: true)
+        try FileManager.default.createDirectory(at: claudeFeature, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: claudeRoot.appendingPathComponent(".claude/agents", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: claudeRoot.appendingPathComponent(".claude/skills/review", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: claudeRoot.appendingPathComponent(".claude/hooks", isDirectory: true), withIntermediateDirectories: true)
+        try Data("root rule".utf8).write(to: claudeRoot.appendingPathComponent("CLAUDE.md"))
+        try Data("feature rule".utf8).write(to: claudeFeature.appendingPathComponent("AGENTS.md"))
+        try Data("{\"permissions\":{\"allow\":[\"Bash(git status)\"],\"ask\":[\"Bash(npm install)\"],\"deny\":[\"Bash(rm -rf /)\"]},\"model\":\"claude-fixture\",\"unknownSetting\":true}".utf8).write(to: claudeRoot.appendingPathComponent(".claude/settings.json"))
+        try Data("---\nname: reviewer\ndescription: Review only\nmodel: fast\ntools: read_file,search_workspace\npermissionMode: plan\nmaxTurns: 4\n---\nRead-only review agent.".utf8).write(to: claudeRoot.appendingPathComponent(".claude/agents/reviewer.md"))
+        try Data("# Review Skill\nReview the diff.".utf8).write(to: claudeRoot.appendingPathComponent(".claude/skills/review/SKILL.md"))
+        try Data("#!/bin/zsh\nprintf hook".utf8).write(to: claudeRoot.appendingPathComponent(".claude/hooks/preflight.sh"))
+        try Data("{\"mcpServers\":{\"docs\":{\"command\":\"docs-mcp\",\"args\":[\"--stdio\"]}}}".utf8).write(to: claudeRoot.appendingPathComponent(".mcp.json"))
+        let claudeCompatibility = try ClaudeCompatibilityLoader.load(workspaceRoot: claudeRoot, workingDirectory: claudeFeature)
+        precondition(claudeCompatibility.instructions.text.contains("root rule"))
+        precondition(claudeCompatibility.instructions.text.contains("feature rule"))
+        precondition(claudeCompatibility.settings.allowPatterns == ["Bash(git status)"])
+        precondition(claudeCompatibility.settings.askPatterns == ["Bash(npm install)"])
+        precondition(claudeCompatibility.settings.denyPatterns == ["Bash(rm -rf /)"])
+        precondition(claudeCompatibility.settings.unsupportedFields.contains("unknownSetting"))
+        precondition(claudeCompatibility.agents.first?.name == "reviewer")
+        precondition(claudeCompatibility.skills.contains { $0.id == "review" && $0.scope == "claude-project" })
+        precondition(claudeCompatibility.hooks.first?.trusted == false)
+        precondition(claudeCompatibility.mcpServers.first?.name == "docs")
+        let discoveredClaudeSkills = try SkillCatalog.discover(projectDirectory: claudeRoot)
+        precondition(discoveredClaudeSkills.contains { $0.id == "review" && $0.scope == "claude-project" })
 
         let repository = try SessionRepository(directory: root.appendingPathComponent("db", isDirectory: true))
         let project = try repository.createProject(name: "Runtime V2", path: root.path)
@@ -92,6 +213,28 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(attach.eventCursor == 0)
         let recovered = try await daemon.recoverAll()
         precondition(recovered.contains { $0.sessionID == harnessSession.id })
+
+        // Runtime ownership is durable rather than an ephemeral GUI worker
+        // card. A Session may change from deepseekd to the foreground App
+        // when it needs a capability the daemon does not host yet; after a
+        // restart, approvals must be sent to that most recent owner.
+        precondition(SessionRuntimeOwnership.owner(sessionID: harnessSession.id, repository: repository) == nil)
+        try SessionRuntimeOwnership.assign(
+            .daemon,
+            sessionID: harnessSession.id,
+            repository: repository,
+            instanceID: "daemon-fixture",
+            commandID: "runtime-owner-daemon-fixture"
+        )
+        precondition(SessionRuntimeOwnership.owner(sessionID: harnessSession.id, repository: repository) == .daemon)
+        try SessionRuntimeOwnership.assign(
+            .foregroundApp,
+            sessionID: harnessSession.id,
+            repository: repository,
+            instanceID: "app-fixture",
+            commandID: "runtime-owner-app-fixture"
+        )
+        precondition(SessionRuntimeOwnership.owner(sessionID: harnessSession.id, repository: repository) == .foregroundApp)
 
         let traceEvents = [
             SessionEvent(sessionID: session.id, sequence: 1, type: "terminal_started", payload: ["terminalID": "term-1"]),
@@ -208,6 +351,10 @@ struct DeepSeekCodeRuntimeV2Checks {
             parts: [.text("不得重复执行")]
         ))
         precondition(admitted.inputID == admittedAgain.inputID)
+        let admittedUserMessages = try repository.events(sessionID: harnessSession.id).filter { $0.type == "user_message" }
+        precondition(admittedUserMessages.count == 1)
+        precondition(admittedUserMessages.first?.payload["text"] == "执行 Harness 验收")
+        precondition(admittedUserMessages.first?.payload["inputID"] == admitted.inputID)
         try await supervisor.start(sessionID: harnessSession.id)
         try await supervisor.pause(sessionID: harnessSession.id)
         try await supervisor.resume(sessionID: harnessSession.id)
@@ -239,7 +386,7 @@ struct DeepSeekCodeRuntimeV2Checks {
         let parts = try repository.sessionParts(sessionID: session.id)
         precondition(parts?.parts.map(\.kind) == [.user, .assistantText, .toolCall])
         precondition(parts?.parts.last?.state == .completed)
-        precondition(ConversationProjector.timeline(parts: parts?.parts ?? []).count == 3)
+        precondition(ConversationProjector.timeline(parts: parts?.parts ?? []).map(\.kind) == [.user, .assistant])
 
         let coordinator = WorkerSessionCoordinator(repository: repository)
         do {
@@ -267,7 +414,26 @@ struct DeepSeekCodeRuntimeV2Checks {
         let childResult = try await childRuntime.collect(workerSessionID: child.id)
         precondition(childResult.summary == "只读 Worker 已完成")
         let storedChild = try repository.workerSession(id: child.id)
-        precondition(storedChild?.state == .completed)
+        precondition(storedChild?.state == .awaitingAdoption)
+        try await childRuntime.adopt(workerSessionID: child.id)
+        let adoptedChild = try repository.workerSession(id: child.id)
+        precondition(adoptedChild?.state == .completed)
+
+        let workerRoot = root.appendingPathComponent("worker-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: workerRoot.appendingPathComponent("Sources", isDirectory: true), withIntermediateDirectories: true)
+        try Data("# Worker fixture\n".utf8).write(to: workerRoot.appendingPathComponent("README.md"))
+        try Data("struct Fixture {}\n".utf8).write(to: workerRoot.appendingPathComponent("Sources/Fixture.swift"))
+        let workerHelperResult = try await WorkerHelperService.execute(WorkerHelperRequest(
+            workerSessionID: "helper-explore",
+            sessionID: session.id,
+            workerID: "explore-helper",
+            workspaceRoot: workerRoot.path,
+            contract: WorkerSessionContract(parentSessionID: session.id, workerKind: .explore, objective: "概览项目结构")
+        ))
+        let workerEnvelope = try unwrap(workerHelperResult.result)
+        precondition(workerEnvelope.evidenceIDs.count == 1)
+        precondition(workerEnvelope.summary.contains("README.md"))
+        precondition(workerEnvelope.outputHash.count == 64)
 
         let planTools = ToolAvailabilityResolver.resolve(providerCapabilities: .deepSeekTextOnly, agentMode: .plan, workerKind: .main, target: .local, projectTrusted: true, sandboxAvailable: true)
         precondition(planTools.contains(where: { $0.name == "read_file" }))
@@ -303,6 +469,20 @@ struct DeepSeekCodeRuntimeV2Checks {
         let blockedPrivateURL = await network.authorize(url: URL(string: "http://127.0.0.1:8080")!, capability: .webFetch, operation: .read, sessionID: session.id, projectID: project.id)
         precondition(allowedResearchURL == .allow)
         precondition(blockedPrivateURL == .block)
+        let knownFetchGrant = await network.hasResearchReadGrant(capability: .webFetch, sessionID: session.id, projectID: project.id, url: URL(string: "https://react.dev/reference/react/useEffect")!)
+        let unknownFetchGrant = await network.hasResearchReadGrant(capability: .webFetch, sessionID: session.id, projectID: project.id, url: URL(string: "https://swift.org/documentation/")!)
+        precondition(knownFetchGrant)
+        precondition(!unknownFetchGrant)
+        // Public read-only research should be low-friction: search and fetch
+        // can both proceed automatically for safe public URLs, while the base
+        // SSRF/private-network policy still blocks unsafe destinations.
+        _ = await network.autoGrantResearchReadOnly(sessionID: traceSession.id, projectID: project.id)
+        let publicSearch = await network.authorize(url: URL(string: "https://www.swift.org/documentation/")!, capability: .webSearch, operation: .read, sessionID: traceSession.id, projectID: project.id)
+        let publicFetch = await network.authorize(url: URL(string: "https://www.swift.org/documentation/")!, capability: .webFetch, operation: .read, sessionID: traceSession.id, projectID: project.id)
+        let privateFetch = await network.authorize(url: URL(string: "http://127.0.0.1:8080/private")!, capability: .webFetch, operation: .read, sessionID: traceSession.id, projectID: project.id)
+        precondition(publicSearch == .allow)
+        precondition(publicFetch == .allow)
+        precondition(privateFetch == .block)
         print("DeepSeek Runtime V2 checks passed")
     }
 }
@@ -313,4 +493,9 @@ private struct RuntimeV2StaticMCPTransport: MCPTransport {
     func request(_ request: MCPJSONRPCRequest) async throws -> MCPJSONRPCResponse {
         try MCPJSONRPCResponse.decode(line: response)
     }
+}
+
+private func unwrap<T>(_ value: T?) throws -> T {
+    guard let value else { throw NSError(domain: "DeepSeekRuntimeV2Checks", code: 1) }
+    return value
 }
