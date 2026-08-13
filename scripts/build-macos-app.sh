@@ -84,17 +84,40 @@ fi
 mv "$APP_STAGE" "$APP_DIR"
 rm -rf "$APP_DIR.previous"
 
-# 自动更新 /Applications 中的应用，删除旧版本
+# 自动更新 /Applications 中的应用
 INSTALL_DIR="/Applications/DeepSeek Code.app"
+
+# 1. 关闭正在运行的应用
+echo "正在检查是否有运行中的 DeepSeek Code..."
+pkill -9 "DeepSeekCode" 2>/dev/null || true
+sleep 1
+
+# 2. 删除旧版本
 if [[ -e "$INSTALL_DIR" ]]; then
   echo "正在删除旧版本: $INSTALL_DIR"
   rm -rf "$INSTALL_DIR"
 fi
+
+# 3. 安装新版本
 echo "正在安装最新版本到 Applications..."
 cp -R "$APP_DIR" "$INSTALL_DIR"
-# 重置 Launchpad 缓存以清除重复图标
-defaults write com.apple.dock ResetLaunchPad -bool true
-killall Dock 2>/dev/null || true
 
-echo "Built: $APP_DIR"
-echo "Installed: $INSTALL_DIR"
+# 4. 清理可能存在的其他副本（避免重复图标）
+echo "正在清理重复的应用副本..."
+find /Applications -name "DeepSeek Code*.app" -not -path "$INSTALL_DIR" -exec rm -rf {} + 2>/dev/null || true
+
+# 5. 重置 Launchpad 缓存
+echo "正在重置 Launchpad 缓存..."
+defaults write com.apple.dock ResetLaunchPad -bool true
+killall Dock
+
+# 6. 等待 Dock 重启
+sleep 2
+
+echo ""
+echo "✅ 构建完成！"
+echo "📦 构建目录: $APP_DIR"
+echo "📱 安装位置: $INSTALL_DIR"
+echo "🔄 Launchpad 已重置，重复图标已清除"
+echo ""
+echo "请从 Applications 文件夹或 Spotlight 启动新版本的 DeepSeek Code"
