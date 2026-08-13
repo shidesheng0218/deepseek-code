@@ -137,6 +137,12 @@ public final class WorkspaceStore {
     public var agentReplyDraft = ""
     public private(set) var controlPlanePairing: ControlPlanePairing?
     public var pendingApproval: PendingToolApproval?
+
+    // 防抖缓冲区，用于减少流式更新频率
+    private var streamingBuffer = ""
+    private var streamingTask: Task<Void, Never>?
+    private let streamingDebounceInterval: TimeInterval = 0.05  // 50ms
+
     public var workspaceEntries: [WorkspaceDirectoryEntry] = []
     public var fileTree: [WorkspaceFileNode] = []
     public var expandedFilePaths: Set<String> = []
@@ -164,6 +170,7 @@ public final class WorkspaceStore {
     private let repository: SessionRepository?
     private let sessionSupervisor: SessionSupervisor?
     private let harnessDaemon: LocalHarnessDaemon?
+    private var connectedDaemonClient: DeepSeekDaemonClient?
     private var controlPlane: LocalControlPlane?
     private var controlPlaneEventObserverID: UUID?
     private let networkRuntime: NetworkRuntime
@@ -1015,23 +1022,10 @@ public final class WorkspaceStore {
         }
         let message = ConversationMessage(role: .user, text: effectivePrompt, attachments: outgoingAttachments)
         conversationMessages.append(message)
-        let attachmentsJSON = (try? String(data: JSONEncoder().encode(outgoingAttachments), encoding: .utf8)) ?? "[]"
-        let optimisticEntryID: String
-        do {
-            if let repository {
-                let event = try repository.appendDurable(sessionID: sessionID, type: "user_message", payload: [
-                    "text": effectivePrompt,
-                    "attachments": outgoingAttachments.map(\.id).joined(separator: ","),
-                    "attachmentsJSON": attachmentsJSON
-                ])
-                optimisticEntryID = "user-\(event.id.uuidString)"
-            } else {
-                optimisticEntryID = "pending-user-\(UUID().uuidString)"
-            }
-        } catch {
-            optimisticEntryID = "pending-user-\(UUID().uuidString)"
-            statusMessage = "消息已显示，但本地事件写入失败：\(error.localizedDescription)"
-        }
+        // The Supervisor owns the durable user_message event. This temporary
+        // card gives the composer immediate feedback and is replaced by the
+        // projection once input admission returns a stable event ID.
+        let optimisticEntryID = "pending-user-\(UUID().uuidString)"
         conversationTimeline = ConversationProjector.deduplicatedTimeline(
             conversationTimeline + [ConversationEntry(id: optimisticEntryID, kind: .user, text: effectivePrompt, attachments: outgoingAttachments)]
         )
@@ -1072,10 +1066,35 @@ public final class WorkspaceStore {
         }
         statusMessage = "Agent 正在准备…"
         updateSelectedSessionStatus(.running)
+        let route = TaskRouter.route(TaskRoutingInput(
+            prompt: effectivePrompt,
+            mode: mode,
+            hasAttachments: outgoingParts.contains { if case .text = $0 { return false }; return true },
+            hasProject: !isScratchProject
+        ))
+        if DaemonExecutionEligibility.isEligible(
+            target: executionTarget,
+            parts: outgoingParts,
+            route: route,
+            hasEnabledHooks: hooks.contains { $0.enabled && $0.trusted },
+            hasEnabledMCP: mcpServers.contains { $0.enabled && $0.trusted }
+        ) {
+            startDaemonAgentRun(sessionID: sessionID, parts: outgoingParts)
+            return
+        }
         if let sessionSupervisor {
             Task { [weak self] in
                 guard let self else { return }
                 do {
+                    if let repository = self.repository {
+                        try SessionRuntimeOwnership.assign(
+                            .foregroundApp,
+                            sessionID: sessionID,
+                            repository: repository,
+                            instanceID: "DeepSeekCodeApp-\(ProcessInfo.processInfo.processIdentifier)",
+                            commandID: "runtime-owner-foreground-\(sessionID)-\(UUID().uuidString)"
+                        )
+                    }
                     _ = try await sessionSupervisor.admit(SessionInput(
                         sessionID: sessionID,
                         idempotencyKey: "send-\(UUID().uuidString)",
@@ -1094,6 +1113,114 @@ public final class WorkspaceStore {
         } else {
             startAgentRun(promptOverride: effectivePrompt, partsOverride: outgoingParts, sessionIDOverride: sessionID)
         }
+    }
+
+    /// Sends supported GUI tasks through the same `deepseekd` Supervisor as
+    /// the CLI. Foreground-only capabilities are intentionally screened by
+    /// `DaemonExecutionEligibility` before reaching this method.
+    private func startDaemonAgentRun(sessionID: String, parts: [ContentPart]) {
+        let worker = agentWorkerRegistry.create(sessionID: sessionID, prompt: parts.plainText, kind: .main)
+        agentWorkerRegistry.transition(
+            id: worker.id,
+            state: .running,
+            detail: "由 deepseekd 执行",
+            checkpoint: AgentWorkerCheckpoint(title: "Runtime", detail: "已交给本地 daemon")
+        )
+        agentWorkers = agentWorkerRegistry.records(sessionID: sessionID)
+        selectedAgentWorkerID = worker.id
+        agentRunTasks[sessionID] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try await self.daemonClient()
+                let receipt = try await self.sendDaemon(
+                    .inputAdmit,
+                    payload: DeepSeekDaemonInputPayload(
+                        sessionID: sessionID,
+                        idempotencyKey: "gui-daemon-\(UUID().uuidString)",
+                        delivery: .immediate,
+                        parts: parts
+                    ),
+                    client: client
+                )
+                _ = receipt
+                _ = try await self.sendDaemon(
+                    .sessionStart,
+                    payload: DeepSeekDaemonSessionPayload(sessionID: sessionID),
+                    client: client
+                )
+                await self.followDaemonSession(sessionID: sessionID, workerID: worker.id, client: client)
+            } catch {
+                self.agentWorkerRegistry.transition(id: worker.id, state: .needsAttention, detail: "deepseekd 不可用", errorMessage: error.localizedDescription)
+                self.agentWorkers = self.agentWorkerRegistry.records(sessionID: sessionID)
+                self.statusMessage = "本地 Runtime 启动失败：\(error.localizedDescription)"
+                self.updateSelectedSessionStatus(.needsAttention)
+            }
+        }
+    }
+
+    private func daemonClient() async throws -> DeepSeekDaemonClient {
+        if let connectedDaemonClient,
+           let response = try? await connectedDaemonClient.send(DeepSeekDaemonRequest(method: .handshake)),
+           response.ok {
+            return connectedDaemonClient
+        }
+        let client = try await DeepSeekDaemonLauncher.connect(storageRoot: storageDirectory)
+        connectedDaemonClient = client
+        return client
+    }
+
+    private func sendDaemon<T: Encodable>(
+        _ method: DeepSeekDaemonMethod,
+        payload: T,
+        client: DeepSeekDaemonClient
+    ) async throws -> DeepSeekDaemonResponse {
+        let encoded = String(decoding: try DeepSeekDaemonJSON.encoder.encode(payload), as: UTF8.self)
+        let response = try await client.send(DeepSeekDaemonRequest(method: method, payload: encoded))
+        guard response.ok else { throw UnifiedRuntimeError.remote(response.output) }
+        return response
+    }
+
+    private func followDaemonSession(sessionID: String, workerID: String, client: DeepSeekDaemonClient) async {
+        var cursor = (try? repository?.events(sessionID: sessionID).last?.sequence) ?? 0
+        let deadline = Date().addingTimeInterval(600)
+        while Date() < deadline, !Task.isCancelled {
+            do {
+                let eventsResponse = try await sendDaemon(
+                    .sessionEvents,
+                    payload: DeepSeekDaemonEventsPayload(sessionID: sessionID, afterSequence: cursor),
+                    client: client
+                )
+                let events = try DeepSeekDaemonJSON.decoder.decode([SessionEvent].self, from: Data(eventsResponse.output.utf8))
+                if let last = events.last { cursor = max(cursor, last.sequence) }
+                refreshSelectedSession()
+                let receiptResponse = try await sendDaemon(
+                    .sessionAttach,
+                    payload: DeepSeekDaemonSessionPayload(sessionID: sessionID),
+                    client: client
+                )
+                let receipt = try DeepSeekDaemonJSON.decoder.decode(SessionAttachReceipt.self, from: Data(receiptResponse.output.utf8))
+                if receipt.status == .awaitingToolApproval || receipt.status == .awaitingApproval {
+                    agentWorkerRegistry.transition(id: workerID, state: .waitingApproval, detail: "等待用户审批")
+                    pendingApproval = (try? repository?.runState(sessionID: sessionID))??.pendingApproval
+                    statusMessage = "任务等待审批"
+                    break
+                }
+                if [.completed, .delivered, .needsRepair, .needsAttention, .failed].contains(receipt.status) {
+                    let state: AgentWorkerState = receipt.status == .failed || receipt.status == .needsAttention ? .needsAttention : .completed
+                    agentWorkerRegistry.transition(id: workerID, state: state, detail: receipt.status.title)
+                    finalizeTaskContract(sessionID: sessionID)
+                    break
+                }
+                try await Task.sleep(nanoseconds: 150_000_000)
+            } catch {
+                agentWorkerRegistry.transition(id: workerID, state: .needsAttention, detail: "daemon 连接中断", errorMessage: error.localizedDescription)
+                statusMessage = "本地 Runtime 连接中断：\(error.localizedDescription)"
+                break
+            }
+        }
+        agentRunTasks[sessionID] = nil
+        agentWorkers = agentWorkerRegistry.records(sessionID: sessionID)
+        refreshSelectedSession()
     }
 
     /// Starts a supervised Agent run and keeps a cancellable control handle so
@@ -1183,9 +1310,20 @@ public final class WorkspaceStore {
     }
 
     private func resumeAgentApprovalForSupervisor(sessionID: String, approvalID: String, decision: ApprovalDecision) async {
-        guard let eventStore, let apiKey = loadAPIKey() else { return }
+        print("→ [APPROVAL] resumeAgentApprovalForSupervisor called: sessionID=\(sessionID), approvalID=\(approvalID)")
+
+        guard let eventStore else {
+            print("❌ [APPROVAL] eventStore is nil")
+            return
+        }
+        guard let apiKey = loadAPIKey() else {
+            print("❌ [APPROVAL] apiKey is nil")
+            return
+        }
+
         let profile = currentProfile
         let workerID = agentWorkers.first(where: { $0.sessionID == sessionID && $0.kind == .main && $0.state == .waitingApproval })?.id
+
         do {
             let client = try ProviderClientFactory.make(
                 profile: profile,
@@ -1213,13 +1351,21 @@ public final class WorkspaceStore {
             )
             let orchestrator = NativeSessionOrchestrator(host: host)
             pendingApproval = nil
+
+            print("→ [APPROVAL] Starting Agent resume stream...")
+            var eventCount = 0
             for try await event in orchestrator.resume(sessionID: sessionID, approvalID: approvalID, decision: decision) {
+                eventCount += 1
+                print("→ [APPROVAL] Event #\(eventCount): \(event)")
                 apply(event: event, profile: profile)
                 if let workerID { updateAgentWorker(for: workerID, event: event) }
             }
+            print("✅ [APPROVAL] Agent resume completed, received \(eventCount) events")
+
             refreshGitStatus()
             finalizeTaskContract(sessionID: sessionID)
         } catch {
+            print("❌ [APPROVAL] Resume failed with error: \(error)")
             statusMessage = "审批恢复失败：\(error.localizedDescription)"
             _ = try? repository?.appendDurable(sessionID: sessionID, type: "harness_approval_resume_failed", payload: ["approvalID": approvalID, "message": SecretRedactor.redact(error.localizedDescription)])
         }
@@ -1613,6 +1759,10 @@ public final class WorkspaceStore {
     @discardableResult
     public func evaluateDeliveryGate() -> DeliveryGateResult? {
         guard let contract = activeTaskContract, hasActiveSession else { return nil }
+        guard contract.requiresDeliveryGate else {
+            deliveryGateResult = nil
+            return nil
+        }
         let hasDiff = !gitDiffOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || verificationGraph.evidenceRecords.contains { $0.kind == .diff && $0.succeeded }
         let indeterminate = repository.map { repo in
             ((try? repo.events(sessionID: selectedSessionID)) ?? []).filter { $0.type == "tool_indeterminate" || $0.type == "tool_indeterminate" || $0.type == "ssh_tool_indeterminate" || $0.type == "mcp_tool_indeterminate" }.count
@@ -1641,11 +1791,23 @@ public final class WorkspaceStore {
     }
 
     public func resolvePendingApproval(_ decision: ApprovalDecision) {
-        guard let pending = pendingApproval, let sessionSupervisor else { return }
+        guard let pending = pendingApproval else {
+            print("❌ [APPROVAL] pendingApproval is nil")
+            statusMessage = "错误：没有待处理的审批"
+            return
+        }
+        guard let sessionSupervisor else {
+            print("❌ [APPROVAL] sessionSupervisor is nil")
+            statusMessage = "错误：SessionSupervisor 未初始化"
+            return
+        }
+
+        print("✅ [APPROVAL] Starting: tool=\(pending.tool), approvalID=\(pending.id), decision=\(decision)")
+
         Task {
             do {
                 if let request = networkApprovalDetails(for: pending), decision == .allowOnce || decision == .allowSession {
-                    if pending.tool == "web.search" || pending.tool == "web_search" || pending.tool == "web.fetch" {
+                    if pending.tool == "web_search" || pending.tool == "web_search" || pending.tool == "web_fetch" {
                         // A research approval covers the bounded read-only
                         // Search → Fetch chain for this Session. It does not
                         // grant browser control, uploads, login or any write.
@@ -1673,16 +1835,52 @@ public final class WorkspaceStore {
                     }
                 }
                 pendingApproval = nil
-                try await sessionSupervisor.resolveApproval(
-                    sessionID: selectedSessionID,
-                    approvalID: pending.id,
-                    decision: decision
-                )
+                if isDaemonOwnedSession(selectedSessionID),
+                   let client = try? await daemonClient() {
+                    print("→ [APPROVAL] Using Daemon path")
+                    let payload = DeepSeekDaemonApprovalPayload(
+                        sessionID: selectedSessionID,
+                        approvalID: pending.id,
+                        decision: decision
+                    )
+                    _ = try await sendDaemon(.approvalResolve, payload: payload, client: client)
+                } else {
+                    print("→ [APPROVAL] Using Supervisor path")
+                    // 直接调用恢复逻辑，确保 Agent 能够继续执行
+                    await resumeAgentApprovalForSupervisor(
+                        sessionID: selectedSessionID,
+                        approvalID: pending.id,
+                        decision: decision
+                    )
+                    // 同步更新数据库状态
+                    try? await sessionSupervisor.resolveApproval(
+                        sessionID: selectedSessionID,
+                        approvalID: pending.id,
+                        decision: decision
+                    )
+                }
+                print("✅ [APPROVAL] Completed successfully")
                 statusMessage = "审批已处理，继续执行"
             } catch {
+                print("❌ [APPROVAL] Failed: \(error)")
                 statusMessage = "恢复任务失败：\(error.localizedDescription)"
             }
         }
+    }
+
+    private func isDaemonOwnedSession(_ sessionID: String) -> Bool {
+        let hasLiveDaemonWorker = agentWorkers.contains {
+            $0.sessionID == sessionID &&
+            $0.kind == .main &&
+            ($0.detail.contains("deepseekd") || $0.checkpoint?.detail.contains("本地 daemon") == true)
+        }
+        if hasLiveDaemonWorker { return true }
+        // Worker cards are deliberately ephemeral. After an App relaunch,
+        // recover the runtime owner from the append-only event log so an
+        // outstanding daemon approval never falls back into the foreground
+        // Agent runtime.
+        guard let repository else { return false }
+        return SessionRuntimeOwnership.owner(sessionID: sessionID, repository: repository) == .daemon
     }
 
     private func networkApprovalDetails(for pending: PendingToolApproval) -> (url: URL, capability: NetworkScope, operation: NetworkOperation)? {
@@ -1693,10 +1891,10 @@ public final class WorkspaceStore {
             object = [:]
         }
         switch pending.tool {
-        case "web.fetch":
+        case "web_fetch":
             guard let raw = object["url"] as? String, let url = URL(string: raw) else { return nil }
             return (url, .webFetch, .read)
-        case "web.search", "web_search":
+        case "web_search":
             let endpoint = searchProviders.first(where: { $0.enabled })?.endpoint ?? "https://www.bing.com/search"
             guard let url = URL(string: endpoint) else { return nil }
             return (url, .webSearch, .read)
@@ -2984,18 +3182,21 @@ public final class WorkspaceStore {
         case let .toolRequested(name):
             statusMessage = "Agent 请求工具：\(name)"
             activityItems.append(ActivityItem(title: name, detail: "Agent 请求执行", state: "进行中"))
-            conversationTimeline.append(ConversationEntry(kind: .tool, title: name, text: "准备执行", state: .running))
         case let .toolCompleted(name, succeeded):
             statusMessage = succeeded ? "工具完成：\(name)" : "工具失败：\(name)"
             activityItems.append(ActivityItem(title: name, detail: succeeded ? "执行完成" : "执行失败", state: succeeded ? "完成" : "失败"))
-            completeLiveTool(name, succeeded: succeeded)
         case let .approvalRequired(tool, risk):
         pendingApproval = ((try? repository?.runState(sessionID: selectedSessionID)) ?? nil)?.pendingApproval
         refreshNetworkState()
             updateSelectedSessionStatus(.awaitingToolApproval)
             statusMessage = "需要审批：\(tool)（L\(risk.rawValue)）"
             activityItems.append(ActivityItem(title: tool, detail: "风险等级 L\(risk.rawValue)", state: "等待审批"))
-            conversationTimeline.append(ConversationEntry(kind: .approval, title: "需要审批", text: "\(tool) · L\(risk.rawValue)", state: .waiting))
+            conversationTimeline.append(ConversationEntry(
+                kind: .approval,
+                title: ConversationProjector.approvalTitle(for: tool),
+                text: ConversationProjector.approvalText(tool: tool, risk: "L\(risk.rawValue)"),
+                state: .waiting
+            ))
         case let .usage(input, cachedInput, output, latencyMilliseconds):
             let beforeCost = usageSummary.estimatedCost
             usageSummary.record(input: input, cachedInput: cachedInput, output: output, pricing: profile)
@@ -3012,6 +3213,7 @@ public final class WorkspaceStore {
                 succeeded: true
             ))
         case .completed:
+            flushStreamingBuffer()
             transcript.flush()
             statusMessage = "Agent 已完成本轮"
         case let .failed(message):
@@ -3021,6 +3223,8 @@ public final class WorkspaceStore {
     }
 
     private func appendLiveAssistantDelta(_ text: String) {
+        // 直接追加到 timeline，不使用防抖
+        // 防抖逻辑在多线程环境下容易出问题
         if let index = conversationTimeline.indices.last, conversationTimeline[index].kind == .assistant {
             conversationTimeline[index].text += text
         } else {
@@ -3028,10 +3232,11 @@ public final class WorkspaceStore {
         }
     }
 
-    private func completeLiveTool(_ tool: String, succeeded: Bool) {
-        guard let index = conversationTimeline.lastIndex(where: { $0.kind == .tool && $0.title == tool && $0.state == .running }) else { return }
-        conversationTimeline[index].state = succeeded ? .completed : .failed
-        conversationTimeline[index].text = succeeded ? "已完成" : "执行失败"
+    private func flushStreamingBuffer() {
+        // 清理状态（虽然不再使用防抖，但保留方法以防其他地方调用）
+        streamingTask?.cancel()
+        streamingTask = nil
+        streamingBuffer = ""
     }
 
     private func toolHost() throws -> WorkspaceToolHost {

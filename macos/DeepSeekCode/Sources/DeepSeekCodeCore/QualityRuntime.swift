@@ -296,8 +296,8 @@ public struct QualityEvidenceState: Codable, Equatable, Sendable {
         let citations = (try? NSRegularExpression(pattern: pattern)).map { $0.numberOfMatches(in: text, range: range) } ?? 0
         var kinds: Set<EvidenceKind> = []
         if citations > 0 || text.contains("citation") { kinds.insert(.citation) }
-        if text.contains("web.search") || text.contains("搜索结果") { kinds.insert(.webSearch) }
-        if text.contains("web.fetch") || text.contains("抓取") { kinds.insert(.webFetch) }
+        if text.contains("web_search") || text.contains("搜索结果") { kinds.insert(.webSearch) }
+        if text.contains("web_fetch") || text.contains("抓取") { kinds.insert(.webFetch) }
         return QualityEvidenceState(kinds: kinds, citationCount: citations)
     }
 }
@@ -320,10 +320,26 @@ public enum ToolDecisionPolicy {
         }
         guard tool.risk != .l4 else { return .blocked("L4 工具永久阻止") }
         if plan.toolIntent == .none {
+            // A direct-answer route controls the *pre-tool* fast path. It
+            // must not turn an explicit, read-only web tool call into a fake
+            // failure. `AgentHost` still routes this through Research Grant,
+            // PermissionBroker and NetworkRuntime's SSRF checks before any
+            // request is sent.
+            if ["web_search", "web_fetch"].contains(tool.name) { return .execute }
             // A direct-answer route should not trigger side effects, but a
             // model may still use an inexpensive local read to answer a
-            // project-adjacent question accurately.
-            return [.readOnly, .browserRead, .computerRead].contains(tool.effect) ? .execute : .answerWithoutTool
+            // project-adjacent question accurately. It may also ask for a
+            // concrete L0/L1 shell probe (for example `pwd`, `git status`,
+            // or a test command); the Permission Broker still owns the
+            // effective approval decision. Never let this exception cover a
+            // workspace write, network action, or L2+ process command.
+            if [.readOnly, .browserRead, .computerRead].contains(tool.effect) {
+                return .execute
+            }
+            if tool.effect == .process, tool.risk <= .l1 {
+                return .execute
+            }
+            return .answerWithoutTool
         }
         if plan.requiresCitations,
            !evidence.hasCitations,
@@ -381,11 +397,13 @@ public struct ResponseQualityAssessment: Codable, Equatable, Sendable {
     public let passed: Bool
     public let missingSections: [String]
     public let missingCitations: Bool
+    public let styleViolations: [String]
 
-    public init(passed: Bool, missingSections: [String], missingCitations: Bool) {
+    public init(passed: Bool, missingSections: [String], missingCitations: Bool, styleViolations: [String] = []) {
         self.passed = passed
         self.missingSections = missingSections
         self.missingCitations = missingCitations
+        self.styleViolations = styleViolations
     }
 }
 
@@ -395,7 +413,41 @@ public enum ResponseQualityValidator {
         let missingSections = contract.requiredSections.filter { !normalized.contains($0.lowercased()) }
         let missingCitations = contract.requiresCitations && !evidence.hasCitations
         let nonempty = !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return ResponseQualityAssessment(passed: nonempty && missingSections.isEmpty && !missingCitations, missingSections: missingSections, missingCitations: missingCitations)
+        let styleViolations = styleViolations(in: response, contract: contract)
+        return ResponseQualityAssessment(
+            passed: nonempty && missingSections.isEmpty && !missingCitations && styleViolations.isEmpty,
+            missingSections: missingSections,
+            missingCitations: missingCitations,
+            styleViolations: styleViolations
+        )
+    }
+
+    private static func styleViolations(in response: String, contract: ResponseContract) -> [String] {
+        let normalized = response.lowercased()
+        var violations: [String] = []
+        let internalMarkers = [
+            "web_fetch",
+            "web_search",
+            "run_command",
+            "terminal.exec",
+            "tool_completed",
+            "tool_requested",
+            "session_status",
+            "deepseek-v",
+            "tokens",
+            "delivered",
+            "needsattention",
+            "needs attention"
+        ]
+        if internalMarkers.contains(where: { normalized.contains($0) }) {
+            violations.append("internal_plumbing")
+        }
+        if contract.kind == .directAnswer {
+            let headingMarkers = ["根因：", "变更：", "验证结果：", "仍存风险：", "输出：", "证据：", "交付："]
+            let headingCount = headingMarkers.filter { response.contains($0) }.count
+            if headingCount >= 2 { violations.append("mechanical_template") }
+        }
+        return violations
     }
 }
 

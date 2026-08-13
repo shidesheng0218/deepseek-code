@@ -17,12 +17,18 @@ cd "$SWIFT_DIR"
 swift build --configuration release --product DeepSeekCode
 swift build --configuration release --product DeepSeekCodeScheduler
 swift build --configuration release --product DeepSeekCodeToolHost
+swift build --configuration release --product deepseekd
+swift build --configuration release --product deepseek
+swift build --configuration release --product deepseek-worker
 
 rm -rf "$APP_STAGE"
 mkdir -p "$APP_STAGE/Contents/MacOS" "$APP_STAGE/Contents/Resources" "$APP_STAGE/Contents/Library"
 cp "$BUILD_DIR/DeepSeekCode" "$APP_STAGE/Contents/MacOS/DeepSeekCode"
 cp "$BUILD_DIR/DeepSeekCodeScheduler" "$APP_STAGE/Contents/Library/DeepSeekCodeScheduler"
 cp "$BUILD_DIR/DeepSeekCodeToolHost" "$APP_STAGE/Contents/Resources/DeepSeekCodeToolHost"
+cp "$BUILD_DIR/deepseekd" "$APP_STAGE/Contents/Resources/deepseekd"
+cp "$BUILD_DIR/deepseek" "$APP_STAGE/Contents/Resources/deepseek"
+cp "$BUILD_DIR/deepseek-worker" "$APP_STAGE/Contents/Resources/deepseek-worker"
 printf '%s\n' "$BUILD_VERSION" > "$APP_STAGE/Contents/Resources/build-stamp.txt"
 
 cat > "$APP_STAGE/Contents/Info.plist" <<PLIST
@@ -48,6 +54,9 @@ if [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
   # nested-signature problems and is unsuitable for a notarized release.
   codesign --force --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP_STAGE/Contents/Library/DeepSeekCodeScheduler"
   codesign --force --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP_STAGE/Contents/Resources/DeepSeekCodeToolHost"
+  codesign --force --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP_STAGE/Contents/Resources/deepseekd"
+  codesign --force --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP_STAGE/Contents/Resources/deepseek"
+  codesign --force --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP_STAGE/Contents/Resources/deepseek-worker"
   codesign --force --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP_STAGE"
 else
   if [[ "${REQUIRE_DEVELOPER_ID_SIGNATURE:-0}" == "1" ]]; then
@@ -75,4 +84,17 @@ fi
 mv "$APP_STAGE" "$APP_DIR"
 rm -rf "$APP_DIR.previous"
 
+# 自动更新 /Applications 中的应用，删除旧版本
+INSTALL_DIR="/Applications/DeepSeek Code.app"
+if [[ -e "$INSTALL_DIR" ]]; then
+  echo "正在删除旧版本: $INSTALL_DIR"
+  rm -rf "$INSTALL_DIR"
+fi
+echo "正在安装最新版本到 Applications..."
+cp -R "$APP_DIR" "$INSTALL_DIR"
+# 重置 Launchpad 缓存以清除重复图标
+defaults write com.apple.dock ResetLaunchPad -bool true
+killall Dock 2>/dev/null || true
+
 echo "Built: $APP_DIR"
+echo "Installed: $INSTALL_DIR"

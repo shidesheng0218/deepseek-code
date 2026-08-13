@@ -139,10 +139,17 @@ public enum SessionPartProjector {
             case "assistant_text":
                 appendOrUpdateText(event: event, kind: .assistantText, title: "DeepSeek", text: payload["text"] ?? "")
             case "assistant_reasoning":
-                appendOrUpdateText(event: event, kind: .reasoning, title: "思考", text: payload["text"] ?? "")
+                // Reasoning remains in the append-only event log for recovery
+                // and diagnostics, but must never be projected into the main
+                // conversation. Showing provider chain-of-thought makes the
+                // user-facing chat noisy and can expose irrelevant internals.
+                continue
             case "agent_completed", "session_turn_completed":
-                if let index = parts.indices.last, parts[index].kind == .assistantText, parts[index].state == .running {
-                    updatePart(index, event: event, state: .completed)
+                // 将所有 running 状态的 assistant 消息标记为 completed
+                for index in parts.indices.reversed() {
+                    if parts[index].kind == .assistantText && parts[index].state == .running {
+                        updatePart(index, event: event, state: .completed)
+                    }
                 }
             case "tool_requested", "tool_started", "tool_completed", "tool_failed", "tool_blocked", "tool_indeterminate":
                 let callID = payload["callID"] ?? "event-\(eventID(event))"
@@ -162,7 +169,20 @@ public enum SessionPartProjector {
                 case "tool_completed":
                     let succeeded = payload["ok"] != "false"
                     let state: SessionPartState = succeeded ? .completed : .failed
-                    let text = succeeded ? "已完成" : "执行失败"
+                    let text: String
+                    if succeeded {
+                        text = "已完成"
+                    } else {
+                        // The durable completion event carries a redacted,
+                        // user-actionable message for expected failures such
+                        // as a rejected network policy, an unavailable search
+                        // provider or a timeout. Do not flatten all of those
+                        // distinct states into the opaque “执行失败”.
+                        text = payload["message"]
+                            ?? payload["error"]
+                            ?? payload["code"]
+                            ?? "执行失败"
+                    }
                     if let index {
                         updatePart(index, event: event, state: state, text: text, evidenceID: payload["evidenceID"])
                     } else {

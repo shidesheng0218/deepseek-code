@@ -45,21 +45,41 @@ public enum PermissionDecision: Equatable, Sendable {
 
 public enum PermissionBroker {
     public static func decision(tool: ToolDescriptor, context: PermissionContext) -> PermissionDecision {
-        if tool.risk == .l4 { return .block(tool.risk) }
+        if tool.risk == .l4 {
+            return .block(tool.risk)
+        }
         let isReadOnly = tool.effect == .readOnly || tool.effect == .browserRead || tool.effect == .computerRead
+
         if context.mode == .plan {
             return isReadOnly && tool.risk == .l0 ? .allow : .block(tool.risk)
         }
-        if isReadOnly && tool.risk == .l0 { return .allow }
-        if context.mode == .manual { return .ask(tool.risk) }
+        if isReadOnly && tool.risk == .l0 {
+            return .allow
+        }
+        if context.mode == .manual {
+            return .ask(tool.risk)
+        }
         if context.mode == .acceptEdits {
             return tool.effect == .workspaceWrite && tool.risk == .l1 ? .allow : .ask(tool.risk)
         }
-        if tool.risk >= .l3 { return .block(tool.risk) }
+
+        // Auto 模式优化：自动允许 web 研究工具（无需项目可信）
+        // 这让体验接近 Claude Code，web 搜索被视为低风险操作
+        if context.mode == .auto {
+            if tool.name == "web_search" || tool.name == "web_fetch" {
+                return .allow
+            }
+        }
+
+        if tool.risk >= .l3 {
+            return .block(tool.risk)
+        }
         if !context.projectTrusted || !context.sandboxAvailable {
             return tool.effect == .workspaceWrite && tool.risk == .l1 ? .allow : .ask(tool.risk)
         }
-        if tool.risk <= .l1 { return .allow }
+        if tool.risk <= .l1 {
+            return .allow
+        }
         return .ask(tool.risk)
     }
 }

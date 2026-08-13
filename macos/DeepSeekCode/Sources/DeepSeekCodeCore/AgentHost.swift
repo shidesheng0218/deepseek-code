@@ -149,13 +149,20 @@ public final class NativeAgentHost: @unchecked Sendable {
     }
 
     public func resume(sessionID: String, approvalID: String, decision: ApprovalDecision) -> AsyncThrowingStream<AgentEvent, Error> {
+        print("→ [AGENTHOST] resume called: sessionID=\(sessionID), approvalID=\(approvalID), decision=\(decision)")
+
         guard let repository else {
+            print("❌ [AGENTHOST] repository is nil")
             return failedStream(AgentHostError.approvalUnavailable)
         }
         let storedState = (try? repository.runState(sessionID: sessionID)) ?? nil
         guard let state = storedState, let pending = state.pendingApproval, pending.id == approvalID else {
+            print("❌ [AGENTHOST] No matching pending approval found")
             return failedStream(AgentHostError.approvalUnavailable)
         }
+
+        print("✅ [AGENTHOST] Found pending approval for tool: \(pending.tool)")
+
         return AsyncThrowingStream { continuation in
             Task {
                 do {
@@ -167,15 +174,18 @@ public final class NativeAgentHost: @unchecked Sendable {
                     }
                     let output: String
                     if decision == .deny {
+                        print("→ [AGENTHOST] User denied approval")
                         output = json(["ok": false, "code": "APPROVAL_DENIED", "message": "用户拒绝了这次工具调用"])
                     } else {
+                        print("→ [AGENTHOST] Executing approved tool: \(pending.tool)")
                         let call = IncrementalToolCall(index: 0, id: pending.toolCallID, name: pending.tool, argumentsJSON: pending.argumentsJSON)
                         switch try await toolExecution(for: call, mode: resumedState.mode, sessionID: sessionID, control: nil, workerKind: .main, approvedByUser: true) {
                         case let .completed(value, succeeded):
+                            print("→ [AGENTHOST] Tool execution completed: succeeded=\(succeeded)")
                             output = value
                             await persistBrowserEvidenceIfAvailable(output: value, call: call, sessionID: sessionID)
                             await persistWebEvidenceIfAvailable(output: value, call: call, sessionID: sessionID)
-                            await persist(sessionID: sessionID, type: "tool_completed", payload: ["tool": call.name, "callID": call.id, "ok": succeeded ? "true" : "false"])
+                            await persist(sessionID: sessionID, type: "tool_completed", payload: toolCompletionPayload(call: call, output: value, succeeded: succeeded))
                             await persist(sessionID: sessionID, type: "evidence_recorded", payload: [
                                 "id": UUID().uuidString,
                                 "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
@@ -184,9 +194,12 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 "succeeded": succeeded ? "true" : "false"
                             ])
                         case let .blocked(value, risk):
+                            print("⚠️ [AGENTHOST] Tool execution blocked: risk=\(risk)")
                             output = value
                             await persist(sessionID: sessionID, type: "tool_blocked", payload: ["tool": call.name, "callID": call.id, "risk": "L\(risk.rawValue)"])
-                        case .approvalRequired: output = json(["ok": false, "code": "APPROVAL_POLICY_CHANGED", "message": "当前权限策略仍不允许该操作"])
+                        case .approvalRequired:
+                            print("⚠️ [AGENTHOST] Tool still requires approval after user approval")
+                            output = json(["ok": false, "code": "APPROVAL_POLICY_CHANGED", "message": "当前权限策略仍不允许该操作"])
                         }
                     }
                     resumedState.messages.append(ChatMessage(role: "tool", content: output, toolCallID: pending.toolCallID))
@@ -195,11 +208,14 @@ public final class NativeAgentHost: @unchecked Sendable {
                     try repository.saveRunState(resumedState)
                     let route = TaskRouter.route(TaskRoutingInput(prompt: resumedState.prompt, mode: resumedState.mode, hasProject: self.workspace != nil))
                     let qualityPlan = TaskQualityPlanner.plan(route: route)
+                    print("→ [AGENTHOST] Continuing Agent stream with new turn...")
                     for try await event in runStream(request: AgentRunRequest(sessionID: sessionID, prompt: resumedState.prompt, budget: resumedState.taskContract?.budget ?? SessionBudget(), mode: resumedState.mode, model: resumedState.model, thinking: resumedState.mode != .plan, taskContract: resumedState.taskContract, pricing: self.defaultPricing, qualityRoute: route, qualityPlan: qualityPlan), initialMessages: resumedState.messages, initialState: resumedState, route: route, qualityPlan: qualityPlan) {
                         continuation.yield(event)
                     }
+                    print("✅ [AGENTHOST] Agent stream completed")
                     continuation.finish()
                 } catch {
+                    print("❌ [AGENTHOST] Resume failed with error: \(error)")
                     continuation.yield(.failed(error.localizedDescription))
                     continuation.finish(throwing: error)
                 }
@@ -234,19 +250,25 @@ public final class NativeAgentHost: @unchecked Sendable {
                 var runState = initialState
                 runState.status = .running
                 try? repository?.saveRunState(runState)
-                if let research = request.taskContract?.webResearch,
-                   research.enabled,
-                   let networkRuntime,
+                // Public research is bounded and read-only. Give each Session
+                // a short-lived search/fetch grant before the model begins so
+                // explicit web tools do not degrade into unnecessary approvals.
+                // The NetworkRuntime still applies SSRF/private-network blocks
+                // before grants, so unsafe destinations cannot be bypassed.
+                if let networkRuntime,
                    let projectID = projectID(for: request.sessionID) {
+                    let research = request.taskContract?.webResearch
+                    let allowedDomains = research?.enabled == true ? Set(research?.allowedDomains ?? []) : []
                     let grant = await networkRuntime.autoGrantResearchReadOnly(
                         sessionID: request.sessionID,
                         projectID: projectID,
-                        allowedDomains: Set(research.allowedDomains)
+                        allowedDomains: allowedDomains
                     )
                     await persist(sessionID: request.sessionID, type: "web_research_auto_grant_created", payload: [
                         "grantID": grant.id,
                         "domains": grant.allowedDomains.sorted().joined(separator: ","),
-                        "expiresAt": ISO8601DateFormatter().string(from: grant.expiresAt)
+                        "expiresAt": ISO8601DateFormatter().string(from: grant.expiresAt),
+                        "scope": allowedDomains.isEmpty ? "public-research" : "contract-domains"
                     ])
                 }
                 do {
@@ -354,7 +376,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                     firstTokenLatencyMilliseconds = UsageLatency.milliseconds(startedAt: modelRequestStartedAt)
                                 }
                                 updateCurrentAssistant { current in
-                                    ChatMessage(
+                                    return ChatMessage(
                                         role: current.role,
                                         parts: current.parts + [.text(text)],
                                         reasoningContent: current.reasoningContent,
@@ -367,7 +389,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 continue
                             case let .reasoningDelta(text):
                                 updateCurrentAssistant { current in
-                                    ChatMessage(
+                                    return ChatMessage(
                                         role: current.role,
                                         parts: current.parts,
                                         reasoningContent: (current.reasoningContent ?? "") + text,
@@ -393,12 +415,22 @@ public final class NativeAgentHost: @unchecked Sendable {
                             }
                             if !calls.isEmpty {
                                 updateCurrentAssistant { current in
-                                    ChatMessage(
+                                    let existingCalls = current.toolCalls ?? []
+                                    var mergedCalls = existingCalls
+                                    for call in calls {
+                                        let next = ChatToolCall(id: call.id, name: call.name, argumentsJSON: call.argumentsJSON)
+                                        if let index = mergedCalls.firstIndex(where: { $0.id == call.id }) {
+                                            mergedCalls[index] = next
+                                        } else {
+                                            mergedCalls.append(next)
+                                        }
+                                    }
+                                    return ChatMessage(
                                         role: current.role,
                                         parts: current.parts,
                                         reasoningContent: current.reasoningContent,
                                         toolCallID: current.toolCallID,
-                                        toolCalls: calls.map { ChatToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON) }
+                                        toolCalls: mergedCalls
                                     )
                                 }
                             }
@@ -427,7 +459,9 @@ public final class NativeAgentHost: @unchecked Sendable {
                                         await persistBrowserEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                         await persistWebEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                         continuation.yield(.toolCompleted(name: call.name, succeeded: succeeded))
-                                        await persist(sessionID: request.sessionID, type: "tool_completed", payload: ["tool": call.name, "callID": call.id, "ok": succeeded ? "true" : "false", "parallel": "true"])
+                                        var completionPayload = toolCompletionPayload(call: call, output: output, succeeded: succeeded)
+                                        completionPayload["parallel"] = "true"
+                                        await persist(sessionID: request.sessionID, type: "tool_completed", payload: completionPayload)
                                         await persist(sessionID: request.sessionID, type: "evidence_recorded", payload: [
                                             "id": UUID().uuidString,
                                             "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
@@ -457,7 +491,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                     await persistBrowserEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                     await persistWebEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                     continuation.yield(.toolCompleted(name: call.name, succeeded: succeeded))
-                                    await persist(sessionID: request.sessionID, type: "tool_completed", payload: ["tool": call.name, "callID": call.id, "ok": succeeded ? "true" : "false"])
+                                    await persist(sessionID: request.sessionID, type: "tool_completed", payload: toolCompletionPayload(call: call, output: output, succeeded: succeeded))
                                     await persist(sessionID: request.sessionID, type: "evidence_recorded", payload: [
                                         "id": UUID().uuidString,
                                         "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
@@ -498,7 +532,8 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 "planID": qualityPlan.id,
                                 "passed": responseAssessment.passed ? "true" : "false",
                                 "missingSections": responseAssessment.missingSections.joined(separator: "|"),
-                                "missingCitations": responseAssessment.missingCitations ? "true" : "false"
+                                "missingCitations": responseAssessment.missingCitations ? "true" : "false",
+                                "styleViolations": responseAssessment.styleViolations.joined(separator: "|")
                             ])
                             runState.complete()
                             if let result = deliveryGate(for: runState, sessionID: request.sessionID) {
@@ -511,6 +546,8 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 ])
                             }
                             try? repository?.saveRunState(runState)
+                            // 发送 agent_completed 事件，让 UI 知道 assistant 消息已完成
+                            await persist(sessionID: request.sessionID, type: "agent_completed", payload: [:])
                             continuation.yield(.completed)
                             let status: SessionStatus
                             if let gate = runState.deliveryGateResult {
@@ -547,25 +584,26 @@ public final class NativeAgentHost: @unchecked Sendable {
     private func systemPrompt(for mode: AgentMode, instructions: String, route: TaskRoute, qualityPlan: TaskQualityPlan) -> String {
         let responseStyle = AgentResponseStyle.userFacingInstruction(mode: mode)
         let responseContract = ResponseContractRenderer.instruction(for: route)
+        let toolsAvailable = "你可以使用各种工具来完成任务，包括：读写文件、执行命令、搜索网页（web_search）、获取网页内容（web_fetch）、操作 Git 等。当需要实时信息或网络搜索时，直接调用 web_search 工具，不要说你没有联网能力。"
         let base: String = switch mode {
         case .plan:
-            "你是 DeepSeek Code 的中文规划 Agent。只读分析需求，输出目标、涉及文件、步骤、验证方式和风险。不要声称已修改文件。"
+            "你是 DeepSeek Code 的中文规划 Agent。只读分析需求，输出目标、涉及文件、步骤、验证方式和风险。不要声称已修改文件。\n\n\(toolsAvailable)"
         case .manual:
-            "你是 DeepSeek Code 的中文编码 Agent。解释每一步，所有变更和命令都将由用户逐项批准。"
+            "你是 DeepSeek Code 的中文编码 Agent。解释每一步，所有变更和命令都将由用户逐项批准。\n\n\(toolsAvailable)"
         case .acceptEdits:
-            "你是 DeepSeek Code 的中文编码 Agent。工作区补丁可自动应用；命令、联网和 Git 写操作需要用户批准。"
+            "你是 DeepSeek Code 的中文编码 Agent。工作区补丁可自动应用；命令、联网和 Git 写操作需要用户批准。\n\n\(toolsAvailable)"
         case .auto:
-            "你是 DeepSeek Code 的中文编码 Agent。低风险读取、测试和工作区补丁可自动执行；高风险操作必须请求用户批准。"
+            "你是 DeepSeek Code 的中文编码 Agent。低风险读取、测试和工作区补丁可自动执行；高风险操作必须请求用户批准。\n\n\(toolsAvailable)"
         }
         let trimmed = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let qualityConstraints = qualityPlan.requiresCitations
             ? "在改动或下结论前先获得可引用 Evidence；外部关键结论必须使用 [WEB-S#] 引用。"
             : "优先使用与当前任务相关的 Evidence；不要把推测写成事实。"
-        guard !trimmed.isEmpty else { return "\(responseStyle)\n\n输出合同：\(responseContract)\n\n质量约束：\(qualityConstraints)\n\n\(base)" }
+        guard !trimmed.isEmpty else { return "\(responseStyle)\n\n回答方式：\(responseContract)\n\n质量约束：\(qualityConstraints)\n\n\(base)" }
         return """
         \(responseStyle)
 
-        输出合同：\(responseContract)
+        回答方式：\(responseContract)
 
         质量约束：\(qualityConstraints)
 
@@ -604,15 +642,16 @@ public final class NativeAgentHost: @unchecked Sendable {
     }
 
     private func permission(for tool: String, argumentsJSON: String, mode: AgentMode, workerKind: AgentWorkerKind) -> ToolPermission {
-        let registered = toolRegistry.tool(named: tool)
+        let canonicalTool = canonicalToolName(for: tool)
+        let registered = toolRegistry.tool(named: canonicalTool)
         let risk: CommandRisk
-        if ["run_command", "terminal.exec"].contains(tool), let arguments = decode(argumentsJSON), let command = arguments["command"] as? String {
+        if ["run_command", "terminal.exec"].contains(canonicalTool), let arguments = decode(argumentsJSON), let command = arguments["command"] as? String {
             risk = CommandPolicy.classify(command)
         } else if let registered {
             risk = registered.risk
-        } else if tool == "apply_patch" {
+        } else if canonicalTool == "apply_patch" {
             risk = .l1
-        } else if tool == "git_action" {
+        } else if canonicalTool == "git_action" {
             risk = .l2
         } else {
             risk = .l0
@@ -631,7 +670,7 @@ public final class NativeAgentHost: @unchecked Sendable {
         if !AgentWorkerPolicy.allows(effect, for: workerKind) {
             return .block(risk)
         }
-        return switch PermissionBroker.decision(tool: ToolDescriptor(name: tool, effect: effect, risk: risk), context: PermissionContext(mode: mode, projectTrusted: projectTrusted, sandboxAvailable: sandboxAvailable)) {
+        return switch PermissionBroker.decision(tool: ToolDescriptor(name: canonicalTool, effect: effect, risk: risk), context: PermissionContext(mode: mode, projectTrusted: projectTrusted, sandboxAvailable: sandboxAvailable)) {
         case .allow: ToolPermission.allow
         case let .ask(value): ToolPermission.ask(value)
         case let .block(value): ToolPermission.block(value)
@@ -673,6 +712,7 @@ public final class NativeAgentHost: @unchecked Sendable {
             "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"
         ])
         let researchCapability = webReadCapability(for: call.name)
+        let researchURL = researchURL(for: call)
         let researchReadAuthorized: Bool
         if let researchCapability,
            let networkRuntime,
@@ -680,13 +720,15 @@ public final class NativeAgentHost: @unchecked Sendable {
             researchReadAuthorized = await networkRuntime.hasResearchReadGrant(
                 capability: researchCapability,
                 sessionID: sessionID,
-                projectID: projectID
+                projectID: projectID,
+                url: researchURL
             )
         } else {
             researchReadAuthorized = false
         }
         if let qualityPlan, let registered = toolRegistry.tool(named: call.name) {
-            let decision = ToolDecisionPolicy.decide(for: registered, plan: qualityPlan, evidence: evidence, workerKind: workerKind)
+            let qualityTool = qualityAdjustedTool(for: call, registered: registered)
+            let decision = ToolDecisionPolicy.decide(for: qualityTool, plan: qualityPlan, evidence: evidence, workerKind: workerKind)
             await persist(sessionID: sessionID, type: "quality_tool_decision", payload: [
                 "planID": qualityPlan.id,
                 "tool": call.name,
@@ -794,6 +836,30 @@ public final class NativeAgentHost: @unchecked Sendable {
         }
     }
 
+    /// Process tools have a schema-level L2 default because they may mutate
+    /// the workspace or contact the network. For quality routing, however,
+    /// the concrete shell intent is authoritative: a harmless `printf` or
+    /// `pwd` should not be treated like `npm install` or `git push`.
+    private func qualityAdjustedTool(for call: IncrementalToolCall, registered: RegisteredTool) -> RegisteredTool {
+        guard ["run_command", "terminal.exec"].contains(canonicalToolName(for: call.name)),
+              let command = decode(call.argumentsJSON)?["command"] as? String else {
+            return registered
+        }
+        let risk = CommandPolicy.classify(command)
+        guard risk != registered.risk else { return registered }
+        return RegisteredTool(
+            name: registered.name,
+            description: registered.description,
+            parameters: registered.parameters,
+            effect: registered.effect,
+            risk: risk,
+            timeoutMilliseconds: registered.timeoutMilliseconds,
+            maxOutputBytes: registered.maxOutputBytes,
+            idempotent: registered.idempotent,
+            supportsCancellation: registered.supportsCancellation
+        )
+    }
+
     private func permissionRisk(for call: IncrementalToolCall, mode: AgentMode, workerKind: AgentWorkerKind = .main) -> CommandRisk {
         switch permission(for: call.name, argumentsJSON: call.argumentsJSON, mode: mode, workerKind: workerKind) {
         case .allow: return toolRegistry.tool(named: call.name)?.risk ?? .l0
@@ -803,10 +869,17 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func webReadCapability(for toolName: String) -> NetworkScope? {
         switch canonicalToolName(for: toolName) {
-        case "web.search": .webSearch
-        case "web.fetch": .webFetch
+        case "web_search": .webSearch
+        case "web_fetch": .webFetch
         default: nil
         }
+    }
+
+    private func researchURL(for call: IncrementalToolCall) -> URL? {
+        guard canonicalToolName(for: call.name) == "web_fetch",
+              let object = try? JSONSerialization.jsonObject(with: Data(call.argumentsJSON.utf8)) as? [String: Any],
+              let raw = object["url"] as? String else { return nil }
+        return URL(string: raw)
     }
 
     private func projectID(for sessionID: String) -> String? {
@@ -874,6 +947,35 @@ public final class NativeAgentHost: @unchecked Sendable {
         return string
     }
 
+    /// Preserve a redacted, actionable tool diagnostic in the durable event
+    /// instead of reducing every failed call to `ok:false`. The model still
+    /// receives the complete structured tool output, while the UI can show a
+    /// concise reason such as provider-unavailable, HTTP status or policy
+    /// rejection without exposing secrets.
+    private func toolCompletionPayload(call: IncrementalToolCall, output: String, succeeded: Bool) -> [String: String] {
+        var payload: [String: String] = [
+            "tool": call.name,
+            "callID": call.id,
+            "ok": succeeded ? "true" : "false"
+        ]
+        guard !succeeded,
+              let data = output.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return payload
+        }
+        for key in ["code", "message", "error", "status", "provider", "retryable"] {
+            if let value = object[key] as? String, !value.isEmpty {
+                payload[key] = SecretRedactor.redact(value)
+            } else if let value = object[key] as? NSNumber {
+                payload[key] = value.stringValue
+            }
+        }
+        if payload["message"] == nil, let error = payload["error"] {
+            payload["message"] = error
+        }
+        return payload
+    }
+
     private func estimatedCost(input: Int, cachedInput: Int, output: Int, pricing: ProviderProfile?) -> Decimal {
         guard let pricing else { return .zero }
         let nonCachedInput = max(0, input - cachedInput)
@@ -904,7 +1006,7 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func persistWebEvidenceIfAvailable(output: String, call: IncrementalToolCall, sessionID: String) async {
         let canonicalName = canonicalToolName(for: call.name)
-        guard canonicalName == "web.search" || canonicalName == "web.fetch",
+        guard canonicalName == "web_search" || canonicalName == "web_fetch",
               let evidence = WebEvidence.fromToolOutput(output),
               let data = try? JSONEncoder().encode(evidence),
               let encoded = String(data: data, encoding: .utf8) else { return }
@@ -913,6 +1015,7 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func deliveryGate(for state: AgentRunState, sessionID: String) -> DeliveryGateResult? {
         guard let contract = state.taskContract, let repository else { return nil }
+        guard contract.requiresDeliveryGate else { return nil }
         let events = (try? repository.events(sessionID: sessionID)) ?? []
         let graph = VerificationGraph.project(taskID: sessionID, events: events)
         let findings: [ReviewFinding]
@@ -1065,12 +1168,12 @@ public enum AgentToolSchemas {
         ])),
         ToolSchema(name: "browser.console", description: "读取浏览器控制台错误", parameters: .object(["type": .string("object"), "properties": .object([:])])),
         ToolSchema(name: "browser.network", description: "读取浏览器失败网络请求", parameters: .object(["type": .string("object"), "properties": .object([:])])),
-        ToolSchema(name: "web.search", description: "搜索公开网页并返回标题、链接和摘要", parameters: .object([
+        ToolSchema(name: "web_search", description: "搜索公开网页并返回标题、链接和摘要", parameters: .object([
             "type": .string("object"),
             "properties": .object(["query": .object(["type": .string("string")])]),
             "required": .array([.string("query")])
         ])),
-        ToolSchema(name: "web.fetch", description: "读取公开网页正文并返回结构化文本证据", parameters: .object([
+        ToolSchema(name: "web_fetch", description: "读取公开网页正文并返回结构化文本证据", parameters: .object([
             "type": .string("object"),
             "properties": .object(["url": .object(["type": .string("string")])]),
             "required": .array([.string("url")])
@@ -1140,7 +1243,7 @@ public enum AgentToolSchemas {
             case "browser.open": .network
             case "browser.click", "browser.type", "browser.assert": .browserAct
             case "browser.snapshot", "browser.screenshot", "browser.query", "browser.console", "browser.network": .browserRead
-            case "web.search", "web.fetch": .network
+            case "web_search", "web_fetch": .network
             case "ssh.execute": .network
             case "computer.click", "computer.type", "computer.key": .computerAct
             case "computer.inspect_app", "computer.snapshot", "computer.find", "computer.capture_window": .computerRead
@@ -1151,7 +1254,7 @@ public enum AgentToolSchemas {
             case "terminal.resize", "terminal.list", "terminal.ports", "terminal.attach": .l0
             case "terminal.exec", "terminal.open", "terminal.write", "terminal.signal", "terminal.close", "run_command", "git_action": .l2
             case "browser.open", "browser.click", "browser.type", "browser.assert": .l2
-            case "web.search", "web.fetch": .l2
+            case "web_search", "web_fetch": .l2
             case "ssh.execute": .l2
             case "computer.click", "computer.type", "computer.key": .l2
             default: .l0

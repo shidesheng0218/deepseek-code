@@ -914,12 +914,15 @@ public actor NetworkRuntime {
         )
         for capability in [NetworkScope.webSearch, .webFetch] {
             let domains: [String]
-            if capability == .webSearch {
-                // Search providers are configured independently from the
-                // documentation domains selected for Fetch.
+            if capability == .webSearch || normalizedDomains.isEmpty {
+                // Public read-only research is intentionally low-friction:
+                // search and first-seen public fetches share the same
+                // short-lived Session grant. `authorize` still applies the
+                // base SSRF/private-network policy before grants, so wildcard
+                // fetch never opens localhost, private IPs, uploads or writes.
                 domains = ["*"]
             } else {
-                domains = normalizedDomains.isEmpty ? ["*"] : Array(normalizedDomains)
+                domains = Array(normalizedDomains)
             }
             for domain in domains {
                 let existing = storedGrants.contains { stored in
@@ -947,13 +950,14 @@ public actor NetworkRuntime {
     public func hasResearchReadGrant(
         capability: NetworkScope,
         sessionID: String,
-        projectID: String?
+        projectID: String?,
+        url: URL? = nil
     ) -> Bool {
         guard capability == .webSearch || capability == .webFetch,
-              let placeholder = URL(string: "https://research.invalid/") else { return false }
+              let candidate = url ?? URL(string: "https://research.invalid/") else { return false }
         return storedGrants.contains {
-            $0.domain == "*" && $0.matches(
-                url: placeholder,
+            $0.matches(
+                url: candidate,
                 capability: capability,
                 operation: .read,
                 sessionID: sessionID,
@@ -1418,15 +1422,19 @@ public struct WebToolHost: ToolHost {
     public let runtime: NetworkRuntime
     public let searchProvider: any SearchProvider
     public let searchProviders: [any SearchProvider]
+    public let orchestrator: SearchOrchestrator
     public let projectID: String?
 
     public init(runtime: NetworkRuntime = .shared, searchProvider: (any SearchProvider)? = nil, searchProviders: [any SearchProvider] = [], projectID: String? = nil) {
         self.runtime = runtime
         let builtIns: [any SearchProvider] = [
-            BingSearchProvider(runtime: runtime),
-            DuckDuckGoSearchProvider(runtime: runtime)
+            DuckDuckGoSearchProvider(runtime: runtime),    // 通用搜索 - 主力
+            BingSearchProvider(runtime: runtime),          // 通用搜索 - 备选
+            GitHubSearchProvider(runtime: runtime),        // 代码搜索
+            StackOverflowSearchProvider(runtime: runtime), // 技术问答
+            RedditSearchProvider(runtime: runtime)         // 社区讨论
         ]
-        let primary = searchProvider ?? searchProviders.first ?? builtIns[0]
+        let primary = searchProvider ?? searchProviders.first ?? builtIns[0]  // 默认使用 DuckDuckGo
         var providers: [any SearchProvider] = searchProviders
         if !providers.contains(where: { $0.id == primary.id }) {
             providers.insert(primary, at: 0)
@@ -1436,6 +1444,7 @@ public struct WebToolHost: ToolHost {
         }
         self.searchProvider = primary
         self.searchProviders = providers
+        self.orchestrator = SearchOrchestrator(providers: providers, runtime: runtime)
         self.projectID = projectID
     }
 
@@ -1445,7 +1454,7 @@ public struct WebToolHost: ToolHost {
             throw UnifiedRuntimeError.invalidArguments
         }
         switch tool.name {
-        case "web.search":
+        case "web_search":
             let query = (arguments["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !query.isEmpty else { throw UnifiedRuntimeError.invalidArguments }
             let context = NetworkContext(sessionID: sessionID, projectID: projectID, purpose: .researchSearch, requestedBy: "main-agent")
@@ -1459,7 +1468,7 @@ public struct WebToolHost: ToolHost {
                 ),
                 context: context
             )
-        case "web.fetch":
+        case "web_fetch":
             guard let rawURL = arguments["url"] as? String,
                   let url = URL(string: rawURL) else { throw UnifiedRuntimeError.invalidArguments }
             return try await fetch(url: url, context: NetworkContext(sessionID: sessionID, projectID: projectID, purpose: .researchFetch, requestedBy: "main-agent"))
@@ -1471,39 +1480,78 @@ public struct WebToolHost: ToolHost {
     public func cancel(invocationID: String) async {}
 
     private func search(request: WebSearchRequest, context: NetworkContext) async throws -> String {
-        let primary = request.providerID.flatMap { id in searchProviders.first(where: { $0.id == id }) } ?? searchProvider
-        let orderedProviders = [primary] + searchProviders.filter { $0.id != primary.id }
-        var lastError: Error?
-        for provider in orderedProviders {
-            do {
-                let response = try await provider.search(request: request, context: context)
-                let retrievedAt = ISO8601DateFormatter().string(from: response.retrievedAt)
-                return Self.json([
-                    "ok": true,
-                    "query": request.query,
-                    "provider": response.providerID,
-                    "requestID": response.requestID,
-                    "retrievedAt": retrievedAt,
-                    "results": response.results.map { [
-                        "id": $0.id,
-                        "title": $0.title,
-                        "url": $0.canonicalURL,
-                        "canonicalURL": $0.canonicalURL,
-                        "snippet": $0.snippet,
-                        "provider": $0.providerID,
-                        "providerID": $0.providerID,
-                        "rank": $0.rank,
-                        "domain": $0.domain,
-                        "contentHash": $0.contentHash as Any,
-                        "retrievedAt": ISO8601DateFormatter().string(from: $0.retrievedAt),
-                        "warnings": $0.warnings
-                    ] }
-                ])
-            } catch {
-                lastError = error
-            }
+        print("→ [SEARCH] Query: \(request.query)")
+
+        // 如果用户指定了特定的提供商，使用单提供商模式（向后兼容）
+        if let providerID = request.providerID, let specificProvider = searchProviders.first(where: { $0.id == providerID }) {
+            print("→ [SEARCH] Using specific provider: \(providerID)")
+            let response = try await specificProvider.search(request: request, context: context)
+            print("✅ [SEARCH] Provider '\(response.providerID)' returned \(response.results.count) results")
+            let retrievedAt = ISO8601DateFormatter().string(from: response.retrievedAt)
+            return Self.json([
+                "ok": true,
+                "query": request.query,
+                "provider": response.providerID,
+                "requestID": response.requestID,
+                "retrievedAt": retrievedAt,
+                "results": response.results.map { [
+                    "id": $0.id,
+                    "title": $0.title,
+                    "url": $0.canonicalURL,
+                    "canonicalURL": $0.canonicalURL,
+                    "snippet": $0.snippet,
+                    "provider": $0.providerID,
+                    "providerID": $0.providerID,
+                    "rank": $0.rank,
+                    "domain": $0.domain,
+                    "contentHash": $0.contentHash as Any,
+                    "retrievedAt": ISO8601DateFormatter().string(from: $0.retrievedAt),
+                    "warnings": $0.warnings
+                ] }
+            ])
         }
-        throw lastError ?? NetworkRuntimeError.invalidResponse
+
+        // 使用搜索编排器（智能多提供商查询）
+        print("🎯 [SEARCH] Using orchestrator for intelligent search")
+        let orchestratedResponse = try await orchestrator.orchestrate(request: request, context: context)
+
+        print("✅ [SEARCH] Orchestrator returned \(orchestratedResponse.results.count) results (intent: \(orchestratedResponse.intent.rawValue), deduplicated: \(orchestratedResponse.deduplicatedCount))")
+
+        if !orchestratedResponse.results.isEmpty {
+            print("→ [SEARCH] Top result: \(orchestratedResponse.results[0].title)")
+        }
+
+        // 构建响应（包含编排器元数据）
+        let retrievedAt = ISO8601DateFormatter().string(from: Date())
+
+        return Self.json([
+            "ok": true,
+            "query": request.query,
+            "provider": "orchestrator",
+            "requestID": UUID().uuidString,
+            "retrievedAt": retrievedAt,
+            "results": orchestratedResponse.results.map { [
+                "id": $0.id,
+                "title": $0.title,
+                "url": $0.canonicalURL,
+                "canonicalURL": $0.canonicalURL,
+                "snippet": $0.snippet,
+                "provider": $0.providerID,
+                "providerID": $0.providerID,
+                "rank": $0.rank,
+                "domain": $0.domain,
+                "contentHash": $0.contentHash as Any,
+                "retrievedAt": ISO8601DateFormatter().string(from: $0.retrievedAt),
+                "warnings": $0.warnings
+            ] },
+            "orchestration": [
+                "intent": orchestratedResponse.intent.rawValue,
+                "totalResults": orchestratedResponse.totalResults,
+                "deduplicatedCount": orchestratedResponse.deduplicatedCount,
+                "searchTime": orchestratedResponse.searchTime,
+                "providersUsed": orchestratedResponse.providerResponses.map { $0.providerID }
+            ]
+        ])
     }
 
     private func fetch(url: URL, context: NetworkContext) async throws -> String {
