@@ -1807,7 +1807,7 @@ public final class WorkspaceStore {
         Task {
             do {
                 if let request = networkApprovalDetails(for: pending), decision == .allowOnce || decision == .allowSession {
-                    if pending.tool == "web_search" || pending.tool == "web_search" || pending.tool == "web_fetch" {
+                    if pending.tool == "web_search" || pending.tool == "web_fetch" {
                         // A research approval covers the bounded read-only
                         // Search → Fetch chain for this Session. It does not
                         // grant browser control, uploads, login or any write.
@@ -3300,7 +3300,9 @@ public final class WorkspaceStore {
             .compactMap { configuration in
                 try? HTTPJSONSearchProvider(configuration: configuration, runtime: networkRuntime, secretStore: secretStore)
             }
-        router.register(host: WebToolHost(runtime: networkRuntime, searchProviders: configuredProviders, projectID: selectedProjectID), forPrefix: "web.")
+        let webHost = WebToolHost(runtime: networkRuntime, searchProviders: configuredProviders, projectID: selectedProjectID)
+        router.register(host: webHost, for: "web_search")
+        router.register(host: webHost, for: "web_fetch")
         router.register(host: SSHDispatchToolHost(manager: sshConnectionManager, networkRuntime: networkRuntime), for: "ssh.execute")
         #if os(macOS)
         router.register(host: ComputerToolHost(), forPrefix: "computer.")

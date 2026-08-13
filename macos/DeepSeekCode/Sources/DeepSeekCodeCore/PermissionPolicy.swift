@@ -66,7 +66,7 @@ public enum PermissionBroker {
         // Auto 模式优化：自动允许 web 研究工具（无需项目可信）
         // 这让体验接近 Claude Code，web 搜索被视为低风险操作
         if context.mode == .auto {
-            if tool.name == "web.search" || tool.name == "web.fetch" {
+            if tool.name == "web_search" || tool.name == "web_fetch" {
                 return .allow
             }
         }

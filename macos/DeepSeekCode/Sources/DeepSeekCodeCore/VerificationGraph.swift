@@ -22,7 +22,7 @@ public enum EvidenceKind: String, Codable, CaseIterable, Identifiable, Sendable 
 
 public enum VerificationEvidenceClassifier {
     public static func kind(tool: String, argumentsJSON: String) -> EvidenceKind {
-        if tool.hasPrefix("web.") || tool.hasPrefix("mcp.") || tool.hasPrefix("github.") || tool.hasPrefix("ssh.") {
+        if tool == "web_search" || tool == "web_fetch" || tool.hasPrefix("web.") || tool.hasPrefix("mcp.") || tool.hasPrefix("github.") || tool.hasPrefix("ssh.") {
             return .network
         }
         switch tool {
@@ -53,7 +53,7 @@ public enum VerificationEvidenceClassifier {
                 return .build
             }
             return .command
-        case "web.search", "web.fetch":
+        case "web_search", "web_fetch":
             return .network
         default:
             return .checkpoint

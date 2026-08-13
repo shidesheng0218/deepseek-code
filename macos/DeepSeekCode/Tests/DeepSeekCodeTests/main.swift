@@ -391,8 +391,8 @@ struct DeepSeekCodeChecks {
         let preparedSandbox = try SandboxRuntime.prepare(command: "printf ok", policy: sandboxPolicy)
         precondition(preparedSandbox.command.contains("sandbox-exec"))
         precondition(WorkspaceStore.WorkspaceSection.network.title == "Network")
-        precondition(AgentToolSchemas.registry.tool(named: "web.search")?.effect == .network)
-        precondition(AgentToolSchemas.registry.tool(named: "web.fetch")?.risk == .l2)
+        precondition(AgentToolSchemas.registry.tool(named: "web_search")?.effect == .network)
+        precondition(AgentToolSchemas.registry.tool(named: "web_fetch")?.risk == .l2)
         let externalWebURL = URL(string: "https://example.com/docs")!
         precondition(NetworkPolicy.default.decision(for: externalWebURL, scope: .webFetch) == .requiresApproval)
         precondition(NetworkPolicy.default.decision(for: externalWebURL, scope: .modelProvider) == .allow)
@@ -403,7 +403,7 @@ struct DeepSeekCodeChecks {
         precondition(NetworkPolicy.default.decision(for: URL(string: "https://[fd00::1]/docs")!, scope: .webFetch) == .block)
         precondition(!SearchProviderConfiguration(id: "local", name: "Local", endpoint: "http://127.0.0.1:8080/search").isValid)
         precondition(!SearchProviderConfiguration(id: "userinfo", name: "Userinfo", endpoint: "https://user:pass@example.com/search").isValid)
-        precondition(VerificationEvidenceClassifier.kind(tool: "web.fetch", argumentsJSON: "{}") == .network)
+        precondition(VerificationEvidenceClassifier.kind(tool: "web_fetch", argumentsJSON: "{}") == .network)
         precondition(VerificationEvidenceClassifier.kind(tool: "mcp.docs.search", argumentsJSON: "{}") == .network)
         precondition(VerificationEvidenceClassifier.kind(tool: "github.pr_checks", argumentsJSON: "{}") == .network)
         let sessionGrant = NetworkGrant(
@@ -1567,7 +1567,7 @@ struct DeepSeekCodeChecks {
         precondition(AgentToolSchemas.registry.tool(named: "browser_snapshot")?.name == "browser.snapshot")
         let compatibleCalls = ToolNameCodec.modelCompatibleToolCalls([
             ChatToolCall(id: "1", name: "browser.snapshot", argumentsJSON: "{}"),
-            ChatToolCall(id: "2", name: "web.fetch", argumentsJSON: "{\"url\":\"https://example.com\"}")
+            ChatToolCall(id: "2", name: "web_fetch", argumentsJSON: "{\"url\":\"https://example.com\"}")
         ])
         precondition(compatibleCalls?.map(\.function.name) == ["browser_snapshot", "web_fetch"])
         precondition(AgentToolSchemas.registry.tool(named: "browser.assert")?.effect == .browserAct)
@@ -1744,10 +1744,12 @@ struct DeepSeekCodeChecks {
         precondition(approvalAuditEvents.contains(where: { $0.type == "tool_completed" && $0.payload["tool"] == "apply_patch" && $0.payload["ok"] == "true" }))
 
         let webApprovalSession = try repository.createSession(projectID: project.id, title: "联网审批恢复", mode: .manual)
-        let webSearchTool = AgentToolSchemas.registry.tool(named: "web.search")!
+        let webSearchTool = AgentToolSchemas.registry.tool(named: "web_search")!
         let webSearchRegistry = ToolRegistry([webSearchTool])
         let webSearchRouter = ToolHostRouter(registry: webSearchRegistry)
-        webSearchRouter.register(host: MemoryToolHost(output: "{\"ok\":true,\"query\":\"Swift concurrency\",\"provider\":\"fixture\",\"results\":[]}"), forPrefix: "web.")
+        let memoryWebHost = MemoryToolHost(output: "{\"ok\":true,\"query\":\"Swift concurrency\",\"provider\":\"fixture\",\"results\":[]}")
+        webSearchRouter.register(host: memoryWebHost, for: "web_search")
+        webSearchRouter.register(host: memoryWebHost, for: "web_fetch")
         let webApprovalHost = NativeAgentHost(
             client: ScriptedChatClient(batches: [
                 [.toolCall(id: "web-approval", name: "web_search", argumentsJSON: "{\"query\":\"Swift concurrency\"}"), .done],
@@ -1765,7 +1767,7 @@ struct DeepSeekCodeChecks {
         let webApprovalEvents = try repository.events(sessionID: webApprovalSession.id)
         precondition(webApprovalEvents.contains(where: { $0.type == "tool_started" && $0.payload["tool"] == "web_search" }))
         precondition(webApprovalEvents.contains(where: { $0.type == "tool_completed" && $0.payload["tool"] == "web_search" && $0.payload["ok"] == "true" }))
-        precondition(webSearchRouter.invocationEvents.contains(where: { $0.tool == "web.search" && $0.phase == .completed && $0.succeeded == true }))
+        precondition(webSearchRouter.invocationEvents.contains(where: { $0.tool == "web_search" && $0.phase == .completed && $0.succeeded == true }))
 
         let silentResearchSession = try repository.createSession(projectID: project.id, title: "已授权联网研究", mode: .acceptEdits)
         _ = await runtime.rememberResearchApproval(sessionID: silentResearchSession.id, projectID: project.id, scope: .session)

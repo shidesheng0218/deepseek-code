@@ -87,9 +87,11 @@ rm -rf "$APP_DIR.previous"
 # 自动更新 /Applications 中的应用
 INSTALL_DIR="/Applications/DeepSeek Code.app"
 
-# 1. 关闭正在运行的应用
-echo "正在检查是否有运行中的 DeepSeek Code..."
-pkill -9 "DeepSeekCode" 2>/dev/null || true
+# 1. 关闭正在运行的应用及后台守护进程（daemon/worker 若不重启会继续用旧代码处理请求）
+echo "正在检查是否有运行中的 DeepSeek Code 进程..."
+pkill -9 -f "DeepSeekCode.app/Contents/MacOS/DeepSeekCode" 2>/dev/null || true
+pkill -9 -f "/deepseekd" 2>/dev/null || true
+pkill -9 -f "/deepseek-worker" 2>/dev/null || true
 sleep 1
 
 # 2. 删除旧版本

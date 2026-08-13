@@ -791,7 +791,7 @@ public final class NativeAgentHost: @unchecked Sendable {
             await persist(sessionID: sessionID, type: "tool_started", payload: ["tool": call.name, "callID": call.id, "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"])
             try await inject(.afterToolStarted, sessionID: sessionID, tool: call.name)
             let canonicalName = canonicalToolName(for: call.name)
-            if canonicalName.hasPrefix("web.") || canonicalName.hasPrefix("github.") || canonicalName.hasPrefix("mcp.") || canonicalName.hasPrefix("browser.") {
+            if canonicalName == "web_search" || canonicalName == "web_fetch" || canonicalName.hasPrefix("web.") || canonicalName.hasPrefix("github.") || canonicalName.hasPrefix("mcp.") || canonicalName.hasPrefix("browser.") {
                 try await inject(.afterNetworkApproved, sessionID: sessionID, tool: call.name)
             }
             do {

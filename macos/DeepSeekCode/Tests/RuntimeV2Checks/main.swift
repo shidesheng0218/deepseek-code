@@ -91,7 +91,7 @@ struct DeepSeekCodeRuntimeV2Checks {
         // model explicitly calls a read-only web tool it must advance to the
         // Research Grant / SSRF gate instead of failing as DIRECT_ANSWER_PATH.
         let directPlan = TaskQualityPlanner.plan(route: TaskRouter.route(TaskRoutingInput(prompt: "Swift actor 是什么？", mode: .acceptEdits)))
-        let explicitWebSearch = RegisteredTool(name: "web.search", description: "search", parameters: .object([:]), effect: .network, risk: .l2, timeoutMilliseconds: 10_000, maxOutputBytes: 32_000, idempotent: true, supportsCancellation: true)
+        let explicitWebSearch = RegisteredTool(name: "web_search", description: "search", parameters: .object([:]), effect: .network, risk: .l2, timeoutMilliseconds: 10_000, maxOutputBytes: 32_000, idempotent: true, supportsCancellation: true)
         precondition(ToolDecisionPolicy.decide(for: explicitWebSearch, plan: directPlan, evidence: QualityEvidenceState()) == .execute)
         // GUI delegates only fully daemon-capable tasks. Browser/attachments,
         // SSH and configured extension hosts stay on the foreground path

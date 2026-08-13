@@ -49,11 +49,13 @@ struct DeepSeekCodeHarnessChecks {
         let session = try repository.createSession(projectID: project.id, title: "Public search", mode: .acceptEdits)
         let events = try EventStore(directory: root.appendingPathComponent("LegacyEvents", isDirectory: true))
         let network = NetworkRuntime(policy: .default, repository: repository)
-        let webSearch = try unwrap(AgentToolSchemas.registry.tool(named: "web.search"))
-        let webFetch = try unwrap(AgentToolSchemas.registry.tool(named: "web.fetch"))
+        let webSearch = try unwrap(AgentToolSchemas.registry.tool(named: "web_search"))
+        let webFetch = try unwrap(AgentToolSchemas.registry.tool(named: "web_fetch"))
         let registry = ToolRegistry([webSearch, webFetch])
         let router = ToolHostRouter(registry: registry, repository: repository)
-        router.register(host: MemoryToolHost(), forPrefix: "web.")
+        let memoryWebHost = MemoryToolHost()
+        router.register(host: memoryWebHost, for: "web_search")
+        router.register(host: memoryWebHost, for: "web_fetch")
         let host = NativeAgentHost(
             client: ScriptedChatClient(batches: [
                 [.toolCall(id: "public-search", name: "web_search", argumentsJSON: "{\"query\":\"Swift actor\"}"), .done],
@@ -79,7 +81,9 @@ struct DeepSeekCodeHarnessChecks {
         let fetchSession = try repository.createSession(projectID: project.id, title: "Public fetch", mode: .acceptEdits)
         let fetchRegistry = ToolRegistry([webSearch, webFetch])
         let fetchRouter = ToolHostRouter(registry: fetchRegistry, repository: repository)
-        fetchRouter.register(host: MemoryToolHost(), forPrefix: "web.")
+        let fetchMemoryHost = MemoryToolHost()
+        fetchRouter.register(host: fetchMemoryHost, for: "web_search")
+        fetchRouter.register(host: fetchMemoryHost, for: "web_fetch")
         let fetchHost = NativeAgentHost(
             client: ScriptedChatClient(batches: [
                 [.toolCall(id: "public-fetch", name: "web_fetch", argumentsJSON: "{\"url\":\"https://example.com/weather/beijing\"}"), .done],
@@ -109,7 +113,7 @@ struct DeepSeekCodeHarnessChecks {
         let failingSession = try repository.createSession(projectID: project.id, title: "Search failure diagnostics", mode: .acceptEdits)
         let failingRegistry = ToolRegistry([webSearch])
         let failingRouter = ToolHostRouter(registry: failingRegistry, repository: repository)
-        failingRouter.register(host: FailingSearchToolHost(), forPrefix: "web.")
+        failingRouter.register(host: FailingSearchToolHost(), for: "web_search")
         let failingHost = NativeAgentHost(
             client: ScriptedChatClient(batches: [
                 [.toolCall(id: "failed-search", name: "web_search", argumentsJSON: "{\"query\":\"今天股市行情\"}"), .done],
@@ -130,7 +134,9 @@ struct DeepSeekCodeHarnessChecks {
         let multiSearchSession = try repository.createSession(projectID: project.id, title: "Multi-search protocol", mode: .acceptEdits)
         let multiSearchRegistry = ToolRegistry([webSearch])
         let multiSearchRouter = ToolHostRouter(registry: multiSearchRegistry, repository: repository)
-        multiSearchRouter.register(host: MemoryToolHost(), forPrefix: "web.")
+        let multiSearchMemoryHost = MemoryToolHost()
+        multiSearchRouter.register(host: multiSearchMemoryHost, for: "web_search")
+        multiSearchRouter.register(host: multiSearchMemoryHost, for: "web_fetch")
         let multiSearchHost = NativeAgentHost(
             client: ScriptedChatClient(batches: [
                 [

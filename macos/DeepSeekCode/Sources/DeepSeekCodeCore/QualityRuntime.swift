@@ -325,7 +325,7 @@ public enum ToolDecisionPolicy {
             // failure. `AgentHost` still routes this through Research Grant,
             // PermissionBroker and NetworkRuntime's SSRF checks before any
             // request is sent.
-            if ["web.search", "web.fetch"].contains(tool.name) { return .execute }
+            if ["web_search", "web_fetch"].contains(tool.name) { return .execute }
             // A direct-answer route should not trigger side effects, but a
             // model may still use an inexpensive local read to answer a
             // project-adjacent question accurately. It may also ask for a

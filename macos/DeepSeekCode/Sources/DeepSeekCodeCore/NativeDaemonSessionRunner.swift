@@ -123,7 +123,9 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
         let registry = ToolRegistry(supportedTools())
         let router = ToolHostRouter(registry: registry, repository: repository)
         router.register(host: LocalWorkspaceToolHost(workspace: workspace), forPrefix: "")
-        router.register(host: WebToolHost(runtime: networkRuntime, projectID: project.id), forPrefix: "web.")
+        let webHost = WebToolHost(runtime: networkRuntime, projectID: project.id)
+        router.register(host: webHost, for: "web_search")
+        router.register(host: webHost, for: "web_fetch")
         if let terminalHost {
             let terminalTools = AgentToolSchemas.registry.allTools().filter { $0.name == "run_command" || $0.name.hasPrefix("terminal.") }
             terminalTools.forEach { registry.register($0) }
@@ -240,7 +242,7 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
     private func supportedTools() -> [RegisteredTool] {
         var supportedNames: Set<String> = [
             "list_directory", "read_file", "search_workspace", "workspace_read_evidence",
-            "apply_patch", "inspect_git", "lsp_query", "web.search", "web.fetch"
+            "apply_patch", "inspect_git", "lsp_query", "web_search", "web_fetch"
         ]
         if terminalHost != nil {
             supportedNames.formUnion(AgentToolSchemas.registry.allTools().map(\.name).filter { $0 == "run_command" || $0.hasPrefix("terminal.") })
