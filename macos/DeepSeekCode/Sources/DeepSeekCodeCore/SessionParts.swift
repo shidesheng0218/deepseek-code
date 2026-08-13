@@ -144,12 +144,20 @@ public enum SessionPartProjector {
                 // conversation. Showing provider chain-of-thought makes the
                 // user-facing chat noisy and can expose irrelevant internals.
                 continue
-            case "agent_completed", "session_turn_completed":
+            case "agent_completed":
                 // 将所有 running 状态的 assistant 消息标记为 completed
                 for index in parts.indices.reversed() {
                     if parts[index].kind == .assistantText && parts[index].state == .running {
                         updatePart(index, event: event, state: .completed)
                     }
+                }
+            case "session_turn_completed":
+                // 对话轮次完成，但会话应该可以继续
+                // 只标记当前轮次的 assistant 消息，不影响会话状态
+                if let lastAssistantIndex = parts.indices.reversed().first(where: {
+                    parts[$0].kind == .assistantText && parts[$0].state == .running
+                }) {
+                    updatePart(lastAssistantIndex, event: event, state: .completed)
                 }
             case "tool_requested", "tool_started", "tool_completed", "tool_failed", "tool_blocked", "tool_indeterminate":
                 let callID = payload["callID"] ?? "event-\(eventID(event))"
