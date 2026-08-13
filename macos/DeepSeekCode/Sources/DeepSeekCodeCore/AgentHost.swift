@@ -887,14 +887,14 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func webReadCapability(for toolName: String) -> NetworkScope? {
         switch canonicalToolName(for: toolName) {
-        case "web.search": .webSearch
-        case "web.fetch": .webFetch
+        case "web_search": .webSearch
+        case "web_fetch": .webFetch
         default: nil
         }
     }
 
     private func researchURL(for call: IncrementalToolCall) -> URL? {
-        guard canonicalToolName(for: call.name) == "web.fetch",
+        guard canonicalToolName(for: call.name) == "web_fetch",
               let object = try? JSONSerialization.jsonObject(with: Data(call.argumentsJSON.utf8)) as? [String: Any],
               let raw = object["url"] as? String else { return nil }
         return URL(string: raw)
@@ -1024,7 +1024,7 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func persistWebEvidenceIfAvailable(output: String, call: IncrementalToolCall, sessionID: String) async {
         let canonicalName = canonicalToolName(for: call.name)
-        guard canonicalName == "web.search" || canonicalName == "web.fetch",
+        guard canonicalName == "web_search" || canonicalName == "web_fetch",
               let evidence = WebEvidence.fromToolOutput(output),
               let data = try? JSONEncoder().encode(evidence),
               let encoded = String(data: data, encoding: .utf8) else { return }
@@ -1186,12 +1186,12 @@ public enum AgentToolSchemas {
         ])),
         ToolSchema(name: "browser.console", description: "读取浏览器控制台错误", parameters: .object(["type": .string("object"), "properties": .object([:])])),
         ToolSchema(name: "browser.network", description: "读取浏览器失败网络请求", parameters: .object(["type": .string("object"), "properties": .object([:])])),
-        ToolSchema(name: "web.search", description: "搜索公开网页并返回标题、链接和摘要", parameters: .object([
+        ToolSchema(name: "web_search", description: "搜索公开网页并返回标题、链接和摘要", parameters: .object([
             "type": .string("object"),
             "properties": .object(["query": .object(["type": .string("string")])]),
             "required": .array([.string("query")])
         ])),
-        ToolSchema(name: "web.fetch", description: "读取公开网页正文并返回结构化文本证据", parameters: .object([
+        ToolSchema(name: "web_fetch", description: "读取公开网页正文并返回结构化文本证据", parameters: .object([
             "type": .string("object"),
             "properties": .object(["url": .object(["type": .string("string")])]),
             "required": .array([.string("url")])
@@ -1261,7 +1261,7 @@ public enum AgentToolSchemas {
             case "browser.open": .network
             case "browser.click", "browser.type", "browser.assert": .browserAct
             case "browser.snapshot", "browser.screenshot", "browser.query", "browser.console", "browser.network": .browserRead
-            case "web.search", "web.fetch": .network
+            case "web_search", "web_fetch": .network
             case "ssh.execute": .network
             case "computer.click", "computer.type", "computer.key": .computerAct
             case "computer.inspect_app", "computer.snapshot", "computer.find", "computer.capture_window": .computerRead
@@ -1272,7 +1272,7 @@ public enum AgentToolSchemas {
             case "terminal.resize", "terminal.list", "terminal.ports", "terminal.attach": .l0
             case "terminal.exec", "terminal.open", "terminal.write", "terminal.signal", "terminal.close", "run_command", "git_action": .l2
             case "browser.open", "browser.click", "browser.type", "browser.assert": .l2
-            case "web.search", "web.fetch": .l2
+            case "web_search", "web_fetch": .l2
             case "ssh.execute": .l2
             case "computer.click", "computer.type", "computer.key": .l2
             default: .l0
