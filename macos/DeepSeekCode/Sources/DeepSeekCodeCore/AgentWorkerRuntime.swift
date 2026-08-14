@@ -205,7 +205,8 @@ public actor DurableChildAgentRuntime: ChildAgentRuntime {
         guard let record = try repository.workerSession(id: workerSessionID) else { throw ChildAgentRuntimeError.notFound }
         guard record.state == .queued else { throw ChildAgentRuntimeError.invalidState }
         _ = try coordinator.transition(id: workerSessionID, state: .running)
-        let task = Task { [driver, coordinator] in
+        let taskGraph = WorkerTaskGraph(repository: repository)
+        let task = Task { [driver, coordinator, taskGraph] in
             do {
                 let result = try await driver.execute(
                     contract: record.contract,
@@ -214,6 +215,15 @@ public actor DurableChildAgentRuntime: ChildAgentRuntime {
                     workerSessionID: record.id
                 )
                 _ = try coordinator.storeResult(id: record.id, result: result)
+                _ = try? taskGraph.publish(WorkerTaskMessage(
+                    parentSessionID: record.parentSessionID,
+                    workerSessionID: record.id,
+                    workerID: record.workerID,
+                    kind: .evidence,
+                    summary: result.summary,
+                    evidenceIDs: result.evidenceIDs,
+                    confidence: result.errorMessage == nil ? 0.8 : 0.2
+                ))
                 return result
             } catch is CancellationError {
                 _ = try? coordinator.transition(id: record.id, state: .stopped)

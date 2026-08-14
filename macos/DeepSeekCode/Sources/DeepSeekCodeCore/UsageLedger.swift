@@ -1,5 +1,26 @@
 import Foundation
 
+public enum CostBudgetAction: String, Codable, Equatable, Sendable {
+    case normal
+    case warn
+    case compressContext = "compress_context"
+    case pauseAtSafeBoundary = "pause_at_safe_boundary"
+}
+
+/// Deterministic per-session cost gate. It deliberately does not cancel an
+/// already-running provider request; callers apply `.pauseAtSafeBoundary`
+/// before opening the next model Step.
+public enum CostBudgetGate {
+    public static func action(spent: Decimal, limit: Decimal?) -> CostBudgetAction {
+        guard let limit, limit > .zero else { return .normal }
+        let ratio = spent / limit
+        if ratio >= Decimal(string: "0.95")! { return .pauseAtSafeBoundary }
+        if ratio >= Decimal(string: "0.85")! { return .compressContext }
+        if ratio >= Decimal(string: "0.70")! { return .warn }
+        return .normal
+    }
+}
+
 public enum UsageLatency {
     /// Returns a non-negative, rounded duration suitable for user-visible usage
     /// telemetry. Callers pass request boundaries so queueing/tool time is not

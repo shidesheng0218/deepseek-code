@@ -44,14 +44,26 @@ public protocol MCPManager: Sendable {
 public actor DefaultMCPManager: MCPManager {
     private let registry: ToolRegistry
     private let manifests: [String: HostCapabilityManifest]
+    /// MCP is an extension transport, not a second execution authority. The
+    /// manager registers its pure host with this router, then invokes it only
+    /// through the shared durable pipeline.
+    private let router: ToolHostRouter?
+    private let pipeline: ToolExecutionPipeline?
     private var transports: [String: any MCPTransport] = [:]
     private var hosts: [String: MCPToolHost] = [:]
     private var descriptors: [String: [MCPToolDescriptor]] = [:]
     private var healthStates: [String: MCPHealth] = [:]
 
-    public init(registry: ToolRegistry, manifests: [String: HostCapabilityManifest] = [:]) {
+    public init(
+        registry: ToolRegistry,
+        manifests: [String: HostCapabilityManifest] = [:],
+        router: ToolHostRouter? = nil,
+        pipeline: ToolExecutionPipeline? = nil
+    ) {
         self.registry = registry
         self.manifests = manifests
+        self.router = router
+        self.pipeline = pipeline
     }
 
     public func connect(serverID: String, transport: any MCPTransport) async throws {
@@ -73,6 +85,7 @@ public actor DefaultMCPManager: MCPManager {
             for descriptor in tools {
                 registry.register(MCPToolRegistration.make(serverID: serverID, descriptor: descriptor))
             }
+            router?.register(host: host, forPrefix: "mcp.\(serverID).")
             healthStates[serverID] = .healthy
         } catch {
             healthStates[serverID] = .unavailable
@@ -88,9 +101,42 @@ public actor DefaultMCPManager: MCPManager {
     }
 
     public func call(serverID: String, tool: String, argumentsJSON: String, sessionID: String) async throws -> String {
-        guard let host = hosts[serverID] else { throw MCPRuntimeError.invalidConfiguration }
-        let registered = registry.tool(named: "mcp.\(serverID).\(tool)") ?? MCPToolRegistration.make(serverID: serverID, descriptor: MCPToolDescriptor(name: tool, description: "", inputSchema: .objectSchema()))
-        return try await host.execute(tool: registered, argumentsJSON: argumentsJSON, sessionID: sessionID)
+        try await call(
+            serverID: serverID,
+            tool: tool,
+            argumentsJSON: argumentsJSON,
+            sessionID: sessionID,
+            commandID: "mcp-call-\(UUID().uuidString)",
+            callID: UUID().uuidString
+        )
+    }
+
+    /// Executes an MCP tool through the one ToolExecutionPipeline.  Callers
+    /// that retry a command must reuse both IDs; the pipeline will then retain
+    /// a single request/evidence/completion chain instead of replaying a host
+    /// call outside the event log.
+    public func call(
+        serverID: String,
+        tool: String,
+        argumentsJSON: String,
+        sessionID: String,
+        commandID: String,
+        callID: String
+    ) async throws -> String {
+        guard hosts[serverID] != nil else { throw MCPRuntimeError.invalidConfiguration }
+        guard let pipeline, router != nil else { throw MCPRuntimeError.pipelineRequired }
+        let registered = registry.tool(named: "mcp.\(serverID).\(tool)") ?? MCPToolRegistration.make(
+            serverID: serverID,
+            descriptor: MCPToolDescriptor(name: tool, description: "", inputSchema: .objectSchema())
+        )
+        let result = try await pipeline.execute(ToolInvocationContext(
+            sessionID: sessionID,
+            commandID: commandID,
+            callID: callID,
+            tool: registered,
+            argumentsJSON: argumentsJSON
+        ))
+        return result.output
     }
 
     public func health(serverID: String) async -> MCPHealth {
@@ -188,12 +234,14 @@ public struct MCPJSONRPCResponse: Codable, Equatable, Sendable {
 
 public enum MCPRuntimeError: LocalizedError {
     case invalidConfiguration
+    case pipelineRequired
     case invalidResponse
     case server(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidConfiguration: "MCP 配置无效"
+        case .pipelineRequired: "MCP 调用必须通过统一工具流水线"
         case .invalidResponse: "MCP Server 返回了无效响应"
         case let .server(message): "MCP Server 错误：\(message)"
         }

@@ -99,7 +99,17 @@ struct DeepSeekCodeRuntimeV2Checks {
             contentsOf: packageRoot.appendingPathComponent("Sources/DeepSeekCodeCore/WorkspaceStore.swift"),
             encoding: .utf8
         )
+        let daemonIPCSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/DeepSeekCodeCore/DeepSeekDaemonIPC.swift"),
+            encoding: .utf8
+        )
         precondition(!workspaceStoreSource.contains("#if false"))
+        // UI approval actions must submit to deepseekd/Supervisor. A direct
+        // repository resolution can resume a command outside the durable
+        // command/continuation chain after an App reconnect.
+        precondition(!workspaceStoreSource.contains("repository.resolveApproval("))
+        precondition(!workspaceStoreSource.contains("repository?.createApproval("))
+        precondition(!daemonIPCSource.contains("repository.resolveApproval("))
         precondition(WorkspaceTypography.microSize >= 10)
         precondition(WorkspaceTypography.metaSize >= 12)
         precondition(WorkspaceTypography.bodySize >= 14)
@@ -299,6 +309,138 @@ struct DeepSeekCodeRuntimeV2Checks {
         let project = try repository.createProject(name: "Runtime V2", path: root.path)
         let session = try repository.createSession(projectID: project.id, title: "Part projection", mode: .acceptEdits)
         let pipelineSession = try repository.createSession(projectID: project.id, title: "Pipeline projection", mode: .acceptEdits)
+
+        // Runtime 3.0 contract: canonical Turn/Step events retain their full
+        // causal metadata when replayed, and retrying a command is idempotent.
+        let protocolSession = try repository.createSession(projectID: project.id, title: "Runtime 3 event protocol", mode: .acceptEdits)
+        let eventCommitter = SessionEventCommitter(repository: repository)
+        let turnStarted = try eventCommitter.commit(SessionEventDraft(
+            aggregateID: protocolSession.id,
+            commandID: "runtime3-turn-command",
+            causationID: "runtime3-input",
+            correlationID: "runtime3-turn",
+            kind: .turnStarted,
+            payload: ["inputID": "runtime3-input"]
+        ))
+        let duplicateTurnStarted = try eventCommitter.commit(SessionEventDraft(
+            aggregateID: protocolSession.id,
+            commandID: "runtime3-turn-command",
+            causationID: "runtime3-input",
+            correlationID: "runtime3-turn",
+            kind: .turnStarted,
+            payload: ["inputID": "runtime3-input"]
+        ))
+        precondition(turnStarted.eventID == duplicateTurnStarted.eventID)
+        precondition(turnStarted.sequence == 1)
+        let replayedProtocolEvents = try repository.eventEnvelopes(sessionID: protocolSession.id)
+        precondition(replayedProtocolEvents.count == 1)
+        precondition(replayedProtocolEvents[0].kind == .turnStarted)
+        precondition(replayedProtocolEvents[0].commandID == "runtime3-turn-command")
+        precondition(replayedProtocolEvents[0].causationID == "runtime3-input")
+        precondition(replayedProtocolEvents[0].correlationID == "runtime3-turn")
+        precondition(replayedProtocolEvents[0].schemaVersion == SessionEventEnvelope.currentSchemaVersion)
+
+        let commandEnvelope = SessionCommandEnvelope(
+            commandID: "runtime3-start-command",
+            idempotencyKey: "runtime3-start-idempotency",
+            expectedSequence: 1,
+            issuedBy: .daemon,
+            deadline: Date().addingTimeInterval(30),
+            body: .start(sessionID: protocolSession.id)
+        )
+        let roundTrippedCommand = try JSONDecoder().decode(
+            SessionCommandEnvelope.self,
+            from: JSONEncoder().encode(commandEnvelope)
+        )
+        precondition(roundTrippedCommand == commandEnvelope)
+        let commandSupervisor = SessionSupervisor(repository: repository, instanceID: "runtime3-command")
+        let commandReceipt = try await commandSupervisor.execute(SessionCommandEnvelope(
+            commandID: "runtime3-admit-command",
+            idempotencyKey: "runtime3-admit-command",
+            expectedSequence: 0,
+            issuedBy: .cli,
+            deadline: Date().addingTimeInterval(30),
+            body: .admit(SessionInput(
+                sessionID: protocolSession.id,
+                idempotencyKey: "runtime3-command-input",
+                delivery: .deferred,
+                parts: [.text("通过统一命令进入 Inbox")]
+            ))
+        ))
+        precondition(commandReceipt.commandID == "runtime3-admit-command")
+        precondition(commandReceipt.sessionID == protocolSession.id)
+        precondition(commandReceipt.state == .completed)
+        precondition(SessionInputDelivery.allCases.contains(.nextStep))
+        precondition(SessionInputDelivery.allCases.contains(.contextOnly))
+        // Approval creation itself is a Supervisor command; UI helpers must
+        // not insert an approval row and then resume it independently.
+        let supervisorApproval = try await commandSupervisor.requestApproval(
+            sessionID: protocolSession.id,
+            tool: "terminal.exec",
+            risk: .l2,
+            arguments: "{\"command\":\"curl --version\"}"
+        )
+        precondition(supervisorApproval.decision == .pending)
+        let storedSupervisorApproval = try repository.approval(id: supervisorApproval.id)
+        precondition(storedSupervisorApproval?.decision == .pending)
+        let protocolSessionEvents = try repository.events(sessionID: protocolSession.id)
+        precondition(protocolSessionEvents.contains { event in
+            event.type == "approval_requested" && event.payload["approvalID"] == supervisorApproval.id
+        })
+
+        let capabilityRegistry = CapabilityRegistry()
+        capabilityRegistry.register(CapabilityDefinition(
+            id: CapabilityID("web.fetch"),
+            version: "1.0.0",
+            dependencies: [CapabilityID("network.broker")],
+            allowedEffects: [.readOnly, .network]
+        ))
+        capabilityRegistry.register(CapabilityDefinition(
+            id: CapabilityID("network.broker"),
+            version: "1.0.0",
+            dependencies: [],
+            allowedEffects: [.readOnly]
+        ))
+        let assembledProfile = try RuntimeAssembler(registry: capabilityRegistry).assemble(
+            RuntimeProfile(capabilities: [CapabilityID("web.fetch")], permissionMode: .trustedWorkspace)
+        )
+        precondition(assembledProfile.capabilities.map(\.rawValue) == ["network.broker", "web.fetch"])
+        precondition(assembledProfile.permissionMode == .trustedWorkspace)
+
+        let leaseStore = PermissionLeaseStore()
+        let leaseKey = PermissionLeaseKey(projectID: project.id, sessionID: protocolSession.id, effect: .workspaceWrite, toolName: "apply_patch")
+        let lease = try leaseStore.grant(key: leaseKey, duration: 60)
+        precondition(leaseStore.isActive(key: leaseKey, at: Date()))
+        precondition(lease.expiresAt > Date())
+        precondition(leaseStore.revoke(key: leaseKey))
+        precondition(!leaseStore.isActive(key: leaseKey, at: Date()))
+        let persistedLeaseKey = PermissionLeaseKey(projectID: project.id, sessionID: protocolSession.id, effect: .network, toolName: "web_fetch")
+        let persistedLeaseStore = PermissionLeaseStore(repository: repository)
+        _ = try persistedLeaseStore.grant(key: persistedLeaseKey, duration: 120)
+        let reloadedLeaseStore = PermissionLeaseStore(repository: repository)
+        precondition(reloadedLeaseStore.isActive(key: persistedLeaseKey, at: Date()))
+        precondition(CostBudgetGate.action(spent: Decimal(string: "0.70")!, limit: Decimal(1)) == .warn)
+        precondition(CostBudgetGate.action(spent: Decimal(string: "0.85")!, limit: Decimal(1)) == .compressContext)
+        precondition(CostBudgetGate.action(spent: Decimal(string: "0.95")!, limit: Decimal(1)) == .pauseAtSafeBoundary)
+
+        let boundarySession = try repository.createSession(projectID: project.id, title: "Runtime 3 input boundary", mode: .acceptEdits)
+        let boundaryContext = try repository.enqueueSessionInput(
+            sessionID: boundarySession.id,
+            idempotencyKey: "runtime3-context-only",
+            delivery: .contextOnly,
+            parts: [.text("补充约束：不要改动公开 API")]
+        )
+        let boundaryPrimary = try repository.enqueueSessionInput(
+            sessionID: boundarySession.id,
+            idempotencyKey: "runtime3-next-step",
+            delivery: .nextStep,
+            parts: [.text("继续修复")]
+        )
+        let inputBoundary = try repository.promoteSessionInputBoundary(sessionID: boundarySession.id)
+        precondition(inputBoundary?.primary.id == boundaryPrimary.id)
+        precondition(inputBoundary?.context.map(\.id) == [boundaryContext.id])
+        let boundaryInputs = try repository.sessionInputs(sessionID: boundarySession.id)
+        precondition(boundaryInputs.first { $0.id == boundaryContext.id }?.state == .promoted)
         // The execution pipeline, rather than the router, owns the durable
         // lifecycle and creates a traceable Evidence record for every tool.
         let pipelineRegistry = ToolRegistry([routerTool])
@@ -318,6 +460,73 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(pipelineResult.evidenceID != nil)
         let pipelineEvents = try repository.events(sessionID: pipelineSession.id)
         precondition(pipelineEvents.map(\.type).suffix(4) == ["tool_requested", "tool_started", "evidence_recorded", "tool_completed"])
+        let pipelineEnvelopes = try repository.eventEnvelopes(sessionID: pipelineSession.id)
+        precondition(pipelineEnvelopes.suffix(4).allSatisfy { $0.schemaVersion == SessionEventEnvelope.currentSchemaVersion })
+        precondition(Set(pipelineEnvelopes.suffix(4).compactMap(\.correlationID)).count == 1)
+        precondition(pipelineEnvelopes.suffix(4).map(\.kind) == [.toolRequested, .toolStarted, .evidenceRecorded, .toolCompleted])
+        // MCP has the same durable ToolExecutionPipeline contract as local
+        // tools: manager convenience APIs must not call an MCP host directly.
+        let mcpPipelineSession = try repository.createSession(projectID: project.id, title: "MCP pipeline", mode: .acceptEdits)
+        let mcpRegistry = ToolRegistry()
+        let mcpRouter = ToolHostRouter(registry: mcpRegistry)
+        let mcpPipeline = ToolExecutionPipeline(repository: repository, router: mcpRouter)
+        let mcpManager = DefaultMCPManager(registry: mcpRegistry, router: mcpRouter, pipeline: mcpPipeline)
+        try await mcpManager.connect(serverID: "fixture", transport: RuntimeV2RoutingMCPTransport())
+        let mcpOutput = try await mcpManager.call(
+            serverID: "fixture",
+            tool: "lookup",
+            argumentsJSON: "{\"topic\":\"pipeline\"}",
+            sessionID: mcpPipelineSession.id,
+            commandID: "mcp-pipeline-command",
+            callID: "mcp-pipeline-call"
+        )
+        precondition(mcpOutput.contains("mcp-pipeline"))
+        let mcpPipelineEvents = try repository.events(sessionID: mcpPipelineSession.id)
+        precondition(mcpPipelineEvents.map(\.type).suffix(4) == ["tool_requested", "tool_started", "evidence_recorded", "tool_completed"])
+        precondition(mcpPipelineEvents.suffix(4).allSatisfy { $0.payload["tool"] == "mcp.fixture.lookup" || $0.type == "evidence_recorded" })
+        // A rejecting pre-tool Hook is part of the same durable chain. It
+        // must stop the host before `tool_started`, with no AgentHost-only
+        // side channel or uncorrelated hook event.
+        let hookPipelineSession = try repository.createSession(projectID: project.id, title: "Hook pipeline", mode: .acceptEdits)
+        let blockingHook = HookDefinition(
+            id: "pipeline-blocking-hook",
+            lifecycle: .preToolUse,
+            command: "printf '{\"decision\":\"block\",\"reason\":\"fixture hook\"}'",
+            trusted: true
+        )
+        let hookPipeline = ToolExecutionPipeline(
+            repository: repository,
+            router: pipelineRouter,
+            preToolHooks: [blockingHook]
+        )
+        let hookContext = ToolInvocationContext(
+            sessionID: hookPipelineSession.id,
+            commandID: "hook-pipeline-command",
+            callID: "hook-pipeline-call",
+            tool: routerTool,
+            argumentsJSON: "{}"
+        )
+        try hookPipeline.begin(hookContext)
+        let hookDecision = await hookPipeline.evaluatePreToolHooks(hookContext)
+        guard case let .blocked(reason) = hookDecision, reason == "fixture hook" else {
+            preconditionFailure("pre-tool hook did not block through pipeline")
+        }
+        let hookPipelineEvents = try repository.events(sessionID: hookPipelineSession.id)
+        precondition(hookPipelineEvents.map(\.type).suffix(3) == ["tool_requested", "pre_tool_hook", "tool_blocked"])
+        // Convenience callers (notably MCP) must receive the same Hook gate;
+        // calling `execute` must never start a blocked host.
+        let convenienceHookSession = try repository.createSession(projectID: project.id, title: "Hook convenience gate", mode: .acceptEdits)
+        let convenienceHookResult = try await hookPipeline.execute(ToolInvocationContext(
+            sessionID: convenienceHookSession.id,
+            commandID: "hook-convenience-command",
+            callID: "hook-convenience-call",
+            tool: routerTool,
+            argumentsJSON: "{}"
+        ))
+        precondition(!convenienceHookResult.succeeded)
+        precondition(convenienceHookResult.code == "HOOK_BLOCKED")
+        let convenienceHookEvents = try repository.events(sessionID: convenienceHookSession.id)
+        precondition(convenienceHookEvents.map(\.type).suffix(3) == ["tool_requested", "pre_tool_hook", "tool_blocked"])
         let inboxInput = try repository.enqueueSessionInput(
             sessionID: session.id,
             idempotencyKey: "foreground-input",
@@ -548,7 +757,14 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(childResult.summary == "只读 Worker 已完成")
         let storedChild = try repository.workerSession(id: child.id)
         precondition(storedChild?.state == .awaitingAdoption)
-        try await childRuntime.adopt(workerSessionID: child.id)
+        let childWorkerMessages = try WorkerTaskGraph(repository: repository).messages(parentSessionID: session.id)
+        precondition(childWorkerMessages.contains {
+            $0.workerSessionID == child.id &&
+            $0.kind == .evidence &&
+            $0.evidenceIDs == ["worker-evidence-1"]
+        })
+        let childAdoptionSupervisor = SessionSupervisor(repository: repository, instanceID: "runtime3-worker-adoption")
+        try await childAdoptionSupervisor.adoptWorkerResult(sessionID: session.id, workerSessionID: child.id)
         let adoptedChild = try repository.workerSession(id: child.id)
         precondition(adoptedChild?.state == .completed)
 
@@ -625,6 +841,19 @@ private struct RuntimeV2StaticMCPTransport: MCPTransport {
 
     func request(_ request: MCPJSONRPCRequest) async throws -> MCPJSONRPCResponse {
         try MCPJSONRPCResponse.decode(line: response)
+    }
+}
+
+private struct RuntimeV2RoutingMCPTransport: MCPTransport {
+    func request(_ request: MCPJSONRPCRequest) async throws -> MCPJSONRPCResponse {
+        switch request.method {
+        case "tools/list":
+            return try MCPJSONRPCResponse.decode(line: "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"lookup\",\"description\":\"Lookup fixture\",\"inputSchema\":{\"type\":\"object\"}}]}}")
+        case "tools/call":
+            return try MCPJSONRPCResponse.decode(line: "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true,\"source\":\"mcp-pipeline\"}}")
+        default:
+            return try MCPJSONRPCResponse.decode(line: "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}")
+        }
     }
 }
 

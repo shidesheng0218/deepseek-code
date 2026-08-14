@@ -26,7 +26,7 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
     public func start(sessionID: String) async throws {
         guard activeRunIDs[sessionID] == nil else { return }
         guard let session = try repository.session(id: sessionID) else { throw HarnessSupervisorError.sessionNotFound }
-        guard let input = try nextRunnableInput(sessionID: sessionID) else {
+        guard let inputBatch = try nextRunnableInputBatch(sessionID: sessionID) else {
             // Starting an empty Session is idempotent and remains at a safe
             // boundary. It must not synthesize a prompt or replay old work.
             return
@@ -39,7 +39,7 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
             await self?.execute(
                 runID: runID,
                 session: session,
-                input: input,
+                inputBatch: inputBatch,
                 control: control
             )
         }
@@ -92,20 +92,29 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
         }
     }
 
-    private func nextRunnableInput(sessionID: String) throws -> SessionInputRecord? {
+    private func nextRunnableInputBatch(sessionID: String) throws -> RunnableInputBatch? {
         let inputs = try repository.sessionInputs(sessionID: sessionID)
-        if let promoted = inputs.first(where: { $0.state == .promoted }) { return promoted }
-        return try repository.promoteNextSessionInput(sessionID: sessionID)
+        if let primary = inputs.first(where: { $0.state == .promoted && $0.delivery != .contextOnly }) {
+            return RunnableInputBatch(
+                primary: primary,
+                context: inputs.filter { $0.state == .promoted && $0.delivery == .contextOnly }
+            )
+        }
+        return try repository.promoteSessionInputBoundary(sessionID: sessionID).map(RunnableInputBatch.init)
     }
 
-    private func execute(runID: String, session: StoredSession, input: SessionInputRecord, control: AgentRunControl) async {
+    private func execute(runID: String, session: StoredSession, inputBatch: RunnableInputBatch, control: AgentRunControl) async {
+        let input = inputBatch.materializedInput
         do {
             try await runner.run(session: session, input: input, control: control)
-            _ = try? repository.markSessionInputConsumed(id: input.id)
+            inputBatch.all.forEach { _ = try? repository.markSessionInputConsumed(id: $0.id) }
             _ = try? repository.appendDurable(
                 sessionID: session.id,
                 type: "daemon_input_consumed",
-                payload: ["inputID": input.id],
+                payload: [
+                    "inputID": inputBatch.primary.id,
+                    "contextInputIDs": inputBatch.context.map(\.id).joined(separator: ",")
+                ],
                 commandID: "daemon-consume-\(input.id)",
                 causationID: input.id
             )
@@ -113,7 +122,7 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
             // A stopped run must never leave its input promoted, otherwise the
             // next start would silently replay the cancelled prompt and the
             // newest user message could never run.
-            _ = try? repository.cancelSessionInput(id: input.id)
+            inputBatch.all.forEach { _ = try? repository.cancelSessionInput(id: $0.id) }
             _ = try? repository.appendDurable(
                 sessionID: session.id,
                 type: "daemon_execution_stopped",
@@ -123,7 +132,7 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
         } catch {
             // A failed run also consumes its input so a retry does not replay
             // the failed prompt while newer user messages are pending.
-            _ = try? repository.markSessionInputConsumed(id: input.id)
+            inputBatch.all.forEach { _ = try? repository.markSessionInputConsumed(id: $0.id) }
             _ = try? repository.appendDurable(
                 sessionID: session.id,
                 type: "agent_failed",
@@ -175,5 +184,35 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
         // A stopped control can never be resumed; drop it so the next start
         // builds a fresh control instead of failing at the first boundary.
         controls.removeValue(forKey: sessionID)
+    }
+
+    private struct RunnableInputBatch: Sendable {
+        let primary: SessionInputRecord
+        let context: [SessionInputRecord]
+
+        init(primary: SessionInputRecord, context: [SessionInputRecord]) {
+            self.primary = primary
+            self.context = context.sorted { $0.admittedSequence < $1.admittedSequence }
+        }
+
+        init(_ boundary: SessionInputBoundary) {
+            self.init(primary: boundary.primary, context: boundary.context)
+        }
+
+        var all: [SessionInputRecord] { context + [primary] }
+
+        var materializedInput: SessionInputRecord {
+            SessionInputRecord(
+                id: primary.id,
+                sessionID: primary.sessionID,
+                idempotencyKey: primary.idempotencyKey,
+                admittedSequence: primary.admittedSequence,
+                delivery: primary.delivery,
+                state: primary.state,
+                parts: context.flatMap(\.parts) + primary.parts,
+                createdAt: primary.createdAt,
+                updatedAt: primary.updatedAt
+            )
+        }
     }
 }

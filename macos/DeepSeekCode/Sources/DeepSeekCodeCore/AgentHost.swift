@@ -113,6 +113,7 @@ public final class NativeAgentHost: @unchecked Sendable {
     private let defaultPricing: ProviderProfile?
     private let networkRuntime: NetworkRuntime?
     private let hookManifest: HostCapabilityManifest?
+    private let permissionLeaseStore: PermissionLeaseStore
 
     public init(client: any ChatStreaming, eventStore: EventStore, workspace: WorkspaceToolHost? = nil, repository: SessionRepository? = nil, projectTrusted: Bool = false, sandboxAvailable: Bool = false, toolRouter: ToolHostRouter? = nil, toolRegistry: ToolRegistry? = nil, hooks: [HookDefinition] = [], failureInjector: any FailureInjector = NoopFailureInjector(), defaultPricing: ProviderProfile? = nil, networkRuntime: NetworkRuntime? = nil, hookManifest: HostCapabilityManifest? = nil) {
         self.client = client
@@ -124,7 +125,12 @@ public final class NativeAgentHost: @unchecked Sendable {
         self.toolRouter = toolRouter
         self.toolPipeline = {
             guard let repository, let toolRouter else { return nil }
-            return ToolExecutionPipeline(repository: repository, router: toolRouter)
+            return ToolExecutionPipeline(
+                repository: repository,
+                router: toolRouter,
+                preToolHooks: hooks,
+                hookManifest: hookManifest
+            )
         }()
         self.toolRegistry = toolRegistry ?? AgentToolSchemas.registry
         self.hooks = hooks
@@ -132,6 +138,7 @@ public final class NativeAgentHost: @unchecked Sendable {
         self.defaultPricing = defaultPricing
         self.networkRuntime = networkRuntime
         self.hookManifest = hookManifest
+        self.permissionLeaseStore = PermissionLeaseStore(repository: repository)
     }
 
     public func run(_ request: AgentRunRequest) -> AsyncThrowingStream<AgentEvent, Error> {
@@ -189,6 +196,15 @@ public final class NativeAgentHost: @unchecked Sendable {
                     if decision == .allowOnce || decision == .allowSession {
                         await persist(sessionID: sessionID, type: "tool_approved", payload: ["approvalID": approvalID, "tool": pending.tool])
                     }
+                    if decision == .allowSession,
+                       let lease = try? grantPermissionLease(sessionID: sessionID, toolName: pending.tool) {
+                        await persist(sessionID: sessionID, type: "permission_lease_granted", payload: [
+                            "leaseID": lease.id,
+                            "tool": pending.tool,
+                            "effect": lease.key.effect.rawValue,
+                            "expiresAt": ISO8601DateFormatter().string(from: lease.expiresAt)
+                        ])
+                    }
                     let output: String
                     if decision == .deny {
                         print("→ [AGENTHOST] User denied approval")
@@ -200,6 +216,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                         case let .completed(value, succeeded, finalizedByPipeline):
                             print("→ [AGENTHOST] Tool execution completed: succeeded=\(succeeded)")
                             output = value
+                            continuation.yield(.toolCompleted(name: call.name, succeeded: succeeded))
                             await persistBrowserEvidenceIfAvailable(output: value, call: call, sessionID: sessionID)
                             await persistWebEvidenceIfAvailable(output: value, call: call, sessionID: sessionID)
                             if !finalizedByPipeline {
@@ -245,7 +262,16 @@ public final class NativeAgentHost: @unchecked Sendable {
     private func runStream(request: AgentRunRequest, initialMessages: [ChatMessage], initialState: AgentRunState, route: TaskRoute, qualityPlan: TaskQualityPlan) -> AsyncThrowingStream<AgentEvent, Error> {
         AsyncThrowingStream<AgentEvent, Error> { continuation in
             Task {
+                let turnID = UUID().uuidString
                 continuation.yield(.started)
+                await persistProtocol(
+                    sessionID: request.sessionID,
+                    kind: .turnStarted,
+                    payload: ["turnID": turnID],
+                    commandID: "turn-\(request.sessionID)-\(turnID)-start",
+                    causationID: request.sessionID,
+                    correlationID: turnID
+                )
                 await persist(sessionID: request.sessionID, type: "session_status_changed", payload: ["status": "running"])
                 await persist(sessionID: request.sessionID, type: "task_routed", payload: [
                     "kind": route.kind.rawValue,
@@ -296,6 +322,8 @@ public final class NativeAgentHost: @unchecked Sendable {
                     var outputTokens = 0
                     var estimatedCost = Decimal.zero
                     var pauseForCostBudget = false
+                    var compressContextForBudget = false
+                    var recordedBudgetAction: CostBudgetAction = .normal
                     while runState.turn < request.budget.maxToolTurns {
                         try await request.control?.waitUntilRunnable()
                         guard Date().timeIntervalSince(startedAt) <= TimeInterval(request.budget.maxWallClockSeconds) else {
@@ -305,7 +333,19 @@ public final class NativeAgentHost: @unchecked Sendable {
                             throw AgentHostError.budgetExceeded("已达到 Session 成本预算")
                         }
                         runState.turn += 1
-                        let contextAssembly = ContextBuilder().assemble(messages, maxTokens: request.budget.maxInputTokens)
+                        let stepID = "\(turnID)-step-\(runState.turn)"
+                        await persistProtocol(
+                            sessionID: request.sessionID,
+                            kind: .stepStarted,
+                            payload: ["turnID": turnID, "stepID": stepID, "step": "\(runState.turn)"],
+                            commandID: "step-\(request.sessionID)-\(stepID)-start",
+                            causationID: turnID,
+                            correlationID: turnID
+                        )
+                        let contextTokenLimit = compressContextForBudget
+                            ? max(2_048, Int(Double(request.budget.maxInputTokens) * 0.60))
+                            : request.budget.maxInputTokens
+                        let contextAssembly = ContextBuilder().assemble(messages, maxTokens: contextTokenLimit)
                         messages = contextAssembly.messages
                         await persist(sessionID: request.sessionID, type: "quality_context_selected", payload: [
                             "planID": qualityPlan.id,
@@ -333,6 +373,20 @@ public final class NativeAgentHost: @unchecked Sendable {
                         let modelRequestStartedAt = Date()
                         let modelRequestID = UUID().uuidString
                         var firstTokenLatencyMilliseconds: Int?
+                        await persistProtocol(
+                            sessionID: request.sessionID,
+                            kind: .modelRequestStarted,
+                            payload: [
+                                "turnID": turnID,
+                                "stepID": stepID,
+                                "requestID": modelRequestID,
+                                "model": request.model,
+                                "maxTokens": "\(chat.maxTokens)"
+                            ],
+                            commandID: "model-request-\(request.sessionID)-\(modelRequestID)",
+                            causationID: stepID,
+                            correlationID: turnID
+                        )
 
                         func recordUsage(_ usage: NormalizedUsage) async throws {
                             inputTokens += usage.inputTokens
@@ -346,7 +400,22 @@ public final class NativeAgentHost: @unchecked Sendable {
                             let latencyMilliseconds = UsageLatency.milliseconds(startedAt: modelRequestStartedAt)
                             let increment = self.estimatedCost(input: usage.inputTokens, cachedInput: usage.cacheReadInputTokens, output: usage.outputTokens, pricing: request.pricing)
                             estimatedCost += increment
-                            if let maxCost = request.budget.maxCost, estimatedCost >= maxCost * Decimal(string: "0.95")! {
+                            let budgetAction = CostBudgetGate.action(spent: estimatedCost, limit: request.budget.maxCost)
+                            if budgetAction != recordedBudgetAction {
+                                recordedBudgetAction = budgetAction
+                                await persist(sessionID: request.sessionID, type: "cost_budget_state_changed", payload: [
+                                    "action": budgetAction.rawValue,
+                                    "estimatedCost": NSDecimalNumber(decimal: estimatedCost).stringValue,
+                                    "maxCost": request.budget.maxCost.map { NSDecimalNumber(decimal: $0).stringValue } ?? ""
+                                ])
+                            }
+                            switch budgetAction {
+                            case .normal, .warn:
+                                break
+                            case .compressContext:
+                                compressContextForBudget = true
+                            case .pauseAtSafeBoundary:
+                                compressContextForBudget = true
                                 pauseForCostBudget = true
                             }
                             continuation.yield(.usage(input: usage.inputTokens, cachedInput: usage.cacheReadInputTokens, output: usage.outputTokens, latencyMilliseconds: latencyMilliseconds))
@@ -404,6 +473,14 @@ public final class NativeAgentHost: @unchecked Sendable {
                                     )
                                 }
                                 continuation.yield(.assistantDelta(text))
+                                await persistProtocol(
+                                    sessionID: request.sessionID,
+                                    kind: .assistantChunkAppended,
+                                    payload: ["turnID": turnID, "stepID": stepID, "requestID": modelRequestID, "text": text],
+                                    commandID: "assistant-chunk-\(request.sessionID)-\(modelRequestID)-\(UUID().uuidString)",
+                                    causationID: modelRequestID,
+                                    correlationID: turnID
+                                )
                                 await persist(sessionID: request.sessionID, type: "assistant_text", payload: ["text": text])
                                 continue
                             case let .reasoningDelta(text):
@@ -572,6 +649,35 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 try? repository?.saveRunState(runState)
                             }
                         }
+                        let committedAssistantIndex = currentAssistantMessageIndex()
+                        let committedAssistant = messages[committedAssistantIndex]
+                        await persistProtocol(
+                            sessionID: request.sessionID,
+                            kind: .assistantMessageCommitted,
+                            payload: [
+                                "turnID": turnID,
+                                "stepID": stepID,
+                                "requestID": modelRequestID,
+                                "text": committedAssistant.content,
+                                "toolCallIDs": (committedAssistant.toolCalls ?? []).map(\.id).joined(separator: ",")
+                            ],
+                            commandID: "assistant-message-\(request.sessionID)-\(modelRequestID)",
+                            causationID: modelRequestID,
+                            correlationID: turnID
+                        )
+                        await persistProtocol(
+                            sessionID: request.sessionID,
+                            kind: .stepEnded,
+                            payload: [
+                                "turnID": turnID,
+                                "stepID": stepID,
+                                "requestID": modelRequestID,
+                                "invokedTool": invokedTool ? "true" : "false"
+                            ],
+                            commandID: "step-\(request.sessionID)-\(stepID)-end",
+                            causationID: modelRequestID,
+                            correlationID: turnID
+                        )
                         if !invokedTool {
                             let finalResponse = messages.filter { $0.role == "assistant" }.map(\.content).joined(separator: "\n")
                             let responseAssessment = ResponseQualityValidator.validate(finalResponse, contract: qualityPlan.responseContract, evidence: QualityEvidenceState.from(messages: messages))
@@ -593,6 +699,14 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 ])
                             }
                             try? repository?.saveRunState(runState)
+                            await persistProtocol(
+                                sessionID: request.sessionID,
+                                kind: .turnEnded,
+                                payload: ["turnID": turnID, "state": "completed", "steps": "\(runState.turn)"],
+                                commandID: "turn-\(request.sessionID)-\(turnID)-end",
+                                causationID: stepID,
+                                correlationID: turnID
+                            )
                             // 发送 agent_completed 事件，让 UI 知道 assistant 消息已完成
                             await persist(sessionID: request.sessionID, type: "agent_completed", payload: [:])
                             continuation.yield(.completed)
@@ -612,6 +726,14 @@ public final class NativeAgentHost: @unchecked Sendable {
                 } catch is CancellationError {
                     runState.status = .cancelled
                     try? repository?.saveRunState(runState)
+                    await persistProtocol(
+                        sessionID: request.sessionID,
+                        kind: .turnEnded,
+                        payload: ["turnID": turnID, "state": "cancelled", "steps": "\(runState.turn)"],
+                        commandID: "turn-\(request.sessionID)-\(turnID)-cancelled",
+                        causationID: turnID,
+                        correlationID: turnID
+                    )
                     await persist(sessionID: request.sessionID, type: "agent_paused_at_checkpoint", payload: ["turn": "\(runState.turn)"])
                     await eventWriter.flush()
                     continuation.finish()
@@ -620,6 +742,14 @@ public final class NativeAgentHost: @unchecked Sendable {
                     runState.fail()
                     try? repository?.saveRunState(runState)
                     continuation.yield(.failed(message))
+                    await persistProtocol(
+                        sessionID: request.sessionID,
+                        kind: .turnEnded,
+                        payload: ["turnID": turnID, "state": "failed", "steps": "\(runState.turn)", "error": message],
+                        commandID: "turn-\(request.sessionID)-\(turnID)-failed",
+                        causationID: turnID,
+                        correlationID: turnID
+                    )
                     await persist(sessionID: request.sessionID, type: "session_status_changed", payload: ["status": "failed", "error": message])
                     await eventWriter.flush()
                     continuation.finish(throwing: error)
@@ -703,6 +833,29 @@ public final class NativeAgentHost: @unchecked Sendable {
             _ = try? repository.appendDurable(sessionID: sessionID, type: type, payload: redacted)
         } else {
             await eventWriter.append(sessionID: sessionID, event: SessionEvent(type: type, payload: redacted))
+        }
+    }
+
+    private func persistProtocol(
+        sessionID: String,
+        kind: SessionEventKind,
+        payload: [String: String],
+        commandID: String,
+        causationID: String?,
+        correlationID: String
+    ) async {
+        let redacted = SecretRedactor.redact(payload)
+        if let repository {
+            _ = try? SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+                aggregateID: sessionID,
+                commandID: commandID,
+                causationID: causationID,
+                correlationID: correlationID,
+                kind: kind,
+                payload: redacted
+            ))
+        } else {
+            await eventWriter.append(sessionID: sessionID, event: SessionEvent(type: kind.rawValue, payload: redacted))
         }
     }
 
@@ -794,6 +947,8 @@ public final class NativeAgentHost: @unchecked Sendable {
         }
         let researchCapability = webReadCapability(for: call.name)
         let researchURL = researchURL(for: call)
+        let activePermissionLease = !approvedByUser
+            && permissionLeaseKey(sessionID: sessionID, toolName: call.name).map { permissionLeaseStore.isActive(key: $0) } == true
         let researchReadAuthorized: Bool
         if let researchCapability,
            let networkRuntime,
@@ -826,19 +981,43 @@ public final class NativeAgentHost: @unchecked Sendable {
                 ])
                 return .completed(output: json(["ok": false, "code": "EVIDENCE_REQUIRED", "message": "请先搜索、抓取并记录可引用 Evidence" ]), succeeded: false)
             case let .requestApproval(risk):
-                if !researchReadAuthorized { return .approvalRequired(risk) }
+                if !researchReadAuthorized && !activePermissionLease { return .approvalRequired(risk) }
             case let .blocked(reason):
                 return .blocked(output: json(["ok": false, "code": "QUALITY_POLICY_BLOCKED", "message": reason]), risk: registered.risk)
             case .execute:
                 break
             }
         }
-        if let hookResult = await runPreToolHooks(call: call, sessionID: sessionID) {
+        if let toolPipeline, let pipelineContext {
+            switch await toolPipeline.evaluatePreToolHooks(pipelineContext) {
+            case .allow:
+                break
+            case .requireApproval:
+                return .approvalRequired(.l2)
+            case let .blocked(reason):
+                return .blocked(
+                    output: json(["ok": false, "code": "HOOK_BLOCKED", "message": reason]),
+                    risk: .l2
+                )
+            }
+        } else if let hookResult = await runPreToolHooks(call: call, sessionID: sessionID) {
+            // Compatibility-only fallback for hosts without a registered
+            // ToolExecutionPipeline. Production Runtime/daemon hosts always
+            // construct the pipeline above.
             return hookResult
         }
         var permissionDecision = approvedByUser
             ? approvedPermission(for: call, mode: mode, workerKind: workerKind)
             : permission(for: call.name, argumentsJSON: call.argumentsJSON, mode: mode, workerKind: workerKind)
+        if activePermissionLease,
+           let leaseKey = permissionLeaseKey(sessionID: sessionID, toolName: call.name) {
+            permissionDecision = .allow
+            await persist(sessionID: sessionID, type: "permission_lease_used", payload: [
+                "tool": canonicalToolName(for: call.name),
+                "callID": call.id,
+                "effect": leaseKey.effect.rawValue
+            ])
+        }
         if !approvedByUser, let researchCapability, researchReadAuthorized {
             permissionDecision = .allow
             await persist(sessionID: sessionID, type: "web_research_grant_used", payload: [
@@ -975,6 +1154,24 @@ public final class NativeAgentHost: @unchecked Sendable {
     private func projectID(for sessionID: String) -> String? {
         guard let repository else { return nil }
         return (try? repository.session(id: sessionID))??.projectID
+    }
+
+    private func permissionLeaseKey(sessionID: String, toolName: String) -> PermissionLeaseKey? {
+        let canonicalName = canonicalToolName(for: toolName)
+        guard let tool = toolRegistry.tool(named: canonicalName) else { return nil }
+        return PermissionLeaseKey(
+            projectID: projectID(for: sessionID),
+            sessionID: sessionID,
+            effect: tool.effect,
+            toolName: canonicalName
+        )
+    }
+
+    private func grantPermissionLease(sessionID: String, toolName: String) throws -> PermissionLease {
+        guard let key = permissionLeaseKey(sessionID: sessionID, toolName: toolName) else {
+            throw AgentHostError.toolNotFound(toolName)
+        }
+        return try permissionLeaseStore.grant(key: key, duration: 8 * 60 * 60)
     }
 
     private func inject(_ point: FailureInjectionPoint, sessionID: String, tool: String) async throws {

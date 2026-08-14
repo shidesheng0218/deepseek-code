@@ -614,12 +614,12 @@ public final class WorkspaceStore {
                     statusMessage = "定时任务包含未授权联网或命令，已暂停"
                     return
                 }
-                createSession(title: "Scheduled · \(task.prompt)")
-                guard hasActiveSession else { return }
-                try? repository?.append(sessionID: selectedSessionID, type: "scheduled_trigger_consumed", payload: ["runID": trigger.id, "taskID": task.id])
                 sessionBudget = SessionBudget(maxToolTurns: 40, maxWallClockSeconds: max(30, task.maxRuntimeMinutes * 60), maxInputTokens: 120_000, maxOutputTokens: 24_000)
-                startDaemonAgentRun(sessionID: selectedSessionID, parts: [.text(task.prompt)])
-                await agentRunTasks[selectedSessionID]?.value
+                let session = try await createSessionThroughDaemon(title: "Scheduled · \(task.prompt)")
+                selectCreatedSession(session)
+                try? repository?.append(sessionID: session.id, type: "scheduled_trigger_consumed", payload: ["runID": trigger.id, "taskID": task.id])
+                startDaemonAgentRun(sessionID: session.id, parts: [.text(task.prompt)])
+                await agentRunTasks[session.id]?.value
                 refreshSelectedSession()
                 let succeeded = selectedSession.status == .completed || selectedSession.status == .delivered
                 if succeeded {
@@ -824,51 +824,17 @@ public final class WorkspaceStore {
     }
 
     public func createSession(title: String? = nil) {
-        guard let repository else {
-            statusMessage = "本地 Session 数据库不可用"
-            return
-        }
-        do {
-            if selectedProjectID == nil {
-                let scratch = try ensureScratchProject(repository: repository)
-                selectedProjectID = scratch.id
-                projectPath = scratch.path
+        let text = (title ?? prompt).trimmingCharacters(in: .whitespacesAndNewlines)
+        let titleText = text.isEmpty ? "新建对话" : String(text.prefix(60))
+        statusMessage = "正在由本地 Runtime 创建 Session…"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let session = try await self.createSessionThroughDaemon(title: titleText)
+                self.selectCreatedSession(session)
+            } catch {
+                self.statusMessage = "创建 Session 失败：\(error.localizedDescription)"
             }
-            guard let selectedProjectID else { return }
-            let text = (title ?? prompt).trimmingCharacters(in: .whitespacesAndNewlines)
-            let titleText = text.isEmpty ? "新建对话" : String(text.prefix(60))
-            let branch = executionTarget == .local ? "main" : "deepseek/\(slug(titleText))"
-            var worktreePath: String?
-            var baselineRevision: String?
-            let git = isScratchProject ? nil : try? GitService(root: URL(fileURLWithPath: projectPath, isDirectory: true))
-            baselineRevision = try? git?.currentRevision()
-            if executionTarget == .worktree {
-                let worktreeRoot = storageDirectory.appendingPathComponent("Worktrees", isDirectory: true)
-                let path = worktreeRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
-                guard let git else { throw GitError(command: "worktree", detail: "项目不是 Git 仓库") }
-                guard let baselineRevision, !baselineRevision.isEmpty else {
-                    throw GitError(command: "worktree", detail: "Worktree 必须基于已有 Commit；请先提交仓库初始版本")
-                }
-                _ = try git.createWorktree(path: path, branch: branch, base: baselineRevision)
-                worktreePath = path.path
-            }
-            let session = try repository.createSession(projectID: selectedProjectID, title: titleText, mode: mode, target: executionTarget, branch: branch, worktreePath: worktreePath, baselineRevision: baselineRevision)
-            let contract = TaskContract.compatibility(prompt: titleText, budget: sessionBudget)
-            try repository.saveTaskContract(contract, sessionID: session.id)
-            try repository.append(sessionID: session.id, type: "task_contract_created", payload: [
-                "goal": contract.goal,
-                "requiredChanges": "\(contract.requiredChanges.count)",
-                "requiredTests": "\(contract.requiredTests.count)"
-            ])
-            if let worktreePath, let baselineRevision {
-                try repository.saveWorktree(WorktreeRecord(sessionID: session.id, baseRevision: baselineRevision, branch: branch, worktreePath: worktreePath))
-            }
-            selectedSessionID = session.id
-            reloadWorkspace()
-            refreshSelectedSession()
-            statusMessage = isScratchProject ? "已创建快速对话" : "已创建 Session"
-        } catch {
-            statusMessage = "创建 Session 失败：\(error.localizedDescription)"
         }
     }
 
@@ -1011,9 +977,6 @@ public final class WorkspaceStore {
         let outgoingPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !outgoingPrompt.isEmpty || !composerAttachments.isEmpty else { return }
         let effectivePrompt = outgoingPrompt.isEmpty ? "请分析这些附件，并根据结果完成任务。" : outgoingPrompt
-        if !hasActiveSession { createSession(title: effectivePrompt) }
-        guard hasActiveSession else { return }
-        let sessionID = selectedSessionID
         let outgoingAttachments = composerAttachments
         let outgoingParts = [ContentPart.text(effectivePrompt)] + outgoingAttachments.map { attachment in
             switch attachment.kind {
@@ -1033,6 +996,24 @@ public final class WorkspaceStore {
         prompt = ""
         composerAttachments.removeAll()
         attachmentStatusMessage = ""
+        guard hasActiveSession else {
+            statusMessage = "正在由本地 Runtime 创建 Session…"
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let session = try await self.createSessionThroughDaemon(title: String(effectivePrompt.prefix(60)))
+                    self.selectCreatedSession(session)
+                    self.submitTask(sessionID: session.id, parts: outgoingParts)
+                } catch {
+                    self.statusMessage = "创建 Session 并发送任务失败：\(error.localizedDescription)"
+                }
+            }
+            return
+        }
+        submitTask(sessionID: selectedSessionID, parts: outgoingParts)
+    }
+
+    private func submitTask(sessionID: String, parts: [ContentPart]) {
         if agentWorkers.contains(where: { $0.sessionID == sessionID && $0.kind == .main && $0.isLive }) {
             statusMessage = "正在加入本轮结束后的输入队列…"
             Task { [weak self] in
@@ -1045,7 +1026,7 @@ public final class WorkspaceStore {
                             sessionID: sessionID,
                             idempotencyKey: "gui-daemon-deferred-\(UUID().uuidString)",
                             delivery: .deferred,
-                            parts: outgoingParts
+                            parts: parts
                         ),
                         client: client
                     )
@@ -1058,7 +1039,64 @@ public final class WorkspaceStore {
         }
         statusMessage = "Agent 正在准备…"
         updateSelectedSessionStatus(.running)
-        startDaemonAgentRun(sessionID: sessionID, parts: outgoingParts)
+        startDaemonAgentRun(sessionID: sessionID, parts: parts)
+    }
+
+    /// Builds any required local Worktree first, then delegates all durable
+    /// Project/Session/TaskContract writes to `deepseekd`. The UI therefore
+    /// only updates its Projection after it receives the daemon receipt.
+    private func createSessionThroughDaemon(title: String) async throws -> StoredSession {
+        let resolvedProjectPath: String
+        if projectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let scratch = scratchProjectURL
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            projectPath = scratch.path
+            resolvedProjectPath = scratch.path
+        } else {
+            resolvedProjectPath = URL(fileURLWithPath: projectPath, isDirectory: true).standardizedFileURL.path
+        }
+
+        let branch = executionTarget == .local ? "main" : "deepseek/\(slug(title))"
+        var worktreePath: String?
+        var baselineRevision: String?
+        let git = isScratchProject ? nil : try? GitService(root: URL(fileURLWithPath: resolvedProjectPath, isDirectory: true))
+        baselineRevision = try? git?.currentRevision()
+        if executionTarget == .worktree {
+            let worktreeRoot = storageDirectory.appendingPathComponent("Worktrees", isDirectory: true)
+            let path = worktreeRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            guard let git else { throw GitError(command: "worktree", detail: "项目不是 Git 仓库") }
+            guard let baselineRevision, !baselineRevision.isEmpty else {
+                throw GitError(command: "worktree", detail: "Worktree 必须基于已有 Commit；请先提交仓库初始版本")
+            }
+            _ = try git.createWorktree(path: path, branch: branch, base: baselineRevision)
+            worktreePath = path.path
+        }
+
+        let client = try await daemonClient()
+        let response = try await sendDaemon(
+            .sessionCreate,
+            payload: DeepSeekDaemonCreateSessionPayload(
+                projectPath: resolvedProjectPath,
+                projectName: isScratchProject ? "快速对话" : nil,
+                title: title,
+                mode: mode,
+                target: executionTarget,
+                branch: branch,
+                worktreePath: worktreePath,
+                baselineRevision: baselineRevision,
+                budget: sessionBudget
+            ),
+            client: client
+        )
+        return try DeepSeekDaemonJSON.decoder.decode(StoredSession.self, from: Data(response.output.utf8))
+    }
+
+    private func selectCreatedSession(_ session: StoredSession) {
+        selectedProjectID = session.projectID
+        selectedSessionID = session.id
+        reloadWorkspace()
+        refreshSelectedSession()
+        statusMessage = isScratchProject ? "已创建快速对话" : "已创建 Session"
     }
 
     /// Sends supported GUI tasks through the same `deepseekd` Supervisor as
@@ -1779,9 +1817,21 @@ public final class WorkspaceStore {
     public func approvePendingTerminalCommand(_ decision: ApprovalDecision = .allowOnce) {
         guard let pending = terminalPendingApproval else { return }
         terminalPendingApproval = nil
-        if let repository { try? repository.resolveApproval(id: pending.id, decision: decision) }
         guard decision == .allowOnce || decision == .allowSession else {
-            statusMessage = "已拒绝终端命令"
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let client = try await daemonClient()
+                    _ = try await sendDaemon(
+                        .approvalResolve,
+                        payload: DeepSeekDaemonApprovalPayload(sessionID: selectedSessionID, approvalID: pending.id, decision: decision),
+                        client: client
+                    )
+                    statusMessage = "已拒绝终端命令"
+                } catch {
+                    statusMessage = "拒绝终端命令失败：\(error.localizedDescription)"
+                }
+            }
             return
         }
         let command = pending.arguments
@@ -1792,7 +1842,20 @@ public final class WorkspaceStore {
             .data(using: .utf8)
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             .flatMap { $0["background"] as? Bool } ?? false
-        launchTerminal(command: command, background: background)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try await daemonClient()
+                _ = try await sendDaemon(
+                    .approvalResolve,
+                    payload: DeepSeekDaemonApprovalPayload(sessionID: selectedSessionID, approvalID: pending.id, decision: decision),
+                    client: client
+                )
+                launchTerminal(command: command, background: background)
+            } catch {
+                statusMessage = "终端审批恢复失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     public func sendTerminalInput(_ data: Data) {
@@ -1868,11 +1931,32 @@ public final class WorkspaceStore {
 
     private func requestTerminalApproval(command: String, risk: CommandRisk, background: Bool = false) {
         let arguments = "{\"command\":\(jsonString(command)),\"background\":\(background ? "true" : "false")}"
-        let approval = (try? repository?.createApproval(sessionID: selectedSessionID, tool: "terminal.exec", risk: risk, arguments: arguments)) ?? nil
-        terminalPendingApproval = approval
         statusMessage = "终端命令需要 L\(risk.rawValue) 审批"
-        if let approval {
-            try? repository?.append(sessionID: selectedSessionID, type: "approval_requested", payload: ["approvalID": approval.id, "tool": "terminal.exec", "risk": "L\(risk.rawValue)", "arguments": SecretRedactor.redact(arguments)])
+        let sessionID = selectedSessionID
+        let idempotencyKey = "gui-terminal-approval-\(sessionID)-\(UUID().uuidString)"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try await daemonClient()
+                let response = try await sendDaemon(
+                    .approvalRequest,
+                    payload: DeepSeekDaemonApprovalRequestPayload(
+                        sessionID: sessionID,
+                        tool: "terminal.exec",
+                        risk: risk,
+                        arguments: arguments,
+                        idempotencyKey: idempotencyKey
+                    ),
+                    client: client
+                )
+                terminalPendingApproval = try DeepSeekDaemonJSON.decoder.decode(
+                    ApprovalRecord.self,
+                    from: Data(response.output.utf8)
+                )
+            } catch {
+                terminalPendingApproval = nil
+                statusMessage = "终端审批请求失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -2772,13 +2856,6 @@ public final class WorkspaceStore {
         storageDirectory.appendingPathComponent("QuickChat", isDirectory: true).standardizedFileURL
     }
 
-    private func ensureScratchProject(repository: SessionRepository) throws -> ProjectRecord {
-        let scratchURL = scratchProjectURL
-        try FileManager.default.createDirectory(at: scratchURL, withIntermediateDirectories: true)
-        if let existing = try repository.project(path: scratchURL.path) { return existing }
-        return try repository.createProject(name: "快速对话", path: scratchURL.path)
-    }
-
     private func slug(_ value: String) -> String {
         let normalized = value.lowercased().replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return normalized.isEmpty ? "task" : String(normalized.prefix(48))
@@ -3087,7 +3164,10 @@ public final class WorkspaceStore {
                 timeoutMilliseconds: 30_000
             )
         }
-        let manager = DefaultMCPManager(registry: registry, manifests: manifests)
+        // The manager only discovers and registers pure MCP Hosts. Actual
+        // invocations enter NativeAgentHost's ToolExecutionPipeline through
+        // this shared router; no WorkspaceStore-side MCP execution exists.
+        let manager = DefaultMCPManager(registry: registry, manifests: manifests, router: router)
         for server in mcpServers where server.enabled {
             guard server.trusted else {
                 statusMessage = "MCP \(server.name) 等待项目/用户信任"
@@ -3112,7 +3192,6 @@ public final class WorkspaceStore {
                 statusMessage = "MCP \(server.name) 连接失败：\(error.localizedDescription)"
             }
         }
-        await manager.installRoutes(on: router)
     }
 
     private func terminalCapabilityManifest() -> HostCapabilityManifest {

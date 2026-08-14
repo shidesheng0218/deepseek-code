@@ -18,6 +18,7 @@ public enum DeepSeekDaemonMethod: String, Codable, CaseIterable, Sendable {
     case sessionPause = "session.pause"
     case sessionResume = "session.resume"
     case sessionCancel = "session.cancel"
+    case approvalRequest = "approval.request"
     case approvalResolve = "approval.resolve"
     case inputAdmit = "input.admit"
     case sessionRecover = "session.recover"
@@ -130,12 +131,32 @@ public struct DeepSeekDaemonCreateSessionPayload: Codable, Equatable, Sendable {
     public let projectName: String?
     public let title: String
     public let mode: AgentMode
+    public let target: SessionTarget
+    public let branch: String
+    public let worktreePath: String?
+    public let baselineRevision: String?
+    public let budget: SessionBudget
 
-    public init(projectPath: String, projectName: String? = nil, title: String, mode: AgentMode = .acceptEdits) {
+    public init(
+        projectPath: String,
+        projectName: String? = nil,
+        title: String,
+        mode: AgentMode = .acceptEdits,
+        target: SessionTarget = .local,
+        branch: String = "",
+        worktreePath: String? = nil,
+        baselineRevision: String? = nil,
+        budget: SessionBudget = SessionBudget()
+    ) {
         self.projectPath = projectPath
         self.projectName = projectName
         self.title = title
         self.mode = mode
+        self.target = target
+        self.branch = branch
+        self.worktreePath = worktreePath
+        self.baselineRevision = baselineRevision
+        self.budget = budget
     }
 }
 
@@ -172,6 +193,31 @@ public struct DeepSeekDaemonApprovalPayload: Codable, Equatable, Sendable {
         self.sessionID = sessionID
         self.approvalID = approvalID
         self.decision = decision
+    }
+}
+
+/// Generic, idempotent approval creation request. The client never writes an
+/// approval row; deepseekd forwards this to SessionSupervisor and returns the
+/// persisted record required for the UI's approval sheet.
+public struct DeepSeekDaemonApprovalRequestPayload: Codable, Equatable, Sendable {
+    public let sessionID: String
+    public let tool: String
+    public let risk: CommandRisk
+    public let arguments: String
+    public let idempotencyKey: String
+
+    public init(
+        sessionID: String,
+        tool: String,
+        risk: CommandRisk,
+        arguments: String,
+        idempotencyKey: String
+    ) {
+        self.sessionID = sessionID
+        self.tool = tool
+        self.risk = risk
+        self.arguments = arguments
+        self.idempotencyKey = idempotencyKey
     }
 }
 
@@ -420,7 +466,42 @@ public actor DeepSeekDaemonCommandRouter {
                         name: (projectName?.isEmpty == false ? projectName! : URL(fileURLWithPath: path).lastPathComponent),
                         path: path
                     )
-                let session = try repository.createSession(projectID: project.id, title: payload.title, mode: payload.mode)
+                let branch = payload.branch.isEmpty
+                    ? (payload.target == .local ? "main" : "deepseek/\(branchSlug(payload.title))")
+                    : payload.branch
+                let session = try repository.createSession(
+                    projectID: project.id,
+                    title: payload.title,
+                    mode: payload.mode,
+                    target: payload.target,
+                    branch: branch,
+                    worktreePath: payload.worktreePath,
+                    baselineRevision: payload.baselineRevision
+                )
+                let contract = TaskContract.compatibility(prompt: payload.title, budget: payload.budget)
+                try repository.saveTaskContract(contract, sessionID: session.id)
+                _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+                    aggregateID: session.id,
+                    commandID: "session-create-contract-\(session.id)",
+                    causationID: request.id,
+                    correlationID: request.id,
+                    kind: SessionEventKind(rawValue: "task_contract_created"),
+                    payload: [
+                        "goal": contract.goal,
+                        "requiredChanges": "\(contract.requiredChanges.count)",
+                        "requiredTests": "\(contract.requiredTests.count)"
+                    ]
+                ))
+                if payload.target == .worktree,
+                   let worktreePath = payload.worktreePath,
+                   let baselineRevision = payload.baselineRevision {
+                    try repository.saveWorktree(WorktreeRecord(
+                        sessionID: session.id,
+                        baseRevision: baselineRevision,
+                        branch: branch,
+                        worktreePath: worktreePath
+                    ))
+                }
                 return try response(request.id, session)
             case .sessionList:
                 let sessions = try repository.sessions().filter { !$0.archived }.map(DeepSeekDaemonSessionSummary.init(session:))
@@ -455,27 +536,30 @@ public actor DeepSeekDaemonCommandRouter {
                 let payload = try decode(DeepSeekDaemonSessionPayload.self, from: request.payload)
                 try await harness.cancelSession(payload.sessionID)
                 return DeepSeekDaemonResponse(id: request.id, ok: true, output: "{}")
+            case .approvalRequest:
+                let payload = try decode(DeepSeekDaemonApprovalRequestPayload.self, from: request.payload)
+                let approval = try await supervisor.requestApproval(
+                    sessionID: payload.sessionID,
+                    tool: payload.tool,
+                    risk: payload.risk,
+                    arguments: payload.arguments,
+                    commandID: "daemon-approval-request-\(payload.idempotencyKey)"
+                )
+                return try response(request.id, approval)
             case .approvalResolve:
                 let payload = try decode(DeepSeekDaemonApprovalPayload.self, from: request.payload)
                 if try isDirectTerminalApproval(approvalID: payload.approvalID, sessionID: payload.sessionID) {
                     guard payload.decision != .pending else { throw DeepSeekDaemonTerminalError.approvalInvalid }
-                    try repository.resolveApproval(id: payload.approvalID, decision: payload.decision)
-                    _ = try repository.appendDurable(
+                    // Direct Terminal approvals still use the same Supervisor
+                    // CAS and continuation boundary as Agent approvals. The
+                    // Router only identifies the direct-terminal contract;
+                    // it never changes approval state or appends a parallel
+                    // resolution event.
+                    try await supervisor.resolveApproval(
                         sessionID: payload.sessionID,
-                        type: "approval_resolved",
-                        payload: ["approvalID": payload.approvalID, "decision": payload.decision.rawValue, "approvedBy": "user"],
-                        commandID: "terminal-direct-approval-\(payload.approvalID)-\(payload.decision.rawValue)",
-                        causationID: payload.approvalID
+                        approvalID: payload.approvalID,
+                        decision: payload.decision
                     )
-                    if payload.decision == .allowOnce || payload.decision == .allowSession {
-                        _ = try repository.appendDurable(
-                            sessionID: payload.sessionID,
-                            type: "terminal_approved",
-                            payload: ["approvalID": payload.approvalID, "approvedBy": "user"],
-                            commandID: "terminal-direct-approved-\(payload.approvalID)",
-                            causationID: payload.approvalID
-                        )
-                    }
                 } else {
                     try await harness.resolveApproval(sessionID: payload.sessionID, approvalID: payload.approvalID, decision: payload.decision)
                 }
@@ -525,9 +609,14 @@ public actor DeepSeekDaemonCommandRouter {
                 let payload = try decode(DeepSeekDaemonWorkerPayload.self, from: request.payload)
                 return try response(request.id, try await workerRuntime.collect(workerSessionID: payload.workerSessionID))
             case .workerAdopt:
-                guard let workerRuntime else { throw ChildAgentRuntimeError.failed("Worker Runtime 不可用") }
                 let payload = try decode(DeepSeekDaemonWorkerPayload.self, from: request.payload)
-                try await workerRuntime.adopt(workerSessionID: payload.workerSessionID)
+                guard let worker = try repository.workerSession(id: payload.workerSessionID) else {
+                    throw ChildAgentRuntimeError.notFound
+                }
+                try await supervisor.adoptWorkerResult(
+                    sessionID: worker.parentSessionID,
+                    workerSessionID: payload.workerSessionID
+                )
                 return DeepSeekDaemonResponse(id: request.id, ok: true, output: "{}")
             case .terminalOpen:
                 let payload = try decode(DeepSeekDaemonTerminalOpenPayload.self, from: request.payload)
@@ -541,12 +630,35 @@ public actor DeepSeekDaemonCommandRouter {
                     "rows": payload.rows,
                     "background": payload.background
                 ])
-                return DeepSeekDaemonResponse(id: request.id, ok: true, output: try await host.execute(tool: tool, argumentsJSON: arguments, sessionID: session.id))
+                let registry = ToolRegistry([tool])
+                let router = ToolHostRouter(registry: registry)
+                router.register(host: host, for: tool.name)
+                let callID = UUID().uuidString
+                let result = try await ToolExecutionPipeline(repository: repository, router: router).execute(
+                    ToolInvocationContext(
+                        sessionID: session.id,
+                        commandID: "terminal-open-\(session.id)-\(callID)",
+                        callID: callID,
+                        tool: tool,
+                        argumentsJSON: arguments,
+                        projectID: session.projectID
+                    )
+                )
+                return DeepSeekDaemonResponse(id: request.id, ok: true, output: result.output)
             case .terminalExec:
                 let payload = try decode(DeepSeekDaemonTerminalExecPayload.self, from: request.payload)
                 let session = try terminalSession(payload.sessionID)
                 let risk = CommandPolicy.classify(payload.command)
                 guard risk != .l4 else { throw DeepSeekDaemonTerminalError.permanentlyBlocked }
+                let tool = try terminalTool(named: "terminal.exec", risk: risk)
+                let arguments = try terminalJSON([
+                    "command": payload.command,
+                    "cwd": resolvedTerminalCWD(session: session, requested: payload.cwd),
+                    "columns": payload.columns,
+                    "rows": payload.rows,
+                    "background": payload.background,
+                    "timeoutMs": payload.timeoutMilliseconds
+                ])
                 let approvedDirectCommand = try directTerminalApprovalAllows(payload, risk: risk)
                 if risk >= .l2, !approvedDirectCommand {
                     let hash = commandHash(payload.command)
@@ -561,20 +673,26 @@ public actor DeepSeekDaemonCommandRouter {
                             "background": payload.background
                         ])
                     )
-                    _ = try repository.appendDurable(
+                    let router = ToolHostRouter(registry: ToolRegistry([tool]))
+                    let pipeline = ToolExecutionPipeline(repository: repository, router: router)
+                    let context = ToolInvocationContext(
                         sessionID: session.id,
-                        type: "terminal_requested",
-                        payload: ["approvalID": approval.id, "risk": "L\(risk.rawValue)", "commandHash": hash],
+                        commandID: "terminal-direct-\(session.id)-\(approval.id)",
+                        callID: approval.id,
+                        tool: tool,
+                        argumentsJSON: arguments,
+                        projectID: session.projectID
+                    )
+                    try pipeline.begin(context)
+                    try pipeline.recordApprovalRequested(context, approvalID: approval.id)
+                    _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+                        aggregateID: session.id,
                         commandID: "terminal-direct-request-\(approval.id)",
-                        causationID: approval.id
-                    )
-                    _ = try repository.appendDurable(
-                        sessionID: session.id,
-                        type: "approval_requested",
-                        payload: ["approvalID": approval.id, "tool": "terminal.exec", "risk": "L\(risk.rawValue)", "arguments": SecretRedactor.redact(approval.arguments)],
-                        commandID: "terminal-direct-approval-request-\(approval.id)",
-                        causationID: approval.id
-                    )
+                        causationID: approval.id,
+                        correlationID: context.traceID,
+                        kind: SessionEventKind(rawValue: "terminal_requested"),
+                        payload: ["approvalID": approval.id, "risk": "L\(risk.rawValue)", "commandHash": hash]
+                    ))
                     return try response(
                         request.id,
                         DeepSeekDaemonTerminalApprovalRequired(
@@ -587,22 +705,20 @@ public actor DeepSeekDaemonCommandRouter {
                     )
                 }
                 let host = try terminalToolHost(for: session, cwd: payload.cwd)
-                let tool = try terminalTool(named: "terminal.exec", risk: risk)
-                let arguments = try terminalJSON([
-                    "command": payload.command,
-                    "cwd": resolvedTerminalCWD(session: session, requested: payload.cwd),
-                    "columns": payload.columns,
-                    "rows": payload.rows,
-                    "background": payload.background,
-                    "timeoutMs": payload.timeoutMilliseconds
-                ])
-                _ = try repository.appendDurable(
+                let registry = ToolRegistry([tool])
+                let router = ToolHostRouter(registry: registry)
+                router.register(host: host, for: tool.name)
+                let callID = payload.approvalID ?? UUID().uuidString
+                let context = ToolInvocationContext(
                     sessionID: session.id,
-                    type: "terminal_requested",
-                    payload: ["risk": "L\(risk.rawValue)", "commandHash": commandHash(payload.command)],
-                    commandID: "terminal-direct-exec-\(UUID().uuidString)"
+                    commandID: "terminal-direct-\(session.id)-\(callID)",
+                    callID: callID,
+                    tool: tool,
+                    argumentsJSON: arguments,
+                    projectID: session.projectID
                 )
-                return DeepSeekDaemonResponse(id: request.id, ok: true, output: try await host.execute(tool: tool, argumentsJSON: arguments, sessionID: session.id))
+                let result = try await ToolExecutionPipeline(repository: repository, router: router).execute(context)
+                return DeepSeekDaemonResponse(id: request.id, ok: true, output: result.output)
             case .terminalList:
                 let payload = try decode(DeepSeekDaemonSessionPayload.self, from: request.payload)
                 _ = try terminalSession(payload.sessionID)
@@ -761,6 +877,14 @@ public actor DeepSeekDaemonCommandRouter {
 
     private func commandHash(_ command: String) -> String {
         SHA256.hash(data: Data(command.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func branchSlug(_ title: String) -> String {
+        let normalized = title.lowercased().unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let compact = String(normalized).split(separator: "-", omittingEmptySubsequences: true).joined(separator: "-")
+        return compact.isEmpty ? "session" : String(compact.prefix(48))
     }
 
     private func terminalJSON(_ value: [String: Any]) throws -> String {

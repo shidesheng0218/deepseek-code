@@ -34,6 +34,35 @@ struct DeepSeekCodeDaemonChecks {
         ))
         let createdSession = try decode(StoredSession.self, from: created.output)
         precondition(created.ok)
+        // Session creation is a daemon Runtime command, not a GUI-side
+        // sequence of repository mutations. The create receipt must include
+        // the requested execution binding and its initial task contract.
+        let boundProjectPath = root.appendingPathComponent("bound-project", isDirectory: true)
+        let boundWorktreePath = root.appendingPathComponent("bound-worktree", isDirectory: true)
+        let boundCreate = await router.handle(DeepSeekDaemonRequest(
+            method: .sessionCreate,
+            payload: try encode(DeepSeekDaemonCreateSessionPayload(
+                projectPath: boundProjectPath.path,
+                title: "Bound daemon session",
+                mode: .acceptEdits,
+                target: .worktree,
+                branch: "deepseek/daemon-bound",
+                worktreePath: boundWorktreePath.path,
+                baselineRevision: "fixture-baseline",
+                budget: SessionBudget(maxToolTurns: 7)
+            ))
+        ))
+        let boundSession = try decode(StoredSession.self, from: boundCreate.output)
+        precondition(boundCreate.ok)
+        precondition(boundSession.target == .worktree)
+        precondition(boundSession.branch == "deepseek/daemon-bound")
+        precondition(boundSession.worktreePath == boundWorktreePath.path)
+        let boundContract = try repository.taskContract(sessionID: boundSession.id)
+        let boundWorktree = try repository.worktree(sessionID: boundSession.id)
+        let boundEvents = try repository.events(sessionID: boundSession.id)
+        precondition(boundContract?.goal == "Bound daemon session")
+        precondition(boundWorktree?.baseRevision == "fixture-baseline")
+        precondition(boundEvents.contains { $0.type == "task_contract_created" })
         _ = try repository.appendDurable(sessionID: createdSession.id, type: "assistant_text", payload: ["text": "event stream"])
         let eventResponse = await router.handle(DeepSeekDaemonRequest(
             method: .sessionEvents,
@@ -55,6 +84,33 @@ struct DeepSeekCodeDaemonChecks {
         let firstReceipt = try decode(AdmissionReceipt.self, from: admitted.output)
         let secondReceipt = try decode(AdmissionReceipt.self, from: admittedAgain.output)
         precondition(firstReceipt.inputID == secondReceipt.inputID)
+
+        // Approval creation is also a daemon → Supervisor command. Retrying
+        // the same request returns the original approval rather than adding a
+        // second pending record from a reconnecting GUI/CLI client.
+        let approvalRequest = DeepSeekDaemonApprovalRequestPayload(
+            sessionID: session.id,
+            tool: "terminal.exec",
+            risk: .l2,
+            arguments: "{\"command\":\"curl --version\"}",
+            idempotencyKey: "daemon-approval-request-1"
+        )
+        let firstApprovalRequest = await router.handle(DeepSeekDaemonRequest(
+            method: .approvalRequest,
+            payload: try encode(approvalRequest)
+        ))
+        let repeatedApprovalRequest = await router.handle(DeepSeekDaemonRequest(
+            method: .approvalRequest,
+            payload: try encode(approvalRequest)
+        ))
+        precondition(firstApprovalRequest.ok && repeatedApprovalRequest.ok)
+        let firstApproval = try decode(ApprovalRecord.self, from: firstApprovalRequest.output)
+        let repeatedApproval = try decode(ApprovalRecord.self, from: repeatedApprovalRequest.output)
+        precondition(firstApproval.id == repeatedApproval.id)
+        let approvalRequestEvents = try repository.events(sessionID: session.id).filter {
+            $0.type == "approval_requested" && $0.payload["approvalID"] == firstApproval.id
+        }
+        precondition(approvalRequestEvents.count == 1)
 
         let sessionPayload = DeepSeekDaemonSessionPayload(sessionID: session.id)
         let encodedSessionPayload = try encode(sessionPayload)
@@ -81,6 +137,12 @@ struct DeepSeekCodeDaemonChecks {
         let executionSupervisor = SessionSupervisor(repository: repository, executionDriver: driver, instanceID: "daemon-execution-check")
         _ = try await executionSupervisor.admit(SessionInput(
             sessionID: executionSession.id,
+            idempotencyKey: "execute-context-only",
+            delivery: .contextOnly,
+            parts: [.text("补充约束：保留对外 API")]
+        ))
+        _ = try await executionSupervisor.admit(SessionInput(
+            sessionID: executionSession.id,
             idempotencyKey: "execute-once",
             delivery: .immediate,
             parts: [.text("通过 daemon 执行")]
@@ -90,8 +152,10 @@ struct DeepSeekCodeDaemonChecks {
         try await executionSupervisor.start(sessionID: executionSession.id)
         try await driver.waitForIdle(sessionID: executionSession.id)
         let startedSessionIDs = await runner.startedSessionIDs()
+        let executedParts = await runner.executedParts()
         let executionInputState = try repository.sessionInputs(sessionID: executionSession.id).last?.state
         precondition(startedSessionIDs == [executionSession.id])
+        precondition(executedParts == ["补充约束：保留对外 API", "通过 daemon 执行"])
         precondition(executionInputState == .consumed)
 
         let providerCatalog = try ProviderCatalog(directory: root.appendingPathComponent("Providers", isDirectory: true))
@@ -182,6 +246,21 @@ struct DeepSeekCodeDaemonChecks {
             terminalHost: terminalHost,
             instanceID: "daemon-direct-terminal-router"
         )
+        // `terminal.open` is a tool invocation as well. It may not bypass the
+        // durable request/evidence/completion lifecycle merely because it
+        // creates a new PTY instead of executing in an existing one.
+        let openTerminal = await terminalRouter.handle(DeepSeekDaemonRequest(
+            method: .terminalOpen,
+            payload: try encode(DeepSeekDaemonTerminalOpenPayload(
+                sessionID: terminalSession.id,
+                command: "printf daemon-terminal-open-ok"
+            ))
+        ))
+        precondition(openTerminal.ok)
+        let terminalSessionEvents = try repository.events(sessionID: terminalSession.id)
+        let openCallID = terminalSessionEvents.last { $0.payload["tool"] == "terminal.open" }?.payload["callID"]
+        let openTerminalEvents = terminalSessionEvents.filter { $0.payload["callID"] == openCallID }
+        precondition(openTerminalEvents.map(\.type).suffix(4) == ["tool_requested", "tool_started", "evidence_recorded", "tool_completed"])
         let approvalResponse = await terminalRouter.handle(DeepSeekDaemonRequest(
             method: .terminalExec,
             payload: try encode(DeepSeekDaemonTerminalExecPayload(sessionID: terminalSession.id, command: "curl --version", timeoutMilliseconds: 5_000))
@@ -198,6 +277,19 @@ struct DeepSeekCodeDaemonChecks {
             payload: try encode(DeepSeekDaemonTerminalExecPayload(sessionID: terminalSession.id, command: "curl --version", timeoutMilliseconds: 5_000, approvalID: approval.approvalID))
         ))
         precondition(firstApproved.ok)
+        let directTerminalPipeline = try repository.eventEnvelopes(sessionID: terminalSession.id).filter {
+            $0.payload["callID"] == approval.approvalID
+        }
+        let directTerminalKinds = directTerminalPipeline.map(\.kind)
+        precondition(directTerminalKinds.contains(.toolRequested))
+        precondition(directTerminalKinds.contains(.approvalRequested))
+        precondition(directTerminalKinds.contains(.toolStarted))
+        precondition(directTerminalKinds.contains(.evidenceRecorded))
+        precondition(directTerminalKinds.contains(.toolCompleted))
+        precondition(directTerminalKinds.firstIndex(of: .toolRequested)! < directTerminalKinds.firstIndex(of: .approvalRequested)!)
+        precondition(directTerminalKinds.firstIndex(of: .approvalRequested)! < directTerminalKinds.firstIndex(of: .toolStarted)!)
+        precondition(directTerminalKinds.firstIndex(of: .toolStarted)! < directTerminalKinds.firstIndex(of: .evidenceRecorded)!)
+        precondition(directTerminalKinds.firstIndex(of: .evidenceRecorded)! < directTerminalKinds.firstIndex(of: .toolCompleted)!)
         let repeatedApproved = await terminalRouter.handle(DeepSeekDaemonRequest(
             method: .terminalExec,
             payload: try encode(DeepSeekDaemonTerminalExecPayload(sessionID: terminalSession.id, command: "curl --version", timeoutMilliseconds: 5_000, approvalID: approval.approvalID))
@@ -231,6 +323,11 @@ struct DeepSeekCodeDaemonChecks {
         precondition(workerAdopt.ok)
         let adoptedWorker = try repository.workerSession(id: workerRecord.id)
         precondition(adoptedWorker?.state == .completed)
+        let workerAdoptionEvents = try repository.events(sessionID: session.id)
+        precondition(workerAdoptionEvents.contains {
+            $0.type == "worker_result_adopted" &&
+            $0.payload["workerSessionID"] == workerRecord.id
+        })
         print("DeepSeek daemon checks passed")
     }
 
@@ -249,14 +346,17 @@ struct DeepSeekCodeDaemonChecks {
 
 private actor DaemonRunnerProbe: DaemonSessionRunner {
     private var started: [String] = []
+    private var parts: [[String]] = []
 
     func run(session: StoredSession, input: SessionInputRecord, control: AgentRunControl) async throws {
         started.append(session.id)
+        parts.append(input.parts.plainText.components(separatedBy: "\n\n"))
     }
 
     func resume(session: StoredSession, approvalID: String, decision: ApprovalDecision, control: AgentRunControl) async throws {}
 
     func startedSessionIDs() -> [String] { started }
+    func executedParts() -> [String] { parts.first ?? [] }
 }
 
 private struct DaemonWorkerProbe: ChildAgentExecutionDriver {

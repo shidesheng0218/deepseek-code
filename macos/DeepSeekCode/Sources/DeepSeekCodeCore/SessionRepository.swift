@@ -245,6 +245,17 @@ public final class SessionRepository: @unchecked Sendable {
                     created_at REAL NOT NULL,
                     resolved_at REAL
                 );
+                CREATE TABLE IF NOT EXISTS permission_leases (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    effect TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL,
+                    UNIQUE(project_id, session_id, effect, tool_name)
+                );
                 CREATE TABLE IF NOT EXISTS agent_runs (
                     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                     state TEXT NOT NULL,
@@ -1077,6 +1088,43 @@ public final class SessionRepository: @unchecked Sendable {
         }
     }
 
+    public func eventEnvelope(commandID: String) throws -> SessionEventEnvelope? {
+        try withLock {
+            try query(
+                "SELECT aggregate_id, sequence, event_id, command_id, causation_id, correlation_id, type, payload, timestamp, schema_version FROM session_event_log WHERE command_id = ? LIMIT 1;",
+                values: [commandID],
+                map: decodeEventEnvelope
+            ).first
+        }
+    }
+
+    public func eventEnvelopes(sessionID: String, afterSequence sequence: Int = 0) throws -> [SessionEventEnvelope] {
+        try withLock {
+            try query(
+                "SELECT aggregate_id, sequence, event_id, command_id, causation_id, correlation_id, type, payload, timestamp, schema_version FROM session_event_log WHERE aggregate_id = ? AND sequence > ? ORDER BY sequence ASC;",
+                values: [sessionID, sequence],
+                map: decodeEventEnvelope
+            )
+        }
+    }
+
+    private func decodeEventEnvelope(_ statement: SQLiteStatement) -> SessionEventEnvelope {
+        let payloadData = Data(statement.string(7).utf8)
+        let payload = (try? decoder.decode([String: String].self, from: payloadData)) ?? [:]
+        return SessionEventEnvelope(
+            eventID: UUID(uuidString: statement.string(2)) ?? UUID(),
+            aggregateID: statement.string(0),
+            sequence: statement.int(1),
+            commandID: statement.string(3),
+            causationID: statement.isNull(4) ? nil : statement.string(4),
+            correlationID: statement.isNull(5) ? nil : statement.string(5),
+            kind: SessionEventKind(rawValue: statement.string(6)),
+            payload: payload,
+            timestamp: Date(timeIntervalSince1970: statement.double(8)),
+            schemaVersion: statement.int(9)
+        )
+    }
+
     public func eventCount(sessionID: String) throws -> Int {
         try withLock {
             let values = try query("SELECT COUNT(*) FROM session_event_log WHERE aggregate_id = ?;", values: [sessionID]) { $0.int(0) }
@@ -1141,8 +1189,8 @@ public final class SessionRepository: @unchecked Sendable {
     public func promoteNextSessionInput(sessionID: String) throws -> SessionInputRecord? {
         let promoted: SessionInputRecord? = try withLock {
             let rows = try query(
-                "SELECT payload FROM session_input_inbox WHERE session_id = ? AND state = ? ORDER BY admitted_sequence ASC LIMIT 1;",
-                values: [sessionID, SessionInputState.accepted.rawValue]
+                "SELECT payload FROM session_input_inbox WHERE session_id = ? AND state = ? AND delivery <> ? ORDER BY admitted_sequence ASC LIMIT 1;",
+                values: [sessionID, SessionInputState.accepted.rawValue, SessionInputDelivery.contextOnly.rawValue]
             ) { $0.string(0) }
             guard let encoded = rows.first,
                   var record = try? decoder.decode(SessionInputRecord.self, from: Data(encoded.utf8)) else { return nil }
@@ -1167,6 +1215,53 @@ public final class SessionRepository: @unchecked Sendable {
         _ = try? refreshProjection(sessionID: sessionID)
         _ = try? refreshPartProjection(sessionID: sessionID)
         return promoted
+    }
+
+    /// Atomically claims one primary message and every accepted context-only
+    /// message for the same safe boundary. The log records each promotion so
+    /// an App/daemon restart can resume from the exact admitted state.
+    public func promoteSessionInputBoundary(sessionID: String) throws -> SessionInputBoundary? {
+        let boundary: SessionInputBoundary? = try withLock {
+            let rows = try query(
+                "SELECT payload FROM session_input_inbox WHERE session_id = ? AND state = ? ORDER BY admitted_sequence ASC;",
+                values: [sessionID, SessionInputState.accepted.rawValue]
+            ) { $0.string(0) }
+            let accepted = rows.compactMap { try? decoder.decode(SessionInputRecord.self, from: Data($0.utf8)) }
+            guard let primaryIndex = accepted.firstIndex(where: { $0.delivery != .contextOnly }) else { return nil }
+            var primary = accepted[primaryIndex]
+            let context = accepted.filter { $0.delivery == .contextOnly }
+            let records = [primary] + context
+            var promotedByID: [String: SessionInputRecord] = [:]
+            for var record in records {
+                record.state = .promoted
+                record.updatedAt = Date()
+                let payload = String(decoding: try encoder.encode(record), as: UTF8.self)
+                try execute(
+                    "UPDATE session_input_inbox SET state = ?, payload = ?, updated_at = ? WHERE id = ? AND state = ?;",
+                    values: [record.state.rawValue, payload, record.updatedAt.timeIntervalSince1970, record.id, SessionInputState.accepted.rawValue]
+                )
+                guard sqlite3_changes(database) == 1 else { continue }
+                _ = try appendDurableUnlocked(
+                    sessionID: sessionID,
+                    type: "session_input_promoted",
+                    payload: ["inputID": record.id, "delivery": record.delivery.rawValue],
+                    commandID: "promote-input-\(record.id)",
+                    causationID: record.id,
+                    correlationID: primary.id,
+                    schemaVersion: SessionEventEnvelope.currentSchemaVersion
+                )
+                promotedByID[record.id] = record
+            }
+            guard let promotedPrimary = promotedByID[primary.id] else { return nil }
+            primary = promotedPrimary
+            return SessionInputBoundary(
+                primary: primary,
+                context: context.compactMap { promotedByID[$0.id] }
+            )
+        }
+        _ = try? refreshProjection(sessionID: sessionID)
+        _ = try? refreshPartProjection(sessionID: sessionID)
+        return boundary
     }
 
     public func markSessionInputConsumed(id: String) throws {
@@ -1413,6 +1508,35 @@ public final class SessionRepository: @unchecked Sendable {
                 values: [decision.rawValue, Date().timeIntervalSince1970, id, ApprovalDecision.pending.rawValue]
             )
             return sqlite3_changes(database) == 1
+        }
+    }
+
+    public func savePermissionLease(_ lease: PermissionLease) throws {
+        try withLock {
+            let payload = String(decoding: try encoder.encode(lease), as: UTF8.self)
+            try execute(
+                "INSERT INTO permission_leases (id, project_id, session_id, effect, tool_name, payload, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, session_id, effect, tool_name) DO UPDATE SET id = excluded.id, payload = excluded.payload, expires_at = excluded.expires_at, revoked_at = excluded.revoked_at;",
+                values: [
+                    lease.id,
+                    lease.key.projectID ?? "",
+                    lease.key.sessionID ?? "",
+                    lease.key.effect.rawValue,
+                    lease.key.toolName,
+                    payload,
+                    lease.expiresAt.timeIntervalSince1970,
+                    lease.revokedAt?.timeIntervalSince1970 as Any
+                ]
+            )
+        }
+    }
+
+    public func permissionLease(key: PermissionLeaseKey) throws -> PermissionLease? {
+        try withLock {
+            let rows = try query(
+                "SELECT payload FROM permission_leases WHERE project_id = ? AND session_id = ? AND effect = ? AND tool_name = ? LIMIT 1;",
+                values: [key.projectID ?? "", key.sessionID ?? "", key.effect.rawValue, key.toolName]
+            ) { $0.string(0) }
+            return rows.first.flatMap { try? decoder.decode(PermissionLease.self, from: Data($0.utf8)) }
         }
     }
 

@@ -68,7 +68,9 @@ public protocol DurableSessionSupervisor: Sendable {
     func start(sessionID: String) async throws
     func pause(sessionID: String) async throws
     func resume(sessionID: String) async throws
+    func requestApproval(sessionID: String, tool: String, risk: CommandRisk, arguments: String, commandID: String) async throws -> ApprovalRecord
     func resolveApproval(sessionID: String, approvalID: String, decision: ApprovalDecision) async throws
+    func adoptWorkerResult(sessionID: String, workerSessionID: String) async throws
     func cancel(sessionID: String) async throws
     func recover(sessionID: String) async throws -> RecoveryResult
     func evaluateDelivery(sessionID: String) async throws -> DeliveryGateResult
@@ -81,6 +83,10 @@ public enum HarnessSupervisorError: LocalizedError, Sendable {
     case approvalSessionMismatch
     case approvalAlreadyResolved
     case missingTaskContract
+    case workerSessionMismatch
+    case workerResultUnavailable
+    case commandExpired
+    case inputNotPromotable
 
     public var errorDescription: String? {
         switch self {
@@ -90,6 +96,10 @@ public enum HarnessSupervisorError: LocalizedError, Sendable {
         case .approvalSessionMismatch: "审批不属于当前 Session"
         case .approvalAlreadyResolved: "该审批已经处理过"
         case .missingTaskContract: "当前 Session 没有任务合同"
+        case .workerSessionMismatch: "Worker 不属于当前 Session"
+        case .workerResultUnavailable: "Worker 尚未产生可采纳结果"
+        case .commandExpired: "命令已过期，未执行"
+        case .inputNotPromotable: "输入尚未到达可提升的安全边界"
         }
     }
 }

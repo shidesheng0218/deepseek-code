@@ -20,6 +20,66 @@ public actor SessionSupervisor: DurableSessionSupervisor {
         executionDrivers[sessionID] = driver
     }
 
+    public func execute(_ command: SessionCommandEnvelope) async throws -> CommandReceipt {
+        guard command.deadline > Date() else { throw HarnessSupervisorError.commandExpired }
+        let sessionID = commandSessionID(command.body)
+        let receiptCommandID = "session-command-\(command.commandID)"
+        if let existing = try repository.eventEnvelope(commandID: receiptCommandID) {
+            return CommandReceipt(
+                commandID: command.commandID,
+                sessionID: existing.payload["sessionID"] ?? sessionID,
+                acceptedSequence: Int(existing.payload["acceptedSequence"] ?? "\(existing.sequence)") ?? existing.sequence,
+                state: CommandState(rawValue: existing.payload["state"] ?? "") ?? .completed
+            )
+        }
+
+        let acceptedSequence: Int
+        switch command.body {
+        case let .admit(input):
+            acceptedSequence = try admit(input).admittedSequence
+        case .start:
+            try await start(sessionID: sessionID)
+            acceptedSequence = try repository.eventCount(sessionID: sessionID)
+        case let .steer(_, inputID):
+            guard let promoted = try repository.promoteNextSessionInput(sessionID: sessionID), promoted.id == inputID else {
+                throw HarnessSupervisorError.inputNotPromotable
+            }
+            acceptedSequence = promoted.admittedSequence
+        case .pause:
+            try await pause(sessionID: sessionID)
+            acceptedSequence = try repository.eventCount(sessionID: sessionID)
+        case .resume:
+            try await resume(sessionID: sessionID)
+            acceptedSequence = try repository.eventCount(sessionID: sessionID)
+        case .cancel:
+            try await cancel(sessionID: sessionID)
+            acceptedSequence = try repository.eventCount(sessionID: sessionID)
+        case let .resolveApproval(_, approvalID, decision):
+            try await resolveApproval(sessionID: sessionID, approvalID: approvalID, decision: decision)
+            acceptedSequence = try repository.eventCount(sessionID: sessionID)
+        case let .adoptWorkerResult(_, workerSessionID):
+            try adoptWorkerResult(sessionID: sessionID, workerSessionID: workerSessionID)
+            acceptedSequence = try repository.eventCount(sessionID: sessionID)
+        case .evaluateDelivery:
+            _ = try evaluateDelivery(sessionID: sessionID)
+            acceptedSequence = try repository.eventCount(sessionID: sessionID)
+        }
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: sessionID,
+            commandID: receiptCommandID,
+            causationID: command.commandID,
+            correlationID: command.commandID,
+            kind: SessionEventKind(rawValue: "session_command_completed"),
+            payload: [
+                "sessionID": sessionID,
+                "acceptedSequence": "\(acceptedSequence)",
+                "state": CommandState.completed.rawValue,
+                "issuedBy": command.issuedBy.rawValue
+            ]
+        ))
+        return CommandReceipt(commandID: command.commandID, sessionID: sessionID, acceptedSequence: acceptedSequence, state: .completed)
+    }
+
     public func admit(_ input: SessionInput) throws -> AdmissionReceipt {
         guard try repository.session(id: input.sessionID) != nil else {
             throw HarnessSupervisorError.sessionNotFound
@@ -100,6 +160,48 @@ public actor SessionSupervisor: DurableSessionSupervisor {
         _ = try repository.appendDurable(sessionID: sessionID, type: "harness_resumed", payload: [:], commandID: "harness-resume-\(sessionID)")
     }
 
+    /// Creates the durable approval record and its event as one Supervisor-
+    /// owned transition. UI/CLI callers submit the decision later; they do
+    /// not insert approval rows or synthesize audit events themselves.
+    public func requestApproval(
+        sessionID: String,
+        tool: String,
+        risk: CommandRisk,
+        arguments: String,
+        commandID: String = UUID().uuidString
+    ) throws -> ApprovalRecord {
+        try ensureSession(sessionID)
+        let eventCommandID = "supervisor-approval-request-\(commandID)"
+        if let existing = try repository.eventEnvelope(commandID: eventCommandID),
+           let approvalID = existing.payload["approvalID"],
+           let approval = try repository.approval(id: approvalID) {
+            return approval
+        }
+        let approval = try repository.createApproval(
+            sessionID: sessionID,
+            tool: tool,
+            risk: risk,
+            // The continuation needs the original JSON to validate and
+            // resume exactly one tool call. It is never copied into the
+            // event payload; only its stable hash is audited below.
+            arguments: arguments
+        )
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: sessionID,
+            commandID: eventCommandID,
+            causationID: approval.id,
+            correlationID: approval.id,
+            kind: .approvalRequested,
+            payload: [
+                "approvalID": approval.id,
+                "tool": tool,
+                "risk": "L\(risk.rawValue)",
+                "argumentsHash": ApprovalContinuation.hash(arguments)
+            ]
+        ))
+        return approval
+    }
+
     public func resolveApproval(sessionID: String, approvalID: String, decision: ApprovalDecision) async throws {
         print("→ [SUPERVISOR] resolveApproval called: sessionID=\(sessionID), approvalID=\(approvalID), decision=\(decision)")
 
@@ -142,6 +244,34 @@ public actor SessionSupervisor: DurableSessionSupervisor {
         } else {
             print("→ [SUPERVISOR] Approval already resolved by driver, skipping database update")
         }
+    }
+
+    public func adoptWorkerResult(sessionID: String, workerSessionID: String) throws {
+        try ensureSession(sessionID)
+        guard let worker = try repository.workerSession(id: workerSessionID) else {
+            throw HarnessSupervisorError.workerResultUnavailable
+        }
+        guard worker.parentSessionID == sessionID else {
+            throw HarnessSupervisorError.workerSessionMismatch
+        }
+        if worker.state == .completed { return }
+        guard worker.state == .awaitingAdoption, let result = worker.result else {
+            throw HarnessSupervisorError.workerResultUnavailable
+        }
+        _ = try WorkerSessionCoordinator(repository: repository).adopt(id: workerSessionID, result: result)
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: sessionID,
+            commandID: "supervisor-worker-adopt-\(sessionID)-\(workerSessionID)",
+            causationID: workerSessionID,
+            correlationID: sessionID,
+            kind: SessionEventKind(rawValue: "worker_result_adopted"),
+            payload: [
+                "workerSessionID": workerSessionID,
+                "workerID": worker.workerID,
+                "evidenceIDs": result.evidenceIDs.joined(separator: ","),
+                "outputHash": result.outputHash
+            ]
+        ))
     }
 
     public func cancel(sessionID: String) async throws {
@@ -194,6 +324,14 @@ public actor SessionSupervisor: DurableSessionSupervisor {
 
     private func ensureSession(_ sessionID: String) throws {
         guard try repository.session(id: sessionID) != nil else { throw HarnessSupervisorError.sessionNotFound }
+    }
+
+    private func commandSessionID(_ body: SessionCommandBody) -> String {
+        switch body {
+        case let .admit(input): input.sessionID
+        case let .start(sessionID), let .pause(sessionID), let .resume(sessionID), let .cancel(sessionID), let .evaluateDelivery(sessionID): sessionID
+        case let .steer(sessionID, _), let .resolveApproval(sessionID, _, _), let .adoptWorkerResult(sessionID, _): sessionID
+        }
     }
 
     private func driver(for sessionID: String) -> (any SessionExecutionDriver)? {

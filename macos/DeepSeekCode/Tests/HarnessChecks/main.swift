@@ -77,6 +77,25 @@ struct DeepSeekCodeHarnessChecks {
         precondition(received.contains(.toolCompleted(name: "web_search", succeeded: true)))
         let audit = try repository.events(sessionID: session.id)
         precondition(audit.contains { $0.type == "web_research_auto_grant_created" })
+        let runtime3Audit = try repository.eventEnvelopes(sessionID: session.id)
+        precondition(runtime3Audit.filter { $0.kind == .turnStarted }.count == 1)
+        precondition(runtime3Audit.filter { $0.kind == .stepStarted }.count == 2)
+        precondition(runtime3Audit.filter { $0.kind == .modelRequestStarted }.count == 2)
+        precondition(runtime3Audit.filter { $0.kind == .assistantMessageCommitted }.count == 2)
+        precondition(runtime3Audit.filter { $0.kind == .stepEnded }.count == 2)
+        precondition(runtime3Audit.filter { $0.kind == .turnEnded }.count == 1)
+        let turnCorrelationIDs = Set(runtime3Audit.compactMap { event -> String? in
+            guard [
+                SessionEventKind.turnStarted,
+                .stepStarted,
+                .modelRequestStarted,
+                .assistantMessageCommitted,
+                .stepEnded,
+                .turnEnded
+            ].contains(event.kind) else { return nil }
+            return event.correlationID
+        })
+        precondition(turnCorrelationIDs.count == 1)
 
         let fetchSession = try repository.createSession(projectID: project.id, title: "Public fetch", mode: .acceptEdits)
         let fetchRegistry = ToolRegistry([webSearch, webFetch])
@@ -161,6 +180,50 @@ struct DeepSeekCodeHarnessChecks {
             .flatMap { $0.toolCalls ?? [] }
             .map(\.id)
         precondition(multiSearchAssistantCalls == ["search-1", "search-2"])
+
+        // allowSession creates a durable PermissionLease. A second matching
+        // call in the same Session must continue without another approval,
+        // even though the underlying tool remains L2/external-write.
+        let leaseSession = try repository.createSession(projectID: project.id, title: "Permission lease", mode: .acceptEdits)
+        let publishTool = RegisteredTool(
+            name: "external_publish",
+            description: "fixture external publish",
+            parameters: .object([:]),
+            effect: .externalWrite,
+            risk: .l2,
+            timeoutMilliseconds: 1_000,
+            maxOutputBytes: 4_096,
+            idempotent: false,
+            supportsCancellation: true
+        )
+        let leaseRegistry = ToolRegistry([publishTool])
+        let leaseRouter = ToolHostRouter(registry: leaseRegistry, repository: repository)
+        leaseRouter.register(host: MemoryToolHost(), for: publishTool.name)
+        let leaseHost = NativeAgentHost(
+            client: ScriptedChatClient(batches: [
+                [.toolCall(id: "publish-1", name: publishTool.name, argumentsJSON: "{}"), .done],
+                [.toolCall(id: "publish-2", name: publishTool.name, argumentsJSON: "{}"), .done],
+                [.textDelta("两次发布调用均已处理。"), .done]
+            ]),
+            eventStore: events,
+            repository: repository,
+            toolRouter: leaseRouter,
+            toolRegistry: leaseRegistry
+        )
+        var firstLeaseRun: [AgentEvent] = []
+        for try await event in leaseHost.run(AgentRunRequest(sessionID: leaseSession.id, prompt: "执行两次发布", mode: .acceptEdits, model: "deepseek-chat")) {
+            firstLeaseRun.append(event)
+        }
+        precondition(firstLeaseRun.contains { if case .approvalRequired = $0 { return true }; return false })
+        let leaseApprovalID = try unwrap(repository.events(sessionID: leaseSession.id).last { $0.type == "approval_requested" }?.payload["approvalID"])
+        var resumedLeaseRun: [AgentEvent] = []
+        for try await event in leaseHost.resume(sessionID: leaseSession.id, approvalID: leaseApprovalID, decision: .allowSession) {
+            resumedLeaseRun.append(event)
+        }
+        precondition(!resumedLeaseRun.contains { if case .approvalRequired = $0 { return true }; return false })
+        precondition(resumedLeaseRun.filter { if case .toolCompleted(name: "external_publish", succeeded: true) = $0 { return true }; return false }.count == 2)
+        let persistedPublishLease = try repository.permissionLease(key: PermissionLeaseKey(projectID: project.id, sessionID: leaseSession.id, effect: .externalWrite, toolName: publishTool.name))
+        precondition(persistedPublishLease?.isActive() == true)
         print("DeepSeek Harness checks passed")
     }
 

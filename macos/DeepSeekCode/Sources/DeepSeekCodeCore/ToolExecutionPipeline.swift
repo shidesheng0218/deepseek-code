@@ -66,6 +66,15 @@ public struct ToolExecutionResult: Codable, Equatable, Sendable {
     }
 }
 
+/// Result of the Pipeline-owned pre-tool Hook phase. Hooks can provide
+/// observability, block an invocation, or ask the Supervisor to create the
+/// normal approval continuation; they never execute the underlying tool.
+public enum ToolPreToolDecision: Equatable, Sendable {
+    case allow
+    case requireApproval(reason: String)
+    case blocked(reason: String)
+}
+
 /// The only durable lifecycle owner for an authorized tool invocation.
 ///
 /// Policy, hooks and approval selection deliberately happen before
@@ -74,17 +83,34 @@ public struct ToolExecutionResult: Codable, Equatable, Sendable {
 public final class ToolExecutionPipeline: @unchecked Sendable {
     private let repository: SessionRepository
     private let router: ToolHostRouter
+    private let preToolHooks: [HookDefinition]
+    private let hookManifest: HostCapabilityManifest?
 
-    public init(repository: SessionRepository, router: ToolHostRouter) {
+    public init(
+        repository: SessionRepository,
+        router: ToolHostRouter,
+        preToolHooks: [HookDefinition] = [],
+        hookManifest: HostCapabilityManifest? = nil
+    ) {
         self.repository = repository
         self.router = router
+        self.preToolHooks = preToolHooks
+        self.hookManifest = hookManifest
     }
 
     /// Convenience for already-authorized read-only callers and fixtures.
     @discardableResult
     public func execute(_ context: ToolInvocationContext) async throws -> ToolExecutionResult {
         try begin(context)
-        return try await executeAuthorized(context)
+        switch await evaluatePreToolHooks(context) {
+        case .allow:
+            return try await executeAuthorized(context)
+        case let .blocked(reason):
+            return blockedPreflightResult(context, code: "HOOK_BLOCKED", message: reason)
+        case let .requireApproval(reason):
+            try? recordBlocked(context, code: "HOOK_APPROVAL_REQUIRED")
+            return blockedPreflightResult(context, code: "HOOK_APPROVAL_REQUIRED", message: reason)
+        }
     }
 
     /// Records the common request/schema stage once.  It is idempotent by
@@ -148,6 +174,55 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
             ),
             payload: ["code": code]
         )
+    }
+
+    /// Runs enabled pre-tool Hooks as an explicit Pipeline phase. A rejected
+    /// hook produces a durable `tool_blocked` record before the host can run;
+    /// this is intentionally not delegated to AgentHost or an extension UI.
+    public func evaluatePreToolHooks(_ context: ToolInvocationContext) async -> ToolPreToolDecision {
+        let matching = preToolHooks.filter { $0.lifecycle == .preToolUse && $0.enabled }
+        guard !matching.isEmpty else { return .allow }
+        do {
+            try append(
+                context,
+                type: "pre_tool_hook",
+                payload: basePayload(context).merging([
+                    "hookCount": "\(matching.count)",
+                    "hookIDs": matching.map(\.id).joined(separator: ",")
+                ], uniquingKeysWith: { _, right in right }),
+                suffix: "pre-tool-hook"
+            )
+        } catch {
+            return .blocked(reason: "无法记录前置 Hook 审计事件")
+        }
+
+        for hook in matching {
+            do {
+                let result = try await HookRunner.execute(
+                    hook,
+                    payload: [
+                        "sessionID": context.sessionID,
+                        "tool": context.tool.name,
+                        "arguments": SecretRedactor.redact(context.argumentsJSON),
+                        "risk": "L\(context.tool.risk.rawValue)"
+                    ],
+                    manifest: hookManifest
+                )
+                switch result.decision {
+                case .allow, .observe:
+                    continue
+                case let .block(reason):
+                    try? recordBlocked(context, code: "HOOK_BLOCKED")
+                    return .blocked(reason: reason)
+                case let .requireApproval(reason):
+                    return .requireApproval(reason: reason)
+                }
+            } catch {
+                try? recordBlocked(context, code: "HOOK_FAILED")
+                return .blocked(reason: SecretRedactor.redact(error.localizedDescription))
+            }
+        }
+        return .allow
     }
 
     /// Executes an invocation that has passed hooks, policy and any required
@@ -361,6 +436,19 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
         )
     }
 
+    private func blockedPreflightResult(_ context: ToolInvocationContext, code: String, message: String) -> ToolExecutionResult {
+        let output = jsonError(code: code, message: message)
+        return ToolExecutionResult(
+            output: output,
+            succeeded: false,
+            indeterminate: false,
+            evidenceID: nil,
+            outputHash: digest(output),
+            retryable: false,
+            code: code
+        )
+    }
+
     private func withDeadline<T: Sendable>(_ context: ToolInvocationContext, operation: @escaping @Sendable () async throws -> T) async throws -> T {
         let remaining = max(0.001, context.deadline.timeIntervalSinceNow)
         return try await withThrowingTaskGroup(of: T.self) { group in
@@ -376,14 +464,14 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
     }
 
     private func append(_ context: ToolInvocationContext, type: String, payload: [String: String], suffix: String) throws {
-        _ = try repository.appendDurable(
-            sessionID: context.sessionID,
-            type: type,
-            payload: payload,
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: context.sessionID,
             commandID: "pipeline-\(context.commandID)-\(context.callID)-\(suffix)",
             causationID: context.callID,
-            correlationID: context.traceID
-        )
+            correlationID: context.traceID,
+            kind: SessionEventKind(rawValue: type),
+            payload: payload
+        ))
     }
 
     private func basePayload(_ context: ToolInvocationContext) -> [String: String] {

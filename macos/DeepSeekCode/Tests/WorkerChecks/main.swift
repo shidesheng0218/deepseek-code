@@ -62,6 +62,26 @@ struct DeepSeekCodeWorkerChecks {
         precondition(driven.outputHash.count == 64)
         precondition(resolverProbe.parentSessionID == "parent-session")
         precondition(resolverProbe.workerSessionID == "process-worker-session")
+
+        let repository = try SessionRepository(directory: root.appendingPathComponent("Database", isDirectory: true))
+        let project = try repository.createProject(name: "Worker graph", path: root.path)
+        let parentSession = try repository.createSession(projectID: project.id, title: "Worker graph parent", mode: .acceptEdits)
+        let taskGraph = WorkerTaskGraph(repository: repository)
+        let finding = WorkerTaskMessage(
+            parentSessionID: parentSession.id,
+            workerSessionID: "process-worker-session",
+            workerID: "process-explore-worker",
+            kind: .finding,
+            summary: "发现 README.md 作为项目入口说明",
+            evidenceIDs: ["worker-explore-evidence"],
+            confidence: 0.92
+        )
+        _ = try taskGraph.publish(finding)
+        let graphMessages = try taskGraph.messages(parentSessionID: parentSession.id)
+        precondition(graphMessages == [finding])
+        let graphEvents = try repository.eventEnvelopes(sessionID: parentSession.id)
+        precondition(graphEvents.last?.kind == SessionEventKind(rawValue: "worker_task_message"))
+        precondition(graphEvents.last?.correlationID == parentSession.id)
         print("DeepSeek worker checks passed")
     }
 }

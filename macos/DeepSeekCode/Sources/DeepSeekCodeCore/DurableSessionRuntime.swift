@@ -2,7 +2,9 @@ import Foundation
 
 public enum SessionInputDelivery: String, Codable, CaseIterable, Sendable {
     case immediate
+    case nextStep = "next_step"
     case deferred
+    case contextOnly = "context_only"
 }
 
 public enum SessionInputState: String, Codable, CaseIterable, Sendable {
@@ -43,6 +45,19 @@ public struct SessionInputRecord: Codable, Equatable, Identifiable, Sendable {
         self.parts = parts
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+}
+
+/// Inputs claimed at one persisted safe boundary. Context-only records never
+/// wake an Agent by themselves; they are delivered alongside the next primary
+/// message so a running session cannot lose steering constraints.
+public struct SessionInputBoundary: Codable, Equatable, Sendable {
+    public let primary: SessionInputRecord
+    public let context: [SessionInputRecord]
+
+    public init(primary: SessionInputRecord, context: [SessionInputRecord]) {
+        self.primary = primary
+        self.context = context.sorted { $0.admittedSequence < $1.admittedSequence }
     }
 }
 
