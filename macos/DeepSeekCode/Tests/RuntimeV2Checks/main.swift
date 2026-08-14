@@ -60,9 +60,46 @@ struct BenchmarkFixtureProbe: HarnessBenchmarkFixture {
     }
 }
 
+private struct FixtureWebFetchProvider: WebFetchProvider {
+    func fetch(url: URL, context: NetworkContext) async throws -> WebFetchResponse {
+        let text = "Fixture web evidence"
+        return WebFetchResponse(
+            sourceID: "fixture-source",
+            sourceURL: url.absoluteString,
+            finalURL: url.absoluteString,
+            title: "Fixture",
+            contentType: "text/plain",
+            statusCode: 200,
+            contentHash: WebEvidenceInspector.sha256(text),
+            extractedText: text,
+            sections: [WebSection(id: "fixture-section", title: "Fixture", text: text)],
+            citationCandidates: [CitationCandidate(id: "fixture-citation", sourceID: "fixture-source", quote: text, contentHash: WebEvidenceInspector.sha256(text))]
+        )
+    }
+}
+
+private struct RouterProbeToolHost: ToolHost {
+    func execute(tool: RegisteredTool, argumentsJSON: String, sessionID: String) async throws -> String {
+        "{\"ok\":true,\"source\":\"router-probe\"}"
+    }
+
+    func cancel(invocationID: String) async {}
+}
+
 @main
 struct DeepSeekCodeRuntimeV2Checks {
     static func main() async throws {
+        // The GUI must not retain disabled foreground-Agent source code. It
+        // is too easy for an old call site to re-enable a second runtime.
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let workspaceStoreSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/DeepSeekCodeCore/WorkspaceStore.swift"),
+            encoding: .utf8
+        )
+        precondition(!workspaceStoreSource.contains("#if false"))
         precondition(WorkspaceTypography.microSize >= 10)
         precondition(WorkspaceTypography.metaSize >= 12)
         precondition(WorkspaceTypography.bodySize >= 14)
@@ -87,12 +124,69 @@ struct DeepSeekCodeRuntimeV2Checks {
         let builtInSearchProviders = WebToolHost().searchProviders.map(\.id)
         precondition(builtInSearchProviders.contains("duckduckgo"))
         precondition(builtInSearchProviders.contains("bing"))
+        let fixtureWebHost = WebToolHost(
+            runtime: NetworkRuntime(policy: .default),
+            fetchProvider: FixtureWebFetchProvider()
+        )
+        let fetchTool = AgentToolSchemas.registry.tool(named: "web_fetch")!
+        let fixtureFetchOutput = try await fixtureWebHost.execute(
+            tool: fetchTool,
+            argumentsJSON: "{\"url\":\"https://example.com/docs\"}",
+            sessionID: "fixture-session"
+        )
+        precondition(fixtureFetchOutput.contains("fixture-source"))
         // A direct-answer plan controls only the pre-tool fast path. Once a
         // model explicitly calls a read-only web tool it must advance to the
-        // Research Grant / SSRF gate instead of failing as DIRECT_ANSWER_PATH.
+        // Research Grant / SSRF gate instead of being rejected by the
+        // direct-answer preflight.
         let directPlan = TaskQualityPlanner.plan(route: TaskRouter.route(TaskRoutingInput(prompt: "Swift actor 是什么？", mode: .acceptEdits)))
         let explicitWebSearch = RegisteredTool(name: "web_search", description: "search", parameters: .object([:]), effect: .network, risk: .l2, timeoutMilliseconds: 10_000, maxOutputBytes: 32_000, idempotent: true, supportsCancellation: true)
         precondition(ToolDecisionPolicy.decide(for: explicitWebSearch, plan: directPlan, evidence: QualityEvidenceState()) == .execute)
+        let unexpectedWrite = RegisteredTool(name: "apply_patch", description: "patch", parameters: .object([:]), effect: .workspaceWrite, risk: .l1, timeoutMilliseconds: 10_000, maxOutputBytes: 32_000, idempotent: false, supportsCancellation: true)
+        precondition(ToolDecisionPolicy.decide(for: unexpectedWrite, plan: directPlan, evidence: QualityEvidenceState()) == .requestApproval(.l1))
+        precondition(WebSearchRequest(query: "Swift actor", maxResults: 99).maxResults == 8)
+        precondition(ToolPresentationResolver.presentation(for: "web_search").title == "联网搜索")
+        precondition(ToolPresentationResolver.presentation(for: "terminal.exec").title == "终端命令")
+        // The router is a pure host dispatcher. Durable lifecycle and
+        // evidence events belong to ToolExecutionPipeline, never to the
+        // transport/router layer.
+        let routerRegistry = ToolRegistry()
+        let routerTool = RegisteredTool(
+            name: "router_probe",
+            description: "router probe",
+            parameters: .object([:]),
+            effect: .readOnly,
+            risk: .l0,
+            timeoutMilliseconds: 1_000,
+            maxOutputBytes: 1_024,
+            idempotent: true,
+            supportsCancellation: true
+        )
+        routerRegistry.register(routerTool)
+        let pureRouter = ToolHostRouter(registry: routerRegistry)
+        pureRouter.register(host: RouterProbeToolHost(), for: "router_probe")
+        let routed = try await pureRouter.execute(tool: routerTool, argumentsJSON: "{}", sessionID: "router-probe-session")
+        precondition(routed.contains("router-probe"))
+        precondition(pureRouter.invocationEvents.isEmpty)
+        let fetchContract = try WebContentExtractor.extract(
+            data: Data(String(repeating: "x", count: 50_000).utf8),
+            contentType: "text/plain",
+            sourceID: "fetch-contract",
+            sourceURL: "https://example.com/source",
+            statusCode: 200
+        )
+        precondition(fetchContract.extractedText.count == 50_000)
+        let continuation = ApprovalContinuation(
+            approvalID: "approval-1",
+            sessionID: "session-1",
+            commandID: "command-1",
+            callID: "call-1",
+            tool: "terminal.exec",
+            argumentsJSON: "{\"command\":\"pwd\"}",
+            risk: .l0
+        )
+        precondition(continuation.matches(sessionID: "session-1", callID: "call-1", tool: "terminal.exec", argumentsJSON: "{\"command\":\"pwd\"}"))
+        precondition(!continuation.matches(sessionID: "session-1", callID: "call-1", tool: "terminal.exec", argumentsJSON: "{\"command\":\"whoami\"}"))
         // GUI delegates only fully daemon-capable tasks. Browser/attachments,
         // SSH and configured extension hosts stay on the foreground path
         // until those capabilities have an equivalent durable daemon host.
@@ -141,7 +235,7 @@ struct DeepSeekCodeRuntimeV2Checks {
         // Tool executions remain durable Session Parts for Evidence, but the
         // default conversation must not expose internal names such as
         // web_search / web_fetch as chat cards.
-        precondition(visibleParts.contains { $0.kind == .toolCall && $0.title == "web_search" })
+        precondition(visibleParts.contains { $0.kind == .toolCall && $0.title == "联网搜索" })
         let primaryConversation = ConversationProjector.timeline(parts: visibleParts)
         precondition(primaryConversation.map(\.kind) == [.user, .assistant])
         precondition(primaryConversation.map(\.text) == ["今天股市行情怎么样？", "我正在查询最新行情。"])
@@ -204,6 +298,45 @@ struct DeepSeekCodeRuntimeV2Checks {
         let repository = try SessionRepository(directory: root.appendingPathComponent("db", isDirectory: true))
         let project = try repository.createProject(name: "Runtime V2", path: root.path)
         let session = try repository.createSession(projectID: project.id, title: "Part projection", mode: .acceptEdits)
+        let pipelineSession = try repository.createSession(projectID: project.id, title: "Pipeline projection", mode: .acceptEdits)
+        // The execution pipeline, rather than the router, owns the durable
+        // lifecycle and creates a traceable Evidence record for every tool.
+        let pipelineRegistry = ToolRegistry([routerTool])
+        let pipelineRouter = ToolHostRouter(registry: pipelineRegistry)
+        pipelineRouter.register(host: RouterProbeToolHost(), for: "router_probe")
+        let pipeline = ToolExecutionPipeline(repository: repository, router: pipelineRouter)
+        let pipelineResult = try await pipeline.execute(
+            ToolInvocationContext(
+                sessionID: pipelineSession.id,
+                commandID: "pipeline-command",
+                callID: "pipeline-call",
+                tool: routerTool,
+                argumentsJSON: "{}"
+            )
+        )
+        precondition(pipelineResult.succeeded)
+        precondition(pipelineResult.evidenceID != nil)
+        let pipelineEvents = try repository.events(sessionID: pipelineSession.id)
+        precondition(pipelineEvents.map(\.type).suffix(4) == ["tool_requested", "tool_started", "evidence_recorded", "tool_completed"])
+        let inboxInput = try repository.enqueueSessionInput(
+            sessionID: session.id,
+            idempotencyKey: "foreground-input",
+            delivery: .immediate,
+            parts: [.text("不要提前消费")]
+        )
+        let consumedBeforePromotion = try repository.consumePromotedSessionInput(id: inboxInput.id)
+        precondition(!consumedBeforePromotion)
+        let promotedInboxInput = try repository.promoteNextSessionInput(sessionID: session.id)
+        precondition(promotedInboxInput?.id == inboxInput.id)
+        let consumedAfterPromotion = try repository.consumePromotedSessionInput(id: inboxInput.id)
+        let duplicateConsumption = try repository.consumePromotedSessionInput(id: inboxInput.id)
+        precondition(consumedAfterPromotion)
+        precondition(!duplicateConsumption)
+        let casApproval = try repository.createApproval(sessionID: session.id, tool: "terminal.exec", risk: .l1, arguments: "{\"command\":\"pwd\"}")
+        let firstResolution = try repository.resolvePendingApproval(id: casApproval.id, decision: .allowOnce)
+        let duplicateResolution = try repository.resolvePendingApproval(id: casApproval.id, decision: .allowOnce)
+        precondition(firstResolution)
+        precondition(!duplicateResolution)
         let traceSession = try repository.createSession(projectID: project.id, title: "Delivery trace", mode: .acceptEdits)
         let harnessSession = try repository.createSession(projectID: project.id, title: "Harness supervisor", mode: .acceptEdits)
 

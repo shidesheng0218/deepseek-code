@@ -106,6 +106,13 @@ struct DeepSeekCodeDaemonChecks {
         try providerCatalog.save(profile)
         let secrets = InMemorySecretStore()
         try secrets.save(reference: profile.apiKeyReference, value: "fixture-key")
+        let daemonAttachmentSource = root.appendingPathComponent("daemon-attachment.txt")
+        try Data("daemon attachment evidence".utf8).write(to: daemonAttachmentSource)
+        let daemonAttachmentStore = try AttachmentStore(
+            directory: root.appendingPathComponent("Attachments", isDirectory: true),
+            secretStore: secrets
+        )
+        let daemonAttachment = try daemonAttachmentStore.importFile(at: daemonAttachmentSource)
         let nativeSession = try repository.createSession(projectID: project.id, title: "Native daemon execution", mode: .acceptEdits)
         let nativeRunner = NativeDaemonSessionRunner(
             repository: repository,
@@ -121,7 +128,7 @@ struct DeepSeekCodeDaemonChecks {
             sessionID: nativeSession.id,
             idempotencyKey: "native-daemon-input",
             delivery: .immediate,
-            parts: [.text("回答一个问题")]
+            parts: [.text("回答一个问题"), .document(daemonAttachment)]
         ))
         try await nativeSupervisor.start(sessionID: nativeSession.id)
         try await nativeDriver.waitForIdle(sessionID: nativeSession.id)

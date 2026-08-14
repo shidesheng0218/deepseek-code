@@ -303,7 +303,6 @@ public struct QualityEvidenceState: Codable, Equatable, Sendable {
 }
 
 public enum ToolDecision: Equatable, Sendable {
-    case answerWithoutTool
     case execute
     case requestApproval(CommandRisk)
     case gatherEvidence([EvidenceKind])
@@ -321,10 +320,10 @@ public enum ToolDecisionPolicy {
         guard tool.risk != .l4 else { return .blocked("L4 工具永久阻止") }
         if plan.toolIntent == .none {
             // A direct-answer route controls the *pre-tool* fast path. It
-            // must not turn an explicit, read-only web tool call into a fake
-            // failure. `AgentHost` still routes this through Research Grant,
+            // must not turn an explicit tool call into a fake failure.
+            // `AgentHost` still routes every call through Research Grant,
             // PermissionBroker and NetworkRuntime's SSRF checks before any
-            // request is sent.
+            // request is sent. Unexpected writes remain one-shot approvals.
             if ["web_search", "web_fetch"].contains(tool.name) { return .execute }
             // A direct-answer route should not trigger side effects, but a
             // model may still use an inexpensive local read to answer a
@@ -339,7 +338,7 @@ public enum ToolDecisionPolicy {
             if tool.effect == .process, tool.risk <= .l1 {
                 return .execute
             }
-            return .answerWithoutTool
+            return .requestApproval(tool.risk)
         }
         if plan.requiresCitations,
            !evidence.hasCitations,

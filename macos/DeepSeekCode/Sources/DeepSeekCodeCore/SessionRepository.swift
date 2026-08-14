@@ -1173,6 +1173,47 @@ public final class SessionRepository: @unchecked Sendable {
         try transitionSessionInput(id: id, state: .consumed)
     }
 
+    /// Completes an Inbox item only after it has crossed a durable execution
+    /// boundary.  This compare-and-swap prevents a foreground client from
+    /// losing an accepted message before its Agent run has actually started.
+    @discardableResult
+    public func consumePromotedSessionInput(id: String) throws -> Bool {
+        let sessionID: String? = try withLock {
+            let rows = try query("SELECT payload FROM session_input_inbox WHERE id = ? LIMIT 1;", values: [id]) { $0.string(0) }
+            guard let encoded = rows.first,
+                  var record = try? decoder.decode(SessionInputRecord.self, from: Data(encoded.utf8)),
+                  record.state == .promoted else { return nil }
+            record.state = .consumed
+            record.updatedAt = Date()
+            let payload = String(decoding: try encoder.encode(record), as: UTF8.self)
+            try execute(
+                "UPDATE session_input_inbox SET state = ?, payload = ?, updated_at = ? WHERE id = ? AND state = ?;",
+                values: [
+                    SessionInputState.consumed.rawValue,
+                    payload,
+                    record.updatedAt.timeIntervalSince1970,
+                    id,
+                    SessionInputState.promoted.rawValue
+                ]
+            )
+            guard sqlite3_changes(database) == 1 else { return nil }
+            _ = try appendDurableUnlocked(
+                sessionID: record.sessionID,
+                type: "session_input_consumed",
+                payload: ["inputID": id],
+                commandID: "input-consumed-\(id)",
+                causationID: id,
+                correlationID: nil,
+                schemaVersion: 1
+            )
+            return record.sessionID
+        }
+        guard let sessionID else { return false }
+        _ = try? refreshProjection(sessionID: sessionID)
+        _ = try? refreshPartProjection(sessionID: sessionID)
+        return true
+    }
+
     public func cancelSessionInput(id: String) throws {
         try transitionSessionInput(id: id, state: .cancelled)
     }
@@ -1357,6 +1398,21 @@ public final class SessionRepository: @unchecked Sendable {
     public func resolveApproval(id: String, decision: ApprovalDecision) throws {
         try withLock {
             try execute("UPDATE approvals SET decision = ?, resolved_at = ? WHERE id = ?;", values: [decision.rawValue, Date().timeIntervalSince1970, id])
+        }
+    }
+
+    /// One-shot compare-and-swap for an approval decision.  A second client
+    /// resolving the same approval receives `false` and must not resume the
+    /// original tool call again.
+    @discardableResult
+    public func resolvePendingApproval(id: String, decision: ApprovalDecision) throws -> Bool {
+        guard decision != .pending else { return false }
+        return try withLock {
+            try execute(
+                "UPDATE approvals SET decision = ?, resolved_at = ? WHERE id = ? AND decision = ?;",
+                values: [decision.rawValue, Date().timeIntervalSince1970, id, ApprovalDecision.pending.rawValue]
+            )
+            return sqlite3_changes(database) == 1
         }
     }
 

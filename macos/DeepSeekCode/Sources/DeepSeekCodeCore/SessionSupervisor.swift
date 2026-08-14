@@ -128,7 +128,9 @@ public actor SessionSupervisor: DurableSessionSupervisor {
         // drivers used by Control Plane/tests do not, therefore the
         // Supervisor finalizes the transition only when it is still pending.
         if let refreshed = try repository.approval(id: approvalID), refreshed.decision == .pending {
-            try repository.resolveApproval(id: approvalID, decision: decision)
+            guard try repository.resolvePendingApproval(id: approvalID, decision: decision) else {
+                throw HarnessSupervisorError.approvalAlreadyResolved
+            }
             _ = try repository.appendDurable(
                 sessionID: sessionID,
                 type: "approval_resolved",
@@ -244,6 +246,14 @@ public actor SessionSupervisor: DurableSessionSupervisor {
 
     public func consumeInput(id: String) {
         try? repository.markSessionInputConsumed(id: id)
+    }
+
+    /// Foreground clients may only consume a message that was first promoted
+    /// at a persisted safe boundary. The boolean reports whether this caller
+    /// won the one-shot completion race.
+    @discardableResult
+    public func consumePromotedInput(id: String) throws -> Bool {
+        try repository.consumePromotedSessionInput(id: id)
     }
 
     public func recover(sessionID: String) throws -> ProjectedSessionState? {

@@ -11,7 +11,19 @@ public protocol DaemonChatClientFactory: Sendable {
     ) throws -> any ChatStreaming
 }
 
-public struct DefaultDaemonChatClientFactory: DaemonChatClientFactory {
+/// Optional capability refinement.  Fixtures can stay transport-only while
+/// the production factory receives the encrypted local attachment provider.
+public protocol AttachmentAwareDaemonChatClientFactory: DaemonChatClientFactory {
+    func make(
+        profile: ProviderProfile,
+        apiKey: String,
+        attachmentProvider: (any AttachmentDataProvider)?,
+        networkRuntime: NetworkRuntime,
+        networkContext: NetworkContext
+    ) throws -> any ChatStreaming
+}
+
+public struct DefaultDaemonChatClientFactory: AttachmentAwareDaemonChatClientFactory {
     public init() {}
 
     public func make(
@@ -20,9 +32,26 @@ public struct DefaultDaemonChatClientFactory: DaemonChatClientFactory {
         networkRuntime: NetworkRuntime,
         networkContext: NetworkContext
     ) throws -> any ChatStreaming {
+        try make(
+            profile: profile,
+            apiKey: apiKey,
+            attachmentProvider: nil,
+            networkRuntime: networkRuntime,
+            networkContext: networkContext
+        )
+    }
+
+    public func make(
+        profile: ProviderProfile,
+        apiKey: String,
+        attachmentProvider: (any AttachmentDataProvider)?,
+        networkRuntime: NetworkRuntime,
+        networkContext: NetworkContext
+    ) throws -> any ChatStreaming {
         try ProviderClientFactory.make(
             profile: profile,
             apiKey: apiKey,
+            attachmentProvider: attachmentProvider,
             networkRuntime: networkRuntime,
             networkContext: networkContext
         )
@@ -56,6 +85,7 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
     private let networkRuntime: NetworkRuntime
     private let storageRoot: URL
     private let terminalHost: (any PersistentTerminalHost)?
+    private let attachmentStore: AttachmentStore?
     private let projectTrusted: Bool
     private let sandboxAvailable: Bool
 
@@ -79,6 +109,10 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
         self.networkRuntime = networkRuntime ?? NetworkRuntime(policy: .default, repository: repository)
         self.storageRoot = storageRoot
         self.terminalHost = terminalHost
+        self.attachmentStore = try? AttachmentStore(
+            directory: storageRoot.appendingPathComponent("Attachments", isDirectory: true),
+            secretStore: secretStore
+        )
         self.projectTrusted = projectTrusted
         self.sandboxAvailable = sandboxAvailable ?? SandboxRuntime.availability.available
     }
@@ -194,17 +228,29 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
         let qualityPlan = TaskQualityPlanner.plan(route: route)
         let model = DeepSeekModelCatalog.routedModel(preferred: profile.model, route: route)
         let capabilities = DeepSeekModelCatalog.capabilities(for: model)
-        let client = try clientFactory.make(
-            profile: profile,
-            apiKey: apiKey,
-            networkRuntime: networkRuntime,
-            networkContext: NetworkContext(
-                sessionID: session.id,
-                projectID: project.id,
-                purpose: .providerRequest,
-                requestedBy: "deepseekd"
-            )
+        let context = NetworkContext(
+            sessionID: session.id,
+            projectID: project.id,
+            purpose: .providerRequest,
+            requestedBy: "deepseekd"
         )
+        let client: any ChatStreaming
+        if let attachmentAwareFactory = clientFactory as? any AttachmentAwareDaemonChatClientFactory {
+            client = try attachmentAwareFactory.make(
+                profile: profile,
+                apiKey: apiKey,
+                attachmentProvider: attachmentStore,
+                networkRuntime: networkRuntime,
+                networkContext: context
+            )
+        } else {
+            client = try clientFactory.make(
+                profile: profile,
+                apiKey: apiKey,
+                networkRuntime: networkRuntime,
+                networkContext: context
+            )
+        }
         let host = NativeAgentHost(
             client: client,
             eventStore: eventStore,
@@ -260,7 +306,8 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
             case let .browserEvidence(evidence): values.append("[浏览器证据] \(evidence.summary)")
             case let .computerEvidence(evidence): values.append("[电脑证据] \(evidence.summary)")
             case let .toolEvidence(evidence): values.append("[工具证据] \(evidence.detail)")
-            case .image, .document: throw NativeDaemonSessionRunnerError.unsupportedAttachment
+            case let .image(attachment), let .document(attachment):
+                values.append("[附件：\(attachment.filename)，内容由 Provider 的本地附件通道读取]")
             }
         }
         let prompt = values.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)

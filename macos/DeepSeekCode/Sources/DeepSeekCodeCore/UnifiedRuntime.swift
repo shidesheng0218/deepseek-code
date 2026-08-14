@@ -14,18 +14,22 @@ public struct ToolInvocationResult: Codable, Equatable, Sendable {
     }
 }
 
-/// Routes tools through one registry while keeping the event chain uniform.
+/// Resolves a registered tool to a concrete host.
+///
+/// This type deliberately owns no business lifecycle: requested, approval,
+/// started, evidence and completion events are written by
+/// `ToolExecutionPipeline`. Keeping this router pure prevents a GUI/CLI/
+/// daemon caller from accidentally creating a second audit trail.
 public final class ToolHostRouter: @unchecked Sendable {
     private let registry: ToolRegistry
-    private let repository: SessionRepository?
     private let lock = NSLock()
     private var exactHosts: [String: any ToolHost] = [:]
     private var prefixHosts: [(String, any ToolHost)] = []
-    private var records: [ToolInvocationRecord] = []
 
     public init(registry: ToolRegistry, repository: SessionRepository? = nil) {
         self.registry = registry
-        self.repository = repository
+        // Kept source-compatible while callers move to ToolExecutionPipeline.
+        _ = repository
     }
 
     public func register(host: any ToolHost, for toolName: String) {
@@ -49,43 +53,22 @@ public final class ToolHostRouter: @unchecked Sendable {
     }
 
     public var invocationEvents: [ToolInvocationRecord] {
-        lock.lock()
-        defer { lock.unlock() }
-        return records
+        []
     }
 
     public func execute(tool: RegisteredTool, argumentsJSON: String, sessionID: String) async throws -> String {
-        let invocationID = UUID().uuidString
-        appendRecord(ToolInvocationRecord(id: invocationID, sessionID: sessionID, tool: tool.name, phase: .requested, risk: tool.risk))
+        _ = argumentsJSON
+        _ = sessionID
         guard let host = resolveHost(for: tool.name) else {
-            appendRecord(ToolInvocationRecord(id: invocationID, sessionID: sessionID, tool: tool.name, phase: .failed, risk: tool.risk, succeeded: false))
             throw UnifiedRuntimeError.toolHostUnavailable(tool.name)
         }
-        appendRecord(ToolInvocationRecord(id: invocationID, sessionID: sessionID, tool: tool.name, phase: .started, risk: tool.risk))
-        do {
-            let output = try await host.execute(tool: tool, argumentsJSON: argumentsJSON, sessionID: sessionID)
-            appendRecord(ToolInvocationRecord(id: invocationID, sessionID: sessionID, tool: tool.name, phase: .completed, risk: tool.risk, succeeded: true))
-            return output
-        } catch is CancellationError {
-            appendRecord(ToolInvocationRecord(id: invocationID, sessionID: sessionID, tool: tool.name, phase: .indeterminate, risk: tool.risk, succeeded: nil))
-            throw CancellationError()
-        } catch {
-            appendRecord(ToolInvocationRecord(id: invocationID, sessionID: sessionID, tool: tool.name, phase: .failed, risk: tool.risk, succeeded: false))
-            throw error
-        }
+        return try await host.execute(tool: tool, argumentsJSON: argumentsJSON, sessionID: sessionID)
     }
 
     public func cancel(invocationID: String) async {
-        // Hosts may keep their own invocation map. Cancellation is intentionally best effort.
-        let record = record(for: invocationID)
-        guard let record, let host = resolveHost(for: record.tool), record.phase == .started else { return }
-        await host.cancel(invocationID: invocationID)
-    }
-
-    private func record(for invocationID: String) -> ToolInvocationRecord? {
-        lock.lock()
-        defer { lock.unlock() }
-        return records.last { $0.id == invocationID }
+        // Invocation ownership belongs to ToolExecutionPipeline. The router
+        // cannot safely infer the tool from an opaque invocation ID.
+        _ = invocationID
     }
 
     private func resolveHost(for name: String) -> (any ToolHost)? {
@@ -93,13 +76,6 @@ public final class ToolHostRouter: @unchecked Sendable {
         defer { lock.unlock() }
         if let host = exactHosts[name] { return host }
         return prefixHosts.first(where: { name.hasPrefix($0.0) })?.1
-    }
-
-    private func appendRecord(_ record: ToolInvocationRecord) {
-        lock.lock()
-        records.append(record)
-        lock.unlock()
-        try? repository?.recordToolInvocation(record)
     }
 }
 

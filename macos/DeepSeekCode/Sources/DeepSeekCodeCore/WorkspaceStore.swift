@@ -618,7 +618,8 @@ public final class WorkspaceStore {
                 guard hasActiveSession else { return }
                 try? repository?.append(sessionID: selectedSessionID, type: "scheduled_trigger_consumed", payload: ["runID": trigger.id, "taskID": task.id])
                 sessionBudget = SessionBudget(maxToolTurns: 40, maxWallClockSeconds: max(30, task.maxRuntimeMinutes * 60), maxInputTokens: 120_000, maxOutputTokens: 24_000)
-                await runAgent(promptOverride: task.prompt, sessionIDOverride: selectedSessionID)
+                startDaemonAgentRun(sessionID: selectedSessionID, parts: [.text(task.prompt)])
+                await agentRunTasks[selectedSessionID]?.value
                 refreshSelectedSession()
                 let succeeded = selectedSession.status == .completed || selectedSession.status == .delivered
                 if succeeded {
@@ -1033,86 +1034,31 @@ public final class WorkspaceStore {
         composerAttachments.removeAll()
         attachmentStatusMessage = ""
         if agentWorkers.contains(where: { $0.sessionID == sessionID && $0.kind == .main && $0.isLive }) {
-            let idempotencyKey = UUID().uuidString
             statusMessage = "正在加入本轮结束后的输入队列…"
-            if let sessionSupervisor {
-                Task { [weak self] in
-                    do {
-                        _ = try await sessionSupervisor.admit(SessionInput(
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let client = try await self.daemonClient()
+                    _ = try await self.sendDaemon(
+                        .inputAdmit,
+                        payload: DeepSeekDaemonInputPayload(
                             sessionID: sessionID,
-                            idempotencyKey: idempotencyKey,
+                            idempotencyKey: "gui-daemon-deferred-\(UUID().uuidString)",
                             delivery: .deferred,
                             parts: outgoingParts
-                        ))
-                        self?.statusMessage = "已加入本轮结束后的输入队列"
-                    } catch {
-                        self?.statusMessage = "补充任务入队失败：\(error.localizedDescription)"
-                    }
-                }
-            } else {
-                do {
-                    _ = try repository?.enqueueSessionInput(
-                        sessionID: sessionID,
-                        idempotencyKey: idempotencyKey,
-                        delivery: .deferred,
-                        parts: outgoingParts
+                        ),
+                        client: client
                     )
-                    statusMessage = "已加入本轮结束后的输入队列"
+                    self.statusMessage = "已加入本轮结束后的输入队列"
                 } catch {
-                    statusMessage = "补充任务入队失败：\(error.localizedDescription)"
+                    self.statusMessage = "补充任务入队失败：\(error.localizedDescription)"
                 }
             }
             return
         }
         statusMessage = "Agent 正在准备…"
         updateSelectedSessionStatus(.running)
-        let route = TaskRouter.route(TaskRoutingInput(
-            prompt: effectivePrompt,
-            mode: mode,
-            hasAttachments: outgoingParts.contains { if case .text = $0 { return false }; return true },
-            hasProject: !isScratchProject
-        ))
-        if DaemonExecutionEligibility.isEligible(
-            target: executionTarget,
-            parts: outgoingParts,
-            route: route,
-            hasEnabledHooks: hooks.contains { $0.enabled && $0.trusted },
-            hasEnabledMCP: mcpServers.contains { $0.enabled && $0.trusted }
-        ) {
-            startDaemonAgentRun(sessionID: sessionID, parts: outgoingParts)
-            return
-        }
-        if let sessionSupervisor {
-            Task { [weak self] in
-                guard let self else { return }
-                do {
-                    if let repository = self.repository {
-                        try SessionRuntimeOwnership.assign(
-                            .foregroundApp,
-                            sessionID: sessionID,
-                            repository: repository,
-                            instanceID: "DeepSeekCodeApp-\(ProcessInfo.processInfo.processIdentifier)",
-                            commandID: "runtime-owner-foreground-\(sessionID)-\(UUID().uuidString)"
-                        )
-                    }
-                    _ = try await sessionSupervisor.admit(SessionInput(
-                        sessionID: sessionID,
-                        idempotencyKey: "send-\(UUID().uuidString)",
-                        delivery: .immediate,
-                        parts: outgoingParts
-                    ))
-                    if let next = try await sessionSupervisor.promoteNextInput(sessionID: sessionID) {
-                        await sessionSupervisor.consumeInput(id: next.id)
-                    }
-                    self.startAgentRun(promptOverride: effectivePrompt, partsOverride: outgoingParts, sessionIDOverride: sessionID)
-                } catch {
-                    self.statusMessage = "任务入队失败：\(error.localizedDescription)"
-                    self.updateSelectedSessionStatus(.failed)
-                }
-            }
-        } else {
-            startAgentRun(promptOverride: effectivePrompt, partsOverride: outgoingParts, sessionIDOverride: sessionID)
-        }
+        startDaemonAgentRun(sessionID: sessionID, parts: outgoingParts)
     }
 
     /// Sends supported GUI tasks through the same `deepseekd` Supervisor as
@@ -1225,70 +1171,51 @@ public final class WorkspaceStore {
 
     /// Starts a supervised Agent run and keeps a cancellable control handle so
     /// the run remains visible and manageable from the Agents view.
-    public func startAgentRun(promptOverride: String? = nil, partsOverride: [ContentPart] = [], sessionIDOverride: String? = nil) {
-        let runSessionID = sessionIDOverride ?? selectedSessionID
-        let userPrompt = (promptOverride ?? prompt).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !runSessionID.isEmpty, !userPrompt.isEmpty else { return }
-        if let existing = agentWorkers.first(where: { $0.sessionID == runSessionID && $0.kind == .main && $0.isLive }) {
-            statusMessage = "该 Session 已有 Agent 在运行：\(existing.detail)"
+    public func startAgentRun(
+        promptOverride: String? = nil,
+        partsOverride: [ContentPart] = [],
+        sessionIDOverride: String? = nil,
+        inputIDOverride: String? = nil
+    ) {
+        _ = inputIDOverride
+        let sessionID = sessionIDOverride ?? selectedSessionID
+        let prompt = (promptOverride ?? self.prompt).trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = partsOverride.isEmpty ? [.text(prompt)] : partsOverride
+        guard !sessionID.isEmpty, !parts.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        startDaemonAgentRun(sessionID: sessionID, parts: parts)
+    }
+
+    /// Completes exactly the promoted Inbox item whose foreground run reached
+    /// a safe boundary, then starts the next queued input. Accepted items are
+    /// never consumed before the model/tool run has actually settled.
+    private func finishForegroundInputAndContinue(
+        sessionID: String,
+        completedInputID: String?,
+        supervisor: SessionSupervisor
+    ) async {
+        let pending = repository.flatMap { try? $0.runState(sessionID: sessionID) }?.pendingApproval
+        guard pending == nil else {
+            await supervisor.release(sessionID: sessionID)
             return
         }
-        let worker = agentWorkerRegistry.create(sessionID: runSessionID, prompt: userPrompt, kind: .main)
-        let control = AgentRunControl()
-        agentRunControls[runSessionID] = control
-        agentWorkerRegistry.transition(id: worker.id, state: .running, detail: "准备上下文", checkpoint: AgentWorkerCheckpoint(title: "准备上下文", detail: "等待模型请求"))
-        agentWorkers = agentWorkerRegistry.records(sessionID: runSessionID)
-        selectedAgentWorkerID = worker.id
-        let executionDriver = ClosureSessionExecutionDriver(
-            onStart: { [weak self] sessionID in
-                guard let self else { return }
-                await self.runAgent(promptOverride: userPrompt, partsOverride: partsOverride, sessionIDOverride: sessionID, workerID: worker.id, control: control)
-            },
-            onPause: { [weak self] sessionID in
-                await self?.requestPauseForSupervisor(sessionID: sessionID)
-            },
-            onResume: { [weak self] sessionID in
-                await self?.requestResumeForSupervisor(sessionID: sessionID)
-            },
-            onResolveApproval: { [weak self] sessionID, approvalID, decision in
-                await self?.resumeAgentApprovalForSupervisor(sessionID: sessionID, approvalID: approvalID, decision: decision)
-            },
-            onCancel: { [weak self] sessionID in
-                await self?.requestCancelForSupervisor(sessionID: sessionID)
-            }
-        )
-        let task = Task<Void, Never> { [weak self] in
-            guard let self else { return }
-            if let supervisor = self.sessionSupervisor {
-                do {
-                    await supervisor.installExecutionDriver(executionDriver, sessionID: runSessionID)
-                    try await supervisor.start(sessionID: runSessionID)
-                } catch {
-                    self.agentWorkerRegistry.transition(
-                        id: worker.id,
-                        state: .needsAttention,
-                        detail: "无法取得 Session 写入租约",
-                        errorMessage: error.localizedDescription
-                    )
-                    self.agentWorkers = self.agentWorkerRegistry.records(sessionID: runSessionID)
-                    self.statusMessage = error.localizedDescription
-                    return
-                }
-                let pendingApproval = self.repository.flatMap { try? $0.runState(sessionID: runSessionID) }?.pendingApproval
-                if pendingApproval == nil,
-                   let next = try? await supervisor.promoteNextInput(sessionID: runSessionID) {
-                    await supervisor.consumeInput(id: next.id)
-                    await supervisor.release(sessionID: runSessionID)
-                    self.statusMessage = "正在处理已排队的补充任务…"
-                    self.startAgentRun(promptOverride: next.parts.plainText, partsOverride: next.parts, sessionIDOverride: runSessionID)
-                } else {
-                    await supervisor.release(sessionID: runSessionID)
-                }
-            } else {
-                await self.runAgent(promptOverride: userPrompt, partsOverride: partsOverride, sessionIDOverride: runSessionID, workerID: worker.id, control: control)
-            }
+        let currentID = completedInputID
+            ?? ((try? repository?.sessionInputs(sessionID: sessionID)) ?? [])
+                .first(where: { $0.state == .promoted })?.id
+        if let currentID {
+            _ = try? await supervisor.consumePromotedInput(id: currentID)
         }
-        agentRunTasks[runSessionID] = task
+        if let next = try? await supervisor.promoteNextInput(sessionID: sessionID) {
+            await supervisor.release(sessionID: sessionID)
+            statusMessage = "正在处理已排队的补充任务…"
+            startAgentRun(
+                promptOverride: next.parts.plainText,
+                partsOverride: next.parts,
+                sessionIDOverride: sessionID,
+                inputIDOverride: next.id
+            )
+        } else {
+            await supervisor.release(sessionID: sessionID)
+        }
     }
 
     private func requestPauseForSupervisor(sessionID: String) async {
@@ -1310,91 +1237,73 @@ public final class WorkspaceStore {
     }
 
     private func resumeAgentApprovalForSupervisor(sessionID: String, approvalID: String, decision: ApprovalDecision) async {
-        print("→ [APPROVAL] resumeAgentApprovalForSupervisor called: sessionID=\(sessionID), approvalID=\(approvalID)")
-
-        guard let eventStore else {
-            print("❌ [APPROVAL] eventStore is nil")
-            return
-        }
-        guard let apiKey = loadAPIKey() else {
-            print("❌ [APPROVAL] apiKey is nil")
-            return
-        }
-
-        let profile = currentProfile
-        let workerID = agentWorkers.first(where: { $0.sessionID == sessionID && $0.kind == .main && $0.state == .waitingApproval })?.id
-
         do {
-            let client = try ProviderClientFactory.make(
-                profile: profile,
-                apiKey: apiKey,
-                attachmentProvider: attachmentStore,
-                networkRuntime: networkRuntime,
-                networkContext: NetworkContext(sessionID: sessionID, projectID: selectedProjectID, purpose: .providerRequest, requestedBy: "supervisor-approval-resume")
+            let client = try await daemonClient()
+            _ = try await sendDaemon(
+                .approvalResolve,
+                payload: DeepSeekDaemonApprovalPayload(sessionID: sessionID, approvalID: approvalID, decision: decision),
+                client: client
             )
-            let workspaceHost = isScratchProject ? nil : try? toolHost()
-            let runtime = makeToolRuntime(workspace: workspaceHost)
-            await prepareMCPRuntime(registry: runtime.registry, router: runtime.router)
-            let host = NativeAgentHost(
-                client: client,
-                eventStore: eventStore,
-                workspace: workspaceHost,
-                repository: repository,
-                projectTrusted: isProjectTrusted,
-                sandboxAvailable: sandboxAvailable,
-                toolRouter: runtime.router,
-                toolRegistry: runtime.registry,
-                hooks: hooks,
-                defaultPricing: profile,
-                networkRuntime: networkRuntime,
-                hookManifest: hookManifest(sessionID: sessionID)
-            )
-            let orchestrator = NativeSessionOrchestrator(host: host)
             pendingApproval = nil
-
-            print("→ [APPROVAL] Starting Agent resume stream...")
-            var eventCount = 0
-            for try await event in orchestrator.resume(sessionID: sessionID, approvalID: approvalID, decision: decision) {
-                eventCount += 1
-                print("→ [APPROVAL] Event #\(eventCount): \(event)")
-                apply(event: event, profile: profile)
-                if let workerID { updateAgentWorker(for: workerID, event: event) }
+            if let worker = agentWorkers.first(where: { $0.sessionID == sessionID && $0.kind == .main }) {
+                await followDaemonSession(sessionID: sessionID, workerID: worker.id, client: client)
             }
-            print("✅ [APPROVAL] Agent resume completed, received \(eventCount) events")
-
-            refreshGitStatus()
-            finalizeTaskContract(sessionID: sessionID)
         } catch {
-            print("❌ [APPROVAL] Resume failed with error: \(error)")
             statusMessage = "审批恢复失败：\(error.localizedDescription)"
-            _ = try? repository?.appendDurable(sessionID: sessionID, type: "harness_approval_resume_failed", payload: ["approvalID": approvalID, "message": SecretRedactor.redact(error.localizedDescription)])
         }
     }
 
     public func pauseAgent(workerID: String) {
-        guard let worker = agentWorkers.first(where: { $0.id == workerID }), let control = agentRunControls[worker.sessionID] else { return }
+        guard let worker = agentWorkers.first(where: { $0.id == workerID }) else { return }
         agentWorkerRegistry.transition(id: workerID, state: .pausing, detail: "暂停请求已提交；将在安全检查点暂停")
-        try? repository?.append(sessionID: worker.sessionID, type: "agent_worker_pause_requested", payload: ["workerID": workerID])
-        Task { await control.requestPause() }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try await self.daemonClient()
+                _ = try await self.sendDaemon(.sessionPause, payload: DeepSeekDaemonSessionPayload(sessionID: worker.sessionID), client: client)
+            } catch {
+                self.agentWorkerRegistry.transition(id: workerID, state: .needsAttention, detail: "暂停命令未送达", errorMessage: error.localizedDescription)
+            }
+            self.agentWorkers = self.agentWorkerRegistry.records(sessionID: worker.sessionID)
+        }
         agentWorkers = agentWorkerRegistry.records(sessionID: worker.sessionID)
     }
 
     public func resumeAgent(workerID: String) {
         guard let worker = agentWorkers.first(where: { $0.id == workerID }) else { return }
-        if let control = agentRunControls[worker.sessionID] {
-            agentWorkerRegistry.transition(id: workerID, state: .running, detail: "恢复运行")
-            Task { await control.resume() }
-        } else if !worker.prompt.isEmpty {
-            startAgentRun(promptOverride: worker.pendingReply ?? worker.prompt, sessionIDOverride: worker.sessionID)
+        agentWorkerRegistry.transition(id: workerID, state: .running, detail: "恢复运行")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try await self.daemonClient()
+                _ = try await self.sendDaemon(.sessionResume, payload: DeepSeekDaemonSessionPayload(sessionID: worker.sessionID), client: client)
+                if self.agentRunTasks[worker.sessionID] == nil {
+                    self.agentRunTasks[worker.sessionID] = Task { [weak self] in
+                        guard let self else { return }
+                        await self.followDaemonSession(sessionID: worker.sessionID, workerID: workerID, client: client)
+                    }
+                }
+            } catch {
+                self.agentWorkerRegistry.transition(id: workerID, state: .needsAttention, detail: "恢复命令未送达", errorMessage: error.localizedDescription)
+            }
+            self.agentWorkers = self.agentWorkerRegistry.records(sessionID: worker.sessionID)
         }
         agentWorkers = agentWorkerRegistry.records(sessionID: worker.sessionID)
     }
 
     public func stopAgent(workerID: String) {
         guard let worker = agentWorkers.first(where: { $0.id == workerID }) else { return }
-        if let control = agentRunControls[worker.sessionID] { Task { await control.requestStop() } }
         agentWorkerRegistry.transition(id: workerID, state: .stopped, detail: "用户已停止")
-        try? repository?.append(sessionID: worker.sessionID, type: "agent_worker_stop_requested", payload: ["workerID": workerID])
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try await self.daemonClient()
+                _ = try await self.sendDaemon(.sessionCancel, payload: DeepSeekDaemonSessionPayload(sessionID: worker.sessionID), client: client)
+            } catch {
+                self.agentWorkerRegistry.transition(id: workerID, state: .needsAttention, detail: "停止命令未送达", errorMessage: error.localizedDescription)
+            }
+            self.agentWorkers = self.agentWorkerRegistry.records(sessionID: worker.sessionID)
+        }
         agentWorkers = agentWorkerRegistry.records(sessionID: worker.sessionID)
     }
 
@@ -1522,12 +1431,11 @@ public final class WorkspaceStore {
         }
         if request.method == "POST", path.hasPrefix("/v1/workers/"), path.hasSuffix("/adopt") {
             let parts = path.split(separator: "/")
-            guard parts.count >= 4, let coordinator = workerSessionCoordinator,
-                  let result = try? JSONDecoder().decode(WorkerResultEnvelope.self, from: request.body) else {
-                return ControlPlaneResponse(status: 400, body: Data("{\"error\":\"invalid worker result\"}".utf8))
-            }
+            guard parts.count >= 4 else { return ControlPlaneResponse(status: 400, body: Data("{\"error\":\"invalid worker ID\"}".utf8)) }
             do {
-                let worker = try coordinator.adopt(id: String(parts[2]), result: result)
+                let client = try await daemonClient()
+                _ = try await sendDaemon(.workerAdopt, payload: DeepSeekDaemonWorkerPayload(workerSessionID: String(parts[2])), client: client)
+                guard let worker = try repository?.workerSession(id: String(parts[2])) else { throw RepositoryError.sessionNotFound }
                 return ControlPlaneResponse.json(worker)
             } catch {
                 return ControlPlaneResponse(status: 409, body: Data("{\"error\":\"worker evidence could not be adopted\"}".utf8))
@@ -1544,16 +1452,8 @@ public final class WorkspaceStore {
             }
             do {
                 guard let approval = try repository.approval(id: approvalID) else { throw RepositoryError.sessionNotFound }
-                if let harnessDaemon {
-                    try await harnessDaemon.resolveApproval(
-                        sessionID: approval.sessionID,
-                        approvalID: approvalID,
-                        decision: decision
-                    )
-                } else {
-                    try repository.resolveApproval(id: approvalID, decision: decision)
-                    try repository.appendDurable(sessionID: approval.sessionID, type: "approval_resolved", payload: ["approvalID": approvalID, "decision": decision.rawValue])
-                }
+                let client = try await daemonClient()
+                _ = try await sendDaemon(.approvalResolve, payload: DeepSeekDaemonApprovalPayload(sessionID: approval.sessionID, approvalID: approvalID, decision: decision), client: client)
                 return ControlPlaneResponse.json(["ok": "true", "approvalID": approvalID, "decision": decision.rawValue])
             } catch {
                 return ControlPlaneResponse(status: 409, body: Data("{\"error\":\"approval could not be resolved\"}".utf8))
@@ -1569,11 +1469,10 @@ public final class WorkspaceStore {
         }
         if request.method == "POST", path.hasPrefix("/v1/sessions/"), path.hasSuffix("/start") {
             let parts = path.split(separator: "/")
-            guard parts.count >= 4, let harnessDaemon else {
-                return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session supervisor unavailable\"}".utf8))
-            }
+            guard parts.count >= 4 else { return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session not found\"}".utf8)) }
             do {
-                try await harnessDaemon.startSession(String(parts[2]))
+                let client = try await daemonClient()
+                _ = try await sendDaemon(.sessionStart, payload: DeepSeekDaemonSessionPayload(sessionID: String(parts[2])), client: client)
                 return ControlPlaneResponse.json(["ok": "true", "sessionID": String(parts[2]), "state": "started"])
             } catch {
                 return ControlPlaneResponse(status: 409, body: Data("{\"error\":\"session could not start\"}".utf8))
@@ -1581,11 +1480,10 @@ public final class WorkspaceStore {
         }
         if request.method == "POST", path.hasPrefix("/v1/sessions/"), path.hasSuffix("/pause") {
             let parts = path.split(separator: "/")
-            guard parts.count >= 4, let harnessDaemon else {
-                return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session supervisor unavailable\"}".utf8))
-            }
+            guard parts.count >= 4 else { return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session not found\"}".utf8)) }
             do {
-                try await harnessDaemon.pauseSession(String(parts[2]))
+                let client = try await daemonClient()
+                _ = try await sendDaemon(.sessionPause, payload: DeepSeekDaemonSessionPayload(sessionID: String(parts[2])), client: client)
                 return ControlPlaneResponse.json(["ok": "true", "sessionID": String(parts[2]), "state": "paused"])
             } catch {
                 return ControlPlaneResponse(status: 409, body: Data("{\"error\":\"session could not pause\"}".utf8))
@@ -1593,11 +1491,10 @@ public final class WorkspaceStore {
         }
         if request.method == "POST", path.hasPrefix("/v1/sessions/"), path.hasSuffix("/resume") {
             let parts = path.split(separator: "/")
-            guard parts.count >= 4, let harnessDaemon else {
-                return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session supervisor unavailable\"}".utf8))
-            }
+            guard parts.count >= 4 else { return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session not found\"}".utf8)) }
             do {
-                try await harnessDaemon.resumeSession(String(parts[2]))
+                let client = try await daemonClient()
+                _ = try await sendDaemon(.sessionResume, payload: DeepSeekDaemonSessionPayload(sessionID: String(parts[2])), client: client)
                 return ControlPlaneResponse.json(["ok": "true", "sessionID": String(parts[2]), "state": "resumed"])
             } catch {
                 return ControlPlaneResponse(status: 409, body: Data("{\"error\":\"session could not resume\"}".utf8))
@@ -1605,11 +1502,10 @@ public final class WorkspaceStore {
         }
         if request.method == "POST", path.hasPrefix("/v1/sessions/"), path.hasSuffix("/cancel") {
             let parts = path.split(separator: "/")
-            guard parts.count >= 4, let harnessDaemon else {
-                return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session supervisor unavailable\"}".utf8))
-            }
+            guard parts.count >= 4 else { return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session not found\"}".utf8)) }
             do {
-                try await harnessDaemon.cancelSession(String(parts[2]))
+                let client = try await daemonClient()
+                _ = try await sendDaemon(.sessionCancel, payload: DeepSeekDaemonSessionPayload(sessionID: String(parts[2])), client: client)
                 return ControlPlaneResponse.json(["ok": "true", "sessionID": String(parts[2]), "state": "cancelled"])
             } catch {
                 return ControlPlaneResponse(status: 409, body: Data("{\"error\":\"session could not cancel\"}".utf8))
@@ -1617,7 +1513,7 @@ public final class WorkspaceStore {
         }
         if request.method == "POST", path.hasPrefix("/v1/sessions/"), path.hasSuffix("/inputs") {
             let components = path.split(separator: "/")
-            guard components.count >= 4, let repository else {
+            guard components.count >= 4 else {
                 return ControlPlaneResponse(status: 404, body: Data("{\"error\":\"session not found\"}".utf8))
             }
             let sessionID = String(components[2])
@@ -1626,27 +1522,19 @@ public final class WorkspaceStore {
                 return ControlPlaneResponse(status: 400, body: Data("{\"error\":\"text is required\"}".utf8))
             }
             do {
-                let input: SessionInputRecord
-                if let sessionSupervisor {
-                    let receipt = try await sessionSupervisor.admit(SessionInput(
+                let client = try await daemonClient()
+                let response = try await sendDaemon(
+                    .inputAdmit,
+                    payload: DeepSeekDaemonInputPayload(
                         sessionID: sessionID,
-                        idempotencyKey: payload.idempotencyKey ?? UUID().uuidString,
+                        idempotencyKey: payload.idempotencyKey ?? "control-plane-\(UUID().uuidString)",
                         delivery: .deferred,
                         parts: [.text(payload.text)]
-                    ))
-                    guard let admitted = try repository.sessionInputs(sessionID: sessionID).first(where: { $0.id == receipt.inputID }) else {
-                        throw RepositoryError.sessionNotFound
-                    }
-                    input = admitted
-                } else {
-                    input = try repository.enqueueSessionInput(
-                        sessionID: sessionID,
-                        idempotencyKey: payload.idempotencyKey ?? UUID().uuidString,
-                        delivery: .deferred,
-                        parts: [.text(payload.text)]
-                    )
-                }
-                return ControlPlaneResponse.json(input, status: 202)
+                    ),
+                    client: client
+                )
+                let receipt = try DeepSeekDaemonJSON.decoder.decode(AdmissionReceipt.self, from: Data(response.output.utf8))
+                return ControlPlaneResponse.json(receipt, status: 202)
             } catch {
                 return ControlPlaneResponse(status: 409, body: Data("{\"error\":\"input could not be queued\"}".utf8))
             }
@@ -1655,104 +1543,14 @@ public final class WorkspaceStore {
     }
 
     public func runAgent(promptOverride: String? = nil, partsOverride: [ContentPart] = [], sessionIDOverride: String? = nil, workerID: String? = nil, control: AgentRunControl? = nil) async {
-        let userPrompt = (promptOverride ?? prompt).trimmingCharacters(in: .whitespacesAndNewlines)
-        let runSessionID = sessionIDOverride ?? selectedSessionID
-        guard hasActiveSession, !userPrompt.isEmpty else { return }
-        guard let apiKey = loadAPIKey() else {
-            let failureMessage = "请先在 Settings 配置 Base URL 和 API Key"
-            statusMessage = failureMessage
-            conversationTimeline.append(ConversationEntry(kind: .verification, title: "执行失败", text: failureMessage, state: .failed))
-            try? repository?.append(sessionID: runSessionID, type: "agent_failed", payload: ["message": failureMessage])
-            isSettingsPresented = true
-            return
-        }
-        guard let eventStore else {
-            statusMessage = "无法打开本地 Session 事件库"
-            updateSelectedSessionStatus(.failed)
-            return
-        }
-        let profile = currentProfile
-        do {
-            let client = try ProviderClientFactory.make(
-                profile: profile,
-                apiKey: apiKey,
-                attachmentProvider: attachmentStore,
-                networkRuntime: networkRuntime,
-                networkContext: NetworkContext(sessionID: runSessionID, projectID: selectedProjectID, purpose: .providerRequest, requestedBy: "main-agent")
-            )
-            let quickChat = isScratchProject
-            let workspaceHost = quickChat ? nil : try? toolHost()
-            // Quick Chat still uses the same network-capable registry. It has
-            // no workspace write host, but web/MCP/browser-safe capabilities
-            // must not disappear just because no repository is selected.
-            let runtime = makeToolRuntime(workspace: quickChat ? nil : workspaceHost)
-            await prepareMCPRuntime(registry: runtime.registry, router: runtime.router)
-            let host = NativeAgentHost(client: client, eventStore: eventStore, workspace: workspaceHost, repository: repository, projectTrusted: isProjectTrusted, sandboxAvailable: sandboxAvailable, toolRouter: runtime.router, toolRegistry: runtime.registry, hooks: quickChat ? [] : hooks, defaultPricing: profile, networkRuntime: networkRuntime, hookManifest: hookManifest(sessionID: runSessionID))
-            let orchestrator = NativeSessionOrchestrator(host: host)
-            transcript.reset()
-            activityItems = []
-            pendingApproval = nil
-            usageSummary = UsageSummary()
-            statusMessage = mode == .auto && !autoModeAvailable ? "Auto 已降级为受控模式：项目未信任或沙箱不可用" : "Agent 正在执行…"
-            let qualityPlan = TaskQualityPlanner.plan(TaskRoutingInput(
-                prompt: userPrompt,
-                mode: mode,
-                hasAttachments: partsOverride.contains { if case .text = $0 { return false }; return true },
-                hasProject: !quickChat
-            ))
-            let routedModel = DeepSeekModelCatalog.routedModel(preferred: profile.model, route: qualityPlan.route)
-            let modelCapabilities = DeepSeekModelCatalog.capabilities(for: routedModel)
-            let thinking = modelCapabilities.supportsThinking && (qualityPlan.modelTier == .capable || (mode != .plan && userPrompt.count > 180))
-            var instructions = (try? InstructionResolver.resolve(
-                workspaceRoot: URL(fileURLWithPath: activeWorkspacePath, isDirectory: true),
-                workingDirectory: URL(fileURLWithPath: activeWorkspacePath, isDirectory: true)
-            ).text) ?? ""
-            if let skill = SkillRuntime.promptSkill(in: userPrompt, descriptors: discoveredSkills) {
-                instructions += "\n\n[已启用 Skill：\(skill.descriptor.name)]\n\(skill.content)"
-                try? repository?.append(sessionID: runSessionID, type: "skill_invoked", payload: ["skillID": skill.descriptor.id, "path": skill.descriptor.path])
-            }
-            let preparedParts = try await prepareContentParts(partsOverride.isEmpty ? [.text(userPrompt)] : partsOverride, profile: profile)
-            let contract = activeTaskContract ?? (try? repository?.taskContract(sessionID: runSessionID)) ?? TaskContract.compatibility(prompt: userPrompt, budget: sessionBudget)
-            activeTaskContract = contract
-            try? repository?.saveTaskContract(contract, sessionID: runSessionID)
-            try? repository?.append(sessionID: runSessionID, type: "session_status_changed", payload: ["status": SessionStatus.executing.rawValue])
-            let request = AgentRunRequest(sessionID: runSessionID, prompt: userPrompt, parts: preparedParts, budget: contract.budget, mode: mode, model: routedModel, thinking: thinking, instructions: instructions, taskContract: contract, control: control, pricing: profile, target: executionTarget, qualityRoute: qualityPlan.route, qualityPlan: qualityPlan)
-            let extensionRuntime = NativeExtensionRuntime(repository: repository, hooks: hooks)
-            try await extensionRuntime.prepare(sessionID: runSessionID, projectRoot: URL(fileURLWithPath: activeWorkspacePath, isDirectory: true))
-            updateSelectedSessionStatus(.running)
-            if let workerID { agentWorkerRegistry.transition(id: workerID, state: .running, detail: "Agent 正在执行", checkpoint: AgentWorkerCheckpoint(title: "执行中", detail: "\(routedModel)")) }
-            for try await event in orchestrator.run(request) {
-                apply(event: event, profile: profile)
-                if let workerID { updateAgentWorker(for: workerID, event: event) }
-            }
-            await extensionRuntime.finish(sessionID: runSessionID)
-            refreshGitStatus()
-            finalizeTaskContract(sessionID: runSessionID)
-        } catch is CancellationError {
-            if let workerID {
-                let requestedState = await control?.currentState()
-                let stopped = requestedState == .stopRequested || requestedState == .stopped
-                agentWorkerRegistry.transition(id: workerID, state: stopped ? .stopped : .paused, detail: stopped ? "已停止" : "已在安全检查点暂停")
-                try? repository?.append(sessionID: runSessionID, type: stopped ? "agent_worker_stopped" : "agent_worker_paused", payload: ["workerID": workerID])
-            }
-            let finalControlState = await control?.currentState()
-            statusMessage = (finalControlState == .stopRequested || finalControlState == .stopped) ? "Agent 已停止" : "Agent 已暂停"
-        } catch {
-            let failureMessage = error.localizedDescription
-            statusMessage = "Agent 失败：\(failureMessage)"
-            updateSelectedSessionStatus(.failed)
-            conversationTimeline.append(ConversationEntry(kind: .verification, title: "执行失败", text: failureMessage, state: .failed))
-            try? repository?.append(sessionID: runSessionID, type: "agent_failed", payload: ["message": failureMessage])
-            if let workerID { agentWorkerRegistry.transition(id: workerID, state: .failed, detail: "执行失败", errorMessage: failureMessage) }
-        }
-        if let workerID, agentWorkers.contains(where: { $0.id == workerID }), agentWorkerRegistry.records(sessionID: runSessionID).first(where: { $0.id == workerID })?.state == .running {
-            agentWorkerRegistry.transition(id: workerID, state: .completed, detail: "本轮完成")
-        }
-        agentRunTasks[runSessionID] = nil
-        agentRunControls[runSessionID] = nil
-        agentWorkers = agentWorkerRegistry.records(sessionID: runSessionID)
-        transcript.flush()
-        refreshSelectedSession()
+        _ = workerID
+        _ = control
+        let sessionID = sessionIDOverride ?? selectedSessionID
+        let prompt = (promptOverride ?? self.prompt).trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = partsOverride.isEmpty ? [.text(prompt)] : partsOverride
+        guard !sessionID.isEmpty, !parts.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        startDaemonAgentRun(sessionID: sessionID, parts: parts)
+        await agentRunTasks[sessionID]?.value
     }
 
     /// Evaluates delivery from persisted evidence rather than the Agent's final text.
@@ -1796,12 +1594,6 @@ public final class WorkspaceStore {
             statusMessage = "错误：没有待处理的审批"
             return
         }
-        guard let sessionSupervisor else {
-            print("❌ [APPROVAL] sessionSupervisor is nil")
-            statusMessage = "错误：SessionSupervisor 未初始化"
-            return
-        }
-
         print("✅ [APPROVAL] Starting: tool=\(pending.tool), approvalID=\(pending.id), decision=\(decision)")
 
         Task {
@@ -1835,41 +1627,24 @@ public final class WorkspaceStore {
                     }
                 }
                 pendingApproval = nil
-                if isDaemonOwnedSession(selectedSessionID),
-                   let client = try? await daemonClient() {
-                    print("→ [APPROVAL] Using Daemon path")
-                    let payload = DeepSeekDaemonApprovalPayload(
-                        sessionID: selectedSessionID,
-                        approvalID: pending.id,
-                        decision: decision
-                    )
-                    _ = try await sendDaemon(.approvalResolve, payload: payload, client: client)
-                    // followDaemonSession exits when it sees an approval; the
-                    // resolve above resumes the run, so polling must restart
-                    // or the GUI never sees the remaining events.
-                    if let worker = agentWorkers.first(where: { $0.sessionID == selectedSessionID && $0.kind == .main }),
-                       agentRunTasks[selectedSessionID] == nil {
-                        let workerID = worker.id
-                        let sessionID = selectedSessionID
-                        agentRunTasks[sessionID] = Task { [weak self] in
-                            guard let self else { return }
-                            await self.followDaemonSession(sessionID: sessionID, workerID: workerID, client: client)
-                        }
+                let client = try await daemonClient()
+                let payload = DeepSeekDaemonApprovalPayload(
+                    sessionID: selectedSessionID,
+                    approvalID: pending.id,
+                    decision: decision
+                )
+                _ = try await sendDaemon(.approvalResolve, payload: payload, client: client)
+                // `followDaemonSession` intentionally stops at approval. The
+                // resumed command keeps the same daemon owner, so restart
+                // projection polling through that one runtime only.
+                if let worker = agentWorkers.first(where: { $0.sessionID == selectedSessionID && $0.kind == .main }),
+                   agentRunTasks[selectedSessionID] == nil {
+                    let workerID = worker.id
+                    let sessionID = selectedSessionID
+                    agentRunTasks[sessionID] = Task { [weak self] in
+                        guard let self else { return }
+                        await self.followDaemonSession(sessionID: sessionID, workerID: workerID, client: client)
                     }
-                } else {
-                    print("→ [APPROVAL] Using Supervisor path")
-                    // 直接调用恢复逻辑，确保 Agent 能够继续执行
-                    await resumeAgentApprovalForSupervisor(
-                        sessionID: selectedSessionID,
-                        approvalID: pending.id,
-                        decision: decision
-                    )
-                    // 同步更新数据库状态
-                    try? await sessionSupervisor.resolveApproval(
-                        sessionID: selectedSessionID,
-                        approvalID: pending.id,
-                        decision: decision
-                    )
                 }
                 print("✅ [APPROVAL] Completed successfully")
                 statusMessage = "审批已处理，继续执行"
@@ -1878,21 +1653,6 @@ public final class WorkspaceStore {
                 statusMessage = "恢复任务失败：\(error.localizedDescription)"
             }
         }
-    }
-
-    private func isDaemonOwnedSession(_ sessionID: String) -> Bool {
-        let hasLiveDaemonWorker = agentWorkers.contains {
-            $0.sessionID == sessionID &&
-            $0.kind == .main &&
-            ($0.detail.contains("deepseekd") || $0.checkpoint?.detail.contains("本地 daemon") == true)
-        }
-        if hasLiveDaemonWorker { return true }
-        // Worker cards are deliberately ephemeral. After an App relaunch,
-        // recover the runtime owner from the append-only event log so an
-        // outstanding daemon approval never falls back into the foreground
-        // Agent runtime.
-        guard let repository else { return false }
-        return SessionRuntimeOwnership.owner(sessionID: sessionID, repository: repository) == .daemon
     }
 
     private func networkApprovalDetails(for pending: PendingToolApproval) -> (url: URL, capability: NetworkScope, operation: NetworkOperation)? {

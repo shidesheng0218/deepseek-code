@@ -83,7 +83,11 @@ public struct WebSearchRequest: Codable, Equatable, Sendable {
 
     public init(query: String, maxResults: Int = 8, language: String? = nil, region: String? = nil, freshness: SearchFreshness? = nil, providerID: String? = nil) {
         self.query = query
-        self.maxResults = min(20, max(1, maxResults))
+        // The provider may know about more sources, but the model-facing
+        // contract is intentionally bounded. Eight source cards are enough
+        // for a grounded follow-up while preventing one tool call from
+        // flooding the conversation context.
+        self.maxResults = min(8, max(1, maxResults))
         self.language = language
         self.region = region
         self.freshness = freshness
@@ -275,6 +279,9 @@ public protocol SearchProvider: Sendable {
     func search(request: WebSearchRequest, context: NetworkContext) async throws -> WebSearchResponse
     func healthCheck(context: NetworkContext) async -> SearchProviderHealth
 }
+
+/// Product-facing name for the provider-neutral `web_search` seam.
+public typealias WebSearchProvider = SearchProvider
 
 public extension SearchProvider {
     func search(query: String, maxResults: Int) async throws -> [WebSearchResult] {

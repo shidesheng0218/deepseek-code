@@ -83,8 +83,18 @@ public struct WebFetchResponse: Codable, Equatable, Sendable {
     }
 }
 
+/// Provider seam for public, read-only page retrieval. Tool schemas and UI
+/// presentation stay provider-neutral; tests and future providers can supply
+/// deterministic evidence without constructing a live URLSession request.
+public protocol WebFetchProvider: Sendable {
+    func fetch(url: URL, context: NetworkContext) async throws -> WebFetchResponse
+}
+
 public enum WebContentExtractor {
-    public static func extract(data: Data, contentType: String, sourceID: String, sourceURL: String, finalURL: String? = nil, statusCode: Int, maxCharacters: Int = 40_000) throws -> WebFetchResponse {
+    /// The fetch tool may retain enough primary-source context for grounded
+    /// research, while `ContextBuilder` remains responsible for reducing what
+    /// is sent back to the model on later turns.
+    public static func extract(data: Data, contentType: String, sourceID: String, sourceURL: String, finalURL: String? = nil, statusCode: Int, maxCharacters: Int = 200_000) throws -> WebFetchResponse {
         guard data.count <= 2 * 1024 * 1024 else { throw WebFetchError.responseTooLarge }
         let mime = contentType.split(separator: ";", maxSplits: 1).first.map { String($0).lowercased().trimmingCharacters(in: .whitespaces) } ?? ""
         let extracted: (title: String?, text: String, sections: [WebSection])

@@ -99,19 +99,21 @@ public enum TaskRouter {
         let contains = { (values: [String]) in values.contains { lower.contains($0.lowercased()) } }
         let repair = contains(["修复", "报错", "错误", "bug", "fix", "failing", "failure"])
         let review = contains(["review", "审查", "代码审查", "diff"])
-        // Time-sensitive public facts must not fall into the generic direct
-        // answer route. Keep this intentionally bounded: a bare “今天” or
-        // “当前项目” is not a web-research request, while market quotes,
-        // weather, news, sports and exchange rates are.
+        // Time words only become a web-research signal when the prompt also
+        // names a public live-data domain.  A workspace question such as
+        // “当前项目…” must stay local unless the user explicitly asks to
+        // search the web.
+        let localWorkspaceReference = input.hasProject && contains([
+            "当前项目", "这个项目", "该项目", "当前仓库", "这个仓库", "本仓库",
+            "代码库", "工作区", "当前工作区", "this project", "repository", "workspace"
+        ])
+        let explicitResearch = contains(["联网", "官方文档", "搜索", "网页", "资料", "查一下", "查询", "research", "documentation", "web"])
         // A bare domain word ("天气", "股票"…) already implies the user wants
-        // a live/current fact, regardless of tense ("明天"/"下周" are just as
-        // time-sensitive as "今天"). Requiring an extra temporal keyword on
-        // top of the domain word caused common phrasings like "明天天气怎么
-        // 样" to slip into the generic direct-answer route with no tool call.
-        let liveDataDomain = contains(["股市", "股票", "a股", "港股", "美股", "指数", "市场", "汇率", "金价", "油价", "天气", "新闻", "比分", "赛程"])
+        // a live/current fact; avoid generic “市场”, which is commonly used
+        // for non-web product discussions.
+        let liveDataDomain = contains(["股市", "股票", "a股", "港股", "美股", "指数", "汇率", "金价", "油价", "天气", "新闻", "比分", "赛程"])
         let liveDataSignal = contains(["行情", "实时", "价格", "汇率", "比分", "赛程", "天气预报"])
-        let temporalLookup = contains(["最新", "今天", "今日", "当前", "现在", "明天", "明日", "后天", "未来", "下周", "本周", "这周", "周末", "近期"])
-        let research = contains(["联网", "官方文档", "搜索", "网页", "资料", "查一下", "查询", "research", "documentation", "web"]) || liveDataSignal || liveDataDomain || temporalLookup
+        let research = explicitResearch || (!localWorkspaceReference && (liveDataSignal || liveDataDomain))
         // “页面” alone is a normal UI feature request, not a browser-test
         // requirement. Escalate only on an explicit browser/evidence signal.
         let browser = contains(["浏览器", "截图", "dom", "console", "playwright", "browser"])
@@ -125,7 +127,7 @@ public enum TaskRouter {
         var reasons: [String] = []
         if repair { reasons.append("包含修复或错误信号") }
         if research { reasons.append("包含联网研究信号") }
-        if liveDataSignal || temporalLookup { reasons.append("包含时效性公开信息信号") }
+        if (liveDataSignal || liveDataDomain) && !localWorkspaceReference { reasons.append("包含时效性公开信息信号") }
         if browser { reasons.append("包含浏览器验证信号") }
         if delivery { reasons.append("包含交付或 CI 信号") }
         if input.hasAttachments { reasons.append("包含附件") }

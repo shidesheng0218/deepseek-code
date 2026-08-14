@@ -1416,16 +1416,48 @@ public actor NetworkRuntime {
     }
 }
 
+/// Default public-page provider. `NetworkRuntime` retains responsibility for
+/// SSRF, redirect, DNS-rebinding and grant checks; this provider only turns a
+/// validated response into citation-ready evidence.
+public struct NetworkRuntimeWebFetchProvider: WebFetchProvider {
+    public let runtime: NetworkRuntime
+
+    public init(runtime: NetworkRuntime) {
+        self.runtime = runtime
+    }
+
+    public func fetch(url: URL, context: NetworkContext) async throws -> WebFetchResponse {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        request.setValue("DeepSeek Code/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("text/html, application/xhtml+xml, text/plain, application/json, application/pdf", forHTTPHeaderField: "Accept")
+        let (data, response) = try await runtime.data(for: request, scope: .webFetch, context: context, maxBytes: 2 * 1024 * 1024)
+        let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? ""
+        let finalURL = response.url?.absoluteString ?? url.absoluteString
+        let sourceID = "web-source-\(WebEvidenceInspector.sha256(WebSourceNormalizer.canonicalURL(finalURL) ?? finalURL).prefix(16))"
+        return try WebContentExtractor.extract(
+            data: data,
+            contentType: contentType,
+            sourceID: sourceID,
+            sourceURL: url.absoluteString,
+            finalURL: finalURL,
+            statusCode: response.statusCode
+        )
+    }
+}
+
 /// Read-only external web tools. They are registered as L2 network tools, so
 /// the Agent permission broker approves the invocation before this host runs.
 public struct WebToolHost: ToolHost {
     public let runtime: NetworkRuntime
     public let searchProvider: any SearchProvider
     public let searchProviders: [any SearchProvider]
+    public let fetchProvider: any WebFetchProvider
     public let orchestrator: SearchOrchestrator
     public let projectID: String?
 
-    public init(runtime: NetworkRuntime = .shared, searchProvider: (any SearchProvider)? = nil, searchProviders: [any SearchProvider] = [], projectID: String? = nil) {
+    public init(runtime: NetworkRuntime = .shared, searchProvider: (any SearchProvider)? = nil, searchProviders: [any SearchProvider] = [], fetchProvider: (any WebFetchProvider)? = nil, projectID: String? = nil) {
         self.runtime = runtime
         let builtIns: [any SearchProvider] = [
             DuckDuckGoSearchProvider(runtime: runtime),    // 通用搜索 - 主力
@@ -1444,6 +1476,7 @@ public struct WebToolHost: ToolHost {
         }
         self.searchProvider = primary
         self.searchProviders = providers
+        self.fetchProvider = fetchProvider ?? NetworkRuntimeWebFetchProvider(runtime: runtime)
         self.orchestrator = SearchOrchestrator(providers: providers, runtime: runtime)
         self.projectID = projectID
     }
@@ -1555,23 +1588,7 @@ public struct WebToolHost: ToolHost {
     }
 
     private func fetch(url: URL, context: NetworkContext) async throws -> String {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 30
-        request.setValue("DeepSeek Code/1.0", forHTTPHeaderField: "User-Agent")
-        request.setValue("text/html, application/xhtml+xml, text/plain, application/json, application/pdf", forHTTPHeaderField: "Accept")
-        let (data, response) = try await runtime.data(for: request, scope: .webFetch, context: context, maxBytes: 2 * 1024 * 1024)
-        let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? ""
-        let finalURL = response.url?.absoluteString ?? url.absoluteString
-        let sourceID = "web-source-\(WebEvidenceInspector.sha256(WebSourceNormalizer.canonicalURL(finalURL) ?? finalURL).prefix(16))"
-        let extracted = try WebContentExtractor.extract(
-            data: data,
-            contentType: contentType,
-            sourceID: sourceID,
-            sourceURL: url.absoluteString,
-            finalURL: finalURL,
-            statusCode: response.statusCode
-        )
+        let extracted = try await fetchProvider.fetch(url: url, context: context)
         return Self.json([
             "ok": true,
             "sourceID": extracted.sourceID,

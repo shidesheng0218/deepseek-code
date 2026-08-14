@@ -1767,7 +1767,11 @@ struct DeepSeekCodeChecks {
         let webApprovalEvents = try repository.events(sessionID: webApprovalSession.id)
         precondition(webApprovalEvents.contains(where: { $0.type == "tool_started" && $0.payload["tool"] == "web_search" }))
         precondition(webApprovalEvents.contains(where: { $0.type == "tool_completed" && $0.payload["tool"] == "web_search" && $0.payload["ok"] == "true" }))
-        precondition(webSearchRouter.invocationEvents.contains(where: { $0.tool == "web_search" && $0.phase == .completed && $0.succeeded == true }))
+        precondition(webSearchRouter.invocationEvents.isEmpty)
+        let pipelineInvocationRecords = try repository.toolInvocations(sessionID: webApprovalSession.id)
+        precondition(pipelineInvocationRecords.contains(where: {
+            $0.tool == "web_search" && $0.phase == .completed && $0.succeeded == true
+        }))
 
         let silentResearchSession = try repository.createSession(projectID: project.id, title: "已授权联网研究", mode: .acceptEdits)
         _ = await runtime.rememberResearchApproval(sessionID: silentResearchSession.id, projectID: project.id, scope: .session)
@@ -2006,8 +2010,7 @@ struct DeepSeekCodeChecks {
         router.register(host: memoryHost, for: "test.")
         let routedOutput = try await router.execute(tool: tool, argumentsJSON: "{}", sessionID: "s1")
         precondition(routedOutput == "{\"ok\":true}")
-        let invocationEvents = router.invocationEvents
-        precondition(invocationEvents.map(\.phase) == [.requested, .started, .completed])
+        precondition(router.invocationEvents.isEmpty)
         let mcpRegistry = ToolRegistry()
         let mcpManager = DefaultMCPManager(registry: mcpRegistry)
         try await mcpManager.connect(serverID: "docs", transport: StaticMCPTransport(response: "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"search\",\"description\":\"Search docs\",\"inputSchema\":{\"type\":\"object\"}}]}}"))

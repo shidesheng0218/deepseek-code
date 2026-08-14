@@ -106,6 +106,7 @@ public final class NativeAgentHost: @unchecked Sendable {
     private let projectTrusted: Bool
     private let sandboxAvailable: Bool
     private let toolRouter: ToolHostRouter?
+    private let toolPipeline: ToolExecutionPipeline?
     private let toolRegistry: ToolRegistry
     private let hooks: [HookDefinition]
     private let failureInjector: any FailureInjector
@@ -121,6 +122,10 @@ public final class NativeAgentHost: @unchecked Sendable {
         self.projectTrusted = projectTrusted
         self.sandboxAvailable = sandboxAvailable
         self.toolRouter = toolRouter
+        self.toolPipeline = {
+            guard let repository, let toolRouter else { return nil }
+            return ToolExecutionPipeline(repository: repository, router: toolRouter)
+        }()
         self.toolRegistry = toolRegistry ?? AgentToolSchemas.registry
         self.hooks = hooks
         self.failureInjector = failureInjector
@@ -160,13 +165,25 @@ public final class NativeAgentHost: @unchecked Sendable {
             print("❌ [AGENTHOST] No matching pending approval found")
             return failedStream(AgentHostError.approvalUnavailable)
         }
+        if let continuation = pending.continuation,
+           (continuation.approvalID != approvalID
+                || !continuation.matches(
+                    sessionID: sessionID,
+                    callID: pending.toolCallID,
+                    tool: pending.tool,
+                    argumentsJSON: pending.argumentsJSON
+                )) {
+            return failedStream(AgentHostError.approvalContinuationMismatch)
+        }
 
         print("✅ [AGENTHOST] Found pending approval for tool: \(pending.tool)")
 
         return AsyncThrowingStream { continuation in
             Task {
                 do {
-                    try repository.resolveApproval(id: approvalID, decision: decision)
+                    guard try repository.resolvePendingApproval(id: approvalID, decision: decision) else {
+                        throw AgentHostError.approvalAlreadyResolved
+                    }
                     var resumedState = state
                     await persist(sessionID: sessionID, type: "approval_resolved", payload: ["approvalID": approvalID, "decision": decision.rawValue])
                     if decision == .allowOnce || decision == .allowSession {
@@ -180,19 +197,21 @@ public final class NativeAgentHost: @unchecked Sendable {
                         print("→ [AGENTHOST] Executing approved tool: \(pending.tool)")
                         let call = IncrementalToolCall(index: 0, id: pending.toolCallID, name: pending.tool, argumentsJSON: pending.argumentsJSON)
                         switch try await toolExecution(for: call, mode: resumedState.mode, sessionID: sessionID, control: nil, workerKind: .main, approvedByUser: true) {
-                        case let .completed(value, succeeded):
+                        case let .completed(value, succeeded, finalizedByPipeline):
                             print("→ [AGENTHOST] Tool execution completed: succeeded=\(succeeded)")
                             output = value
                             await persistBrowserEvidenceIfAvailable(output: value, call: call, sessionID: sessionID)
                             await persistWebEvidenceIfAvailable(output: value, call: call, sessionID: sessionID)
-                            await persist(sessionID: sessionID, type: "tool_completed", payload: toolCompletionPayload(call: call, output: value, succeeded: succeeded))
-                            await persist(sessionID: sessionID, type: "evidence_recorded", payload: [
-                                "id": UUID().uuidString,
-                                "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
-                                "title": evidenceTitle(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
-                                "detail": succeeded ? "已批准工具执行成功" : "已批准工具执行失败",
-                                "succeeded": succeeded ? "true" : "false"
-                            ])
+                            if !finalizedByPipeline {
+                                await persist(sessionID: sessionID, type: "tool_completed", payload: toolCompletionPayload(call: call, output: value, succeeded: succeeded))
+                                await persist(sessionID: sessionID, type: "evidence_recorded", payload: [
+                                    "id": UUID().uuidString,
+                                    "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
+                                    "title": evidenceTitle(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
+                                    "detail": succeeded ? "已批准工具执行成功" : "已批准工具执行失败",
+                                    "succeeded": succeeded ? "true" : "false"
+                                ])
+                            }
                         case let .blocked(value, risk):
                             print("⚠️ [AGENTHOST] Tool execution blocked: risk=\(risk)")
                             output = value
@@ -454,21 +473,23 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 for (call, execution) in results {
                                     continuation.yield(.toolRequested(name: call.name))
                                     switch execution {
-                                    case let .completed(output, succeeded):
+                                    case let .completed(output, succeeded, finalizedByPipeline):
                                         messages.append(ChatMessage(role: "tool", content: output, toolCallID: call.id))
                                         await persistBrowserEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                         await persistWebEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                         continuation.yield(.toolCompleted(name: call.name, succeeded: succeeded))
-                                        var completionPayload = toolCompletionPayload(call: call, output: output, succeeded: succeeded)
-                                        completionPayload["parallel"] = "true"
-                                        await persist(sessionID: request.sessionID, type: "tool_completed", payload: completionPayload)
-                                        await persist(sessionID: request.sessionID, type: "evidence_recorded", payload: [
-                                            "id": UUID().uuidString,
-                                            "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
-                                            "title": evidenceTitle(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
-                                            "detail": succeeded ? "并行只读工具执行成功" : "并行只读工具执行失败",
-                                            "succeeded": succeeded ? "true" : "false"
-                                        ])
+                                        if !finalizedByPipeline {
+                                            var completionPayload = toolCompletionPayload(call: call, output: output, succeeded: succeeded)
+                                            completionPayload["parallel"] = "true"
+                                            await persist(sessionID: request.sessionID, type: "tool_completed", payload: completionPayload)
+                                            await persist(sessionID: request.sessionID, type: "evidence_recorded", payload: [
+                                                "id": UUID().uuidString,
+                                                "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
+                                                "title": evidenceTitle(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
+                                                "detail": succeeded ? "并行只读工具执行成功" : "并行只读工具执行失败",
+                                                "succeeded": succeeded ? "true" : "false"
+                                            ])
+                                        }
                                     case let .blocked(output, risk):
                                         messages.append(ChatMessage(role: "tool", content: output, toolCallID: call.id))
                                         continuation.yield(.toolCompleted(name: call.name, succeeded: false))
@@ -486,26 +507,52 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 invokedTool = true
                                 continuation.yield(.toolRequested(name: call.name))
                                 switch try await toolExecution(for: call, mode: request.mode, sessionID: request.sessionID, control: request.control, workerKind: request.workerKind, qualityPlan: qualityPlan, evidence: QualityEvidenceState.from(messages: messages)) {
-                                case let .completed(output, succeeded):
+                                case let .completed(output, succeeded, finalizedByPipeline):
                                     messages.append(ChatMessage(role: "tool", content: output, toolCallID: call.id))
                                     await persistBrowserEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                     await persistWebEvidenceIfAvailable(output: output, call: call, sessionID: request.sessionID)
                                     continuation.yield(.toolCompleted(name: call.name, succeeded: succeeded))
-                                    await persist(sessionID: request.sessionID, type: "tool_completed", payload: toolCompletionPayload(call: call, output: output, succeeded: succeeded))
-                                    await persist(sessionID: request.sessionID, type: "evidence_recorded", payload: [
-                                        "id": UUID().uuidString,
-                                        "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
-                                        "title": evidenceTitle(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
-                                        "detail": succeeded ? "工具执行成功" : "工具执行失败",
-                                        "succeeded": succeeded ? "true" : "false"
-                                    ])
+                                    if !finalizedByPipeline {
+                                        await persist(sessionID: request.sessionID, type: "tool_completed", payload: toolCompletionPayload(call: call, output: output, succeeded: succeeded))
+                                        await persist(sessionID: request.sessionID, type: "evidence_recorded", payload: [
+                                            "id": UUID().uuidString,
+                                            "kind": evidenceKind(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
+                                            "title": evidenceTitle(for: canonicalToolName(for: call.name), argumentsJSON: call.argumentsJSON),
+                                            "detail": succeeded ? "工具执行成功" : "工具执行失败",
+                                            "succeeded": succeeded ? "true" : "false"
+                                        ])
+                                    }
                                 case let .approvalRequired(risk):
                                     let approvalID = (try? repository?.createApproval(sessionID: request.sessionID, tool: call.name, risk: risk, arguments: call.argumentsJSON))??.id ?? UUID().uuidString
-                                    runState.requestApproval(approvalID: approvalID, toolCallID: call.id, tool: call.name, argumentsJSON: call.argumentsJSON)
+                                    let commandID = "tool-\(request.sessionID)-\(call.id)"
+                                    runState.requestApproval(
+                                        approvalID: approvalID,
+                                        commandID: commandID,
+                                        toolCallID: call.id,
+                                        tool: call.name,
+                                        argumentsJSON: call.argumentsJSON,
+                                        risk: risk
+                                    )
                                     runState.messages = messages
                                     try? repository?.saveRunState(runState)
                                     continuation.yield(.approvalRequired(tool: call.name, risk: risk))
-                                    await persist(sessionID: request.sessionID, type: "approval_requested", payload: ["approvalID": approvalID, "tool": call.name, "callID": call.id, "risk": "L\(risk.rawValue)"])
+                                    let argumentsHash = runState.pendingApproval?.continuation?.argumentsHash ?? ApprovalContinuation.hash(call.argumentsJSON)
+                                    await persist(sessionID: request.sessionID, type: "approval_requested", payload: [
+                                        "approvalID": approvalID,
+                                        "tool": call.name,
+                                        "callID": call.id,
+                                        "risk": "L\(risk.rawValue)",
+                                        "commandID": commandID,
+                                        "argumentsHash": argumentsHash
+                                    ])
+                                    await persist(sessionID: request.sessionID, type: "approval_continuation_recorded", payload: [
+                                        "approvalID": approvalID,
+                                        "commandID": commandID,
+                                        "callID": call.id,
+                                        "tool": call.name,
+                                        "argumentsHash": argumentsHash,
+                                        "checkpoint": "tool_execution"
+                                    ])
                                     await eventWriter.flush()
                                     continuation.finish()
                                     return
@@ -708,7 +755,7 @@ public final class NativeAgentHost: @unchecked Sendable {
     }
 
     private enum ToolExecution: Sendable {
-        case completed(output: String, succeeded: Bool)
+        case completed(output: String, succeeded: Bool, finalizedByPipeline: Bool = false)
         case approvalRequired(CommandRisk)
         case blocked(output: String, risk: CommandRisk)
     }
@@ -724,11 +771,27 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func toolExecution(for call: IncrementalToolCall, mode: AgentMode, sessionID: String, control: AgentRunControl?, workerKind: AgentWorkerKind = .main, approvedByUser: Bool = false, qualityPlan: TaskQualityPlan? = nil, evidence: QualityEvidenceState = QualityEvidenceState()) async throws -> ToolExecution {
         try await control?.waitUntilRunnable()
-        await persist(sessionID: sessionID, type: "tool_requested", payload: [
-            "tool": call.name,
-            "callID": call.id,
-            "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"
-        ])
+        let registered = toolRegistry.tool(named: call.name)
+        let pipelineContext = registered.map {
+            ToolInvocationContext(
+                sessionID: sessionID,
+                commandID: "tool-\(sessionID)-\(call.id)",
+                callID: call.id,
+                tool: $0,
+                argumentsJSON: call.argumentsJSON,
+                workerID: workerKind == .main ? nil : workerKind.rawValue,
+                projectID: projectID(for: sessionID)
+            )
+        }
+        if let toolPipeline, let pipelineContext {
+            try toolPipeline.begin(pipelineContext)
+        } else {
+            await persist(sessionID: sessionID, type: "tool_requested", payload: [
+                "tool": call.name,
+                "callID": call.id,
+                "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"
+            ])
+        }
         let researchCapability = webReadCapability(for: call.name)
         let researchURL = researchURL(for: call)
         let researchReadAuthorized: Bool
@@ -762,8 +825,6 @@ public final class NativeAgentHost: @unchecked Sendable {
                     "requiredEvidence": kinds.map(\.rawValue).joined(separator: ",")
                 ])
                 return .completed(output: json(["ok": false, "code": "EVIDENCE_REQUIRED", "message": "请先搜索、抓取并记录可引用 Evidence" ]), succeeded: false)
-            case .answerWithoutTool:
-                return .completed(output: json(["ok": false, "code": "DIRECT_ANSWER_PATH", "message": "当前任务应直接回答，无需调用工具" ]), succeeded: false)
             case let .requestApproval(risk):
                 if !researchReadAuthorized { return .approvalRequired(risk) }
             case let .blocked(reason):
@@ -788,7 +849,6 @@ public final class NativeAgentHost: @unchecked Sendable {
         }
         switch permissionDecision {
         case .allow:
-            await persist(sessionID: sessionID, type: "tool_started", payload: ["tool": call.name, "callID": call.id, "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"])
             try await inject(.afterToolStarted, sessionID: sessionID, tool: call.name)
             let canonicalName = canonicalToolName(for: call.name)
             if canonicalName == "web_search" || canonicalName == "web_fetch" || canonicalName.hasPrefix("web.") || canonicalName.hasPrefix("github.") || canonicalName.hasPrefix("mcp.") || canonicalName.hasPrefix("browser.") {
@@ -796,17 +856,30 @@ public final class NativeAgentHost: @unchecked Sendable {
             }
             do {
                 let output: String
-                if let toolRouter, let registered = toolRegistry.tool(named: call.name) {
+                let finalizedByPipeline: Bool
+                let succeeded: Bool
+                if let toolPipeline, let pipelineContext {
+                    let result = try await toolPipeline.executeAuthorized(pipelineContext)
+                    output = result.output
+                    succeeded = result.succeeded
+                    finalizedByPipeline = true
+                } else if let toolRouter, let registered {
+                    await persist(sessionID: sessionID, type: "tool_started", payload: ["tool": call.name, "callID": call.id, "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"])
                     output = try await toolRouter.execute(tool: registered, argumentsJSON: call.argumentsJSON, sessionID: sessionID)
+                    succeeded = true
+                    finalizedByPipeline = false
                 } else {
+                    await persist(sessionID: sessionID, type: "tool_started", payload: ["tool": call.name, "callID": call.id, "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"])
                     output = try executeTool(name: call.name, argumentsJSON: call.argumentsJSON)
+                    succeeded = true
+                    finalizedByPipeline = false
                 }
                 if call.name == "apply_patch" {
                     try await inject(.afterPatchApplied, sessionID: sessionID, tool: call.name)
                 } else if canonicalName.hasPrefix("browser.") {
                     try await inject(.afterBrowserAction, sessionID: sessionID, tool: call.name)
                 }
-                return .completed(output: output, succeeded: true)
+                return .completed(output: output, succeeded: succeeded, finalizedByPipeline: finalizedByPipeline)
             } catch {
                 return .completed(output: json(["ok": false, "error": error.localizedDescription]), succeeded: false)
             }
@@ -846,7 +919,6 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func qualityDecisionName(_ decision: ToolDecision) -> String {
         switch decision {
-        case .answerWithoutTool: "answerWithoutTool"
         case .execute: "execute"
         case .requestApproval: "requestApproval"
         case .gatherEvidence: "gatherEvidence"
@@ -1305,6 +1377,8 @@ private enum ToolPermission {
     case maxTurnsExceeded
     case budgetExceeded(String)
     case approvalUnavailable
+    case approvalAlreadyResolved
+    case approvalContinuationMismatch
     case failureInjected(FailureInjectionPoint)
 
     public var errorDescription: String? {
@@ -1314,6 +1388,8 @@ private enum ToolPermission {
         case .maxTurnsExceeded: "Agent 超过最大工具轮次"
         case let .budgetExceeded(message): message
         case .approvalUnavailable: "找不到可恢复的审批状态"
+        case .approvalAlreadyResolved: "该审批已经处理，原工具调用不会重复执行"
+        case .approvalContinuationMismatch: "审批恢复记录与原始工具调用不匹配，已安全停止"
         case let .failureInjected(point): "故障注入：\(point.rawValue)"
         }
     }

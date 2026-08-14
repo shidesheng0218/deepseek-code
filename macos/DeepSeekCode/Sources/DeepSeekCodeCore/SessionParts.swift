@@ -162,16 +162,17 @@ public enum SessionPartProjector {
             case "tool_requested", "tool_started", "tool_completed", "tool_failed", "tool_blocked", "tool_indeterminate":
                 let callID = payload["callID"] ?? "event-\(eventID(event))"
                 let tool = payload["tool"] ?? "工具"
+                let presentation = ToolPresentationResolver.presentation(for: tool)
                 let index = toolIndexes[callID]
                 switch event.type {
                 case "tool_requested":
-                    appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .waiting, title: tool, text: "等待执行", toolCallID: callID)
+                    appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .waiting, title: presentation.title, text: presentation.pendingDetail, toolCallID: callID)
                     toolIndexes[callID] = parts.indices.last
                 case "tool_started":
                     if let index {
-                        updatePart(index, event: event, state: .running, text: "执行中")
+                        updatePart(index, event: event, state: .running, text: presentation.runningDetail)
                     } else {
-                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .running, title: tool, text: "执行中", toolCallID: callID)
+                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .running, title: presentation.title, text: presentation.runningDetail, toolCallID: callID)
                         toolIndexes[callID] = parts.indices.last
                     }
                 case "tool_completed":
@@ -179,7 +180,7 @@ public enum SessionPartProjector {
                     let state: SessionPartState = succeeded ? .completed : .failed
                     let text: String
                     if succeeded {
-                        text = "已完成"
+                        text = presentation.completedDetail
                     } else {
                         // The durable completion event carries a redacted,
                         // user-actionable message for expected failures such
@@ -194,21 +195,21 @@ public enum SessionPartProjector {
                     if let index {
                         updatePart(index, event: event, state: state, text: text, evidenceID: payload["evidenceID"])
                     } else {
-                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: state, title: tool, text: text, toolCallID: callID)
+                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: state, title: presentation.title, text: text, toolCallID: callID)
                         toolIndexes[callID] = parts.indices.last
                     }
                 case "tool_indeterminate":
                     if let index {
                         updatePart(index, event: event, state: .indeterminate, text: payload["reason"] ?? "执行结果未知")
                     } else {
-                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .indeterminate, title: tool, text: payload["reason"] ?? "执行结果未知", toolCallID: callID)
+                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .indeterminate, title: presentation.title, text: payload["reason"] ?? "执行结果未知", toolCallID: callID)
                         toolIndexes[callID] = parts.indices.last
                     }
                 default:
                     if let index {
                         updatePart(index, event: event, state: .failed, text: event.type == "tool_blocked" ? "已被权限策略阻止" : "执行失败")
                     } else {
-                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .failed, title: tool, text: event.type == "tool_blocked" ? "已被权限策略阻止" : "执行失败", toolCallID: callID)
+                        appendPart(id: "tool-\(callID)", event: event, kind: .toolCall, state: .failed, title: presentation.title, text: event.type == "tool_blocked" ? "已被权限策略阻止" : "执行失败", toolCallID: callID)
                         toolIndexes[callID] = parts.indices.last
                     }
                 }
