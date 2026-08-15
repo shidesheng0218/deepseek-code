@@ -996,7 +996,7 @@ public final class SessionRepository: @unchecked Sendable {
         commandID: String = UUID().uuidString,
         causationID: String? = nil,
         correlationID: String? = nil,
-        schemaVersion: Int = 1
+        schemaVersion: Int = SessionEventEnvelope.currentSchemaVersion
     ) throws -> SessionEvent {
         let result = try withLock {
             let existing = try query(

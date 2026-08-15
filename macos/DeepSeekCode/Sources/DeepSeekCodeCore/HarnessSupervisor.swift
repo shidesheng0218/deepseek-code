@@ -63,7 +63,82 @@ public struct RecoveryResult: Codable, Equatable, Sendable {
     }
 }
 
+/// A versioned, Supervisor-owned mutation request used by thin GUI/CLI
+/// clients for durable projections that are not part of a model turn (for
+/// example a user-attached terminal or a worktree handoff).  The transport
+/// never receives repository access: deepseekd forwards this request to the
+/// single SessionSupervisor actor.
+public enum SessionRuntimeMutationKind: String, Codable, Sendable {
+    case event
+    case createHandoff
+    case saveHandoffFiles
+    case updateHandoff
+    case saveTerminalSession
+    case saveTerminalProcess
+    case saveTerminalPort
+    case appendTerminalEvent
+    case appendTerminalHistory
+    case updateWorktreeBinding
+    case saveWorktree
+}
+
+public struct SessionRuntimeMutation: Codable, Equatable, Sendable {
+    public let kind: SessionRuntimeMutationKind
+    public let sessionID: String
+    public let commandID: String
+    /// Canonical JSON for the explicitly selected mutation kind. Keeping the
+    /// payload opaque at the IPC boundary avoids exposing repository types to
+    /// UI clients while still allowing each mutation to be schema checked by
+    /// the Supervisor.
+    public let payloadJSON: String
+
+    public init(kind: SessionRuntimeMutationKind, sessionID: String, commandID: String = UUID().uuidString, payloadJSON: String) {
+        self.kind = kind
+        self.sessionID = sessionID
+        self.commandID = commandID
+        self.payloadJSON = payloadJSON
+    }
+}
+
+/// Creation input accepted only by the durable Supervisor. The GUI/CLI may
+/// prepare a local Worktree path, but only this Runtime transition creates the
+/// Project/Session/TaskContract records and their audit events.
+public struct SessionCreationRequest: Codable, Equatable, Sendable {
+    public let projectPath: String
+    public let projectName: String?
+    public let title: String
+    public let mode: AgentMode
+    public let target: SessionTarget
+    public let branch: String
+    public let worktreePath: String?
+    public let baselineRevision: String?
+    public let budget: SessionBudget
+
+    public init(
+        projectPath: String,
+        projectName: String? = nil,
+        title: String,
+        mode: AgentMode = .acceptEdits,
+        target: SessionTarget = .local,
+        branch: String = "",
+        worktreePath: String? = nil,
+        baselineRevision: String? = nil,
+        budget: SessionBudget = SessionBudget()
+    ) {
+        self.projectPath = projectPath
+        self.projectName = projectName
+        self.title = title
+        self.mode = mode
+        self.target = target
+        self.branch = branch
+        self.worktreePath = worktreePath
+        self.baselineRevision = baselineRevision
+        self.budget = budget
+    }
+}
+
 public protocol DurableSessionSupervisor: Sendable {
+    func createSession(_ request: SessionCreationRequest, commandID: String) async throws -> StoredSession
     func admit(_ input: SessionInput) async throws -> AdmissionReceipt
     func start(sessionID: String) async throws
     func pause(sessionID: String) async throws
@@ -74,6 +149,10 @@ public protocol DurableSessionSupervisor: Sendable {
     func cancel(sessionID: String) async throws
     func recover(sessionID: String) async throws -> RecoveryResult
     func evaluateDelivery(sessionID: String) async throws -> DeliveryGateResult
+    func applyRuntimeMutation(_ mutation: SessionRuntimeMutation) async throws -> String
+    func recordRuntimeEvent(sessionID: String, type: String, payload: [String: String], commandID: String, causationID: String?, correlationID: String?) async throws
+    func persistRunState(_ state: AgentRunState) async throws
+    func consumeDirectTerminalApproval(sessionID: String, approvalID: String?, risk: CommandRisk, commandHash: String) async throws -> Bool
 }
 
 public enum HarnessSupervisorError: LocalizedError, Sendable {

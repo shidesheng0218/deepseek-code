@@ -110,6 +110,54 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(!workspaceStoreSource.contains("repository.resolveApproval("))
         precondition(!workspaceStoreSource.contains("repository?.createApproval("))
         precondition(!daemonIPCSource.contains("repository.resolveApproval("))
+        precondition(!daemonIPCSource.contains("repository.createSession("))
+        precondition(!daemonIPCSource.contains("repository.createApproval("))
+        let agentHostSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/DeepSeekCodeCore/AgentHost.swift"),
+            encoding: .utf8
+        )
+        precondition(!agentHostSource.contains("repository?.createApproval("))
+        precondition(!agentHostSource.contains("toolRouter.execute("))
+        precondition(!agentHostSource.contains("executeTool(name:"))
+        precondition(workspaceStoreSource.contains("DaemonExecutionEligibility.isEligible("))
+        precondition(!workspaceStoreSource.contains("repository.append(sessionID: sessionID, type: \"verification_gate_evaluated\""))
+        precondition(!workspaceStoreSource.contains("repository.append(sessionID: sessionID, type: \"session_status_changed\""))
+        precondition(!workspaceStoreSource.contains("SessionSupervisor(repository: repository)"))
+        precondition(!workspaceStoreSource.contains("LocalHarnessDaemon("))
+        // Runtime 3 has one writable owner. The GUI is a projection/client;
+        // it must never mutate handoff, terminal, evidence, or event tables
+        // behind deepseekd's back.
+        let forbiddenWorkspaceWrites = [
+            "repository.append(",
+            "repository?.append(",
+            "repository.appendDurable(",
+            "repository?.appendDurable(",
+            "repository.createHandoff(",
+            "repository.updateHandoff(",
+            "repository.saveHandoffFiles(",
+            "repository.saveTerminalSession(",
+            "repository?.saveTerminalSession(",
+            "repository.saveTerminalProcess(",
+            "repository?.saveTerminalProcess(",
+            "repository.saveTerminalPort(",
+            "repository?.saveTerminalPort(",
+            "repository.appendTerminalEvent(",
+            "repository?.appendTerminalEvent(",
+            "repository.appendTerminalCommandHistory(",
+            "repository?.appendTerminalCommandHistory(",
+            "repository.saveWorktree("
+        ]
+        precondition(forbiddenWorkspaceWrites.allSatisfy { !workspaceStoreSource.contains($0) })
+        // NativeAgentHost remains an adapter. Run-state and durable event
+        // persistence must be mediated by SessionSupervisor rather than a
+        // second repository writer embedded in the model loop.
+        precondition(!agentHostSource.contains("repository.saveRunState("))
+        precondition(!agentHostSource.contains("repository?.saveRunState("))
+        precondition(!agentHostSource.contains("repository.appendDurable("))
+        // The daemon routes direct-terminal lifecycle events through its
+        // Supervisor too; it may transport requests, but not append a second
+        // terminal timeline directly.
+        precondition(!daemonIPCSource.contains("SessionEventCommitter(repository: repository).commit"))
         precondition(WorkspaceTypography.microSize >= 10)
         precondition(WorkspaceTypography.metaSize >= 12)
         precondition(WorkspaceTypography.bodySize >= 14)
@@ -339,6 +387,14 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(replayedProtocolEvents[0].causationID == "runtime3-input")
         precondition(replayedProtocolEvents[0].correlationID == "runtime3-turn")
         precondition(replayedProtocolEvents[0].schemaVersion == SessionEventEnvelope.currentSchemaVersion)
+        _ = try repository.appendDurable(
+            sessionID: protocolSession.id,
+            type: "legacy_call_promoted_to_runtime3",
+            payload: [:],
+            commandID: "runtime3-default-schema"
+        )
+        let defaultSchemaEvent = try repository.eventEnvelope(commandID: "runtime3-default-schema")
+        precondition(defaultSchemaEvent?.schemaVersion == SessionEventEnvelope.currentSchemaVersion)
 
         let commandEnvelope = SessionCommandEnvelope(
             commandID: "runtime3-start-command",
@@ -472,15 +528,19 @@ struct DeepSeekCodeRuntimeV2Checks {
         let mcpPipeline = ToolExecutionPipeline(repository: repository, router: mcpRouter)
         let mcpManager = DefaultMCPManager(registry: mcpRegistry, router: mcpRouter, pipeline: mcpPipeline)
         try await mcpManager.connect(serverID: "fixture", transport: RuntimeV2RoutingMCPTransport())
-        let mcpOutput = try await mcpManager.call(
+        let mcpTool = try unwrap(mcpRegistry.tool(named: "mcp.fixture.lookup"))
+        let mcpResult = try await mcpManager.call(MCPToolInvocation(
             serverID: "fixture",
             tool: "lookup",
-            argumentsJSON: "{\"topic\":\"pipeline\"}",
-            sessionID: mcpPipelineSession.id,
-            commandID: "mcp-pipeline-command",
-            callID: "mcp-pipeline-call"
-        )
-        precondition(mcpOutput.contains("mcp-pipeline"))
+            context: ToolInvocationContext(
+                sessionID: mcpPipelineSession.id,
+                commandID: "mcp-pipeline-command",
+                callID: "mcp-pipeline-call",
+                tool: mcpTool,
+                argumentsJSON: "{\"topic\":\"pipeline\"}"
+            )
+        ))
+        precondition(mcpResult.output.contains("mcp-pipeline"))
         let mcpPipelineEvents = try repository.events(sessionID: mcpPipelineSession.id)
         precondition(mcpPipelineEvents.map(\.type).suffix(4) == ["tool_requested", "tool_started", "evidence_recorded", "tool_completed"])
         precondition(mcpPipelineEvents.suffix(4).allSatisfy { $0.payload["tool"] == "mcp.fixture.lookup" || $0.type == "evidence_recorded" })

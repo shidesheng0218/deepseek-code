@@ -202,7 +202,14 @@ struct DeepSeekCodeCLI {
                 FileHandle.standardError.write(Data("需要审批：\(approval.approvalID)（L\(approval.risk.rawValue)）\n".utf8))
                 return
             }
-            guard response.ok else { throw CLIError.command(response.output) }
+            // CLI users need a machine-readable failure class for retry and
+            // automation. The GUI keeps these details in Inspector, but the
+            // terminal surface may safely expose the daemon code alongside
+            // the redacted, user-facing explanation.
+            guard response.ok else {
+                let code = response.code ?? "COMMAND_FAILED"
+                throw CLIError.command("\(code): \(response.output)")
+            }
             print(response.output)
         case "list":
             guard command.count == 2 else { throw CLIError.invalidUsage("用法：deepseek terminal list <session-id>") }

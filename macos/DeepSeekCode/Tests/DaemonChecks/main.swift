@@ -71,6 +71,22 @@ struct DeepSeekCodeDaemonChecks {
         let streamedEvents = try decode([SessionEvent].self, from: eventResponse.output)
         precondition(streamedEvents.contains { $0.payload["text"] == "event stream" })
 
+        // GUI projection mutations are Supervisor commands, not repository
+        // writes. Retrying the same mutation must return the original receipt
+        // and produce exactly one durable event.
+        let mutation = SessionRuntimeMutation(
+            kind: .event,
+            sessionID: createdSession.id,
+            commandID: "daemon-runtime-mutation-1",
+            payloadJSON: "{\"type\":\"projection_fixture\",\"payload\":{\"value\":\"one\"}}"
+        )
+        let mutationRequest = DeepSeekDaemonRequest(method: .runtimeMutate, payload: try encode(mutation))
+        let firstMutation = await router.handle(mutationRequest)
+        let repeatedMutation = await router.handle(mutationRequest)
+        precondition(firstMutation.ok && repeatedMutation.ok)
+        let mutationEvents = try repository.events(sessionID: createdSession.id)
+        precondition(mutationEvents.filter { $0.type == "projection_fixture" }.count == 1)
+
         let inputPayload = DeepSeekDaemonInputPayload(
             sessionID: session.id,
             idempotencyKey: "daemon-input-1",

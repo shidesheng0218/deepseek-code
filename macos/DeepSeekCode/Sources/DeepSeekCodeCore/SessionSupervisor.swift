@@ -80,6 +80,79 @@ public actor SessionSupervisor: DurableSessionSupervisor {
         return CommandReceipt(commandID: command.commandID, sessionID: sessionID, acceptedSequence: acceptedSequence, state: .completed)
     }
 
+    /// The only Runtime-owned Project/Session creation transition. Its command
+    /// ID is durable, so a reconnecting GUI/CLI request receives the original
+    /// Session instead of creating another branch, worktree binding or task
+    /// contract.
+    public func createSession(_ request: SessionCreationRequest, commandID: String) throws -> StoredSession {
+        let eventCommandID = "supervisor-session-create-\(commandID)"
+        if let existing = try repository.eventEnvelope(commandID: eventCommandID),
+           let sessionID = existing.payload["sessionID"],
+           let session = try repository.session(id: sessionID) {
+            return session
+        }
+        let projectPath = URL(fileURLWithPath: request.projectPath, isDirectory: true).standardizedFileURL.path
+        let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedProjectName = request.projectName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let project = try repository.project(path: projectPath)
+            ?? repository.createProject(
+                name: requestedProjectName?.isEmpty == false
+                    ? requestedProjectName!
+                    : URL(fileURLWithPath: projectPath).lastPathComponent,
+                path: projectPath
+            )
+        let branch = request.branch.isEmpty
+            ? (request.target == .local ? "main" : "deepseek/\(sessionBranchSlug(title))")
+            : request.branch
+        let session = try repository.createSession(
+            projectID: project.id,
+            title: title.isEmpty ? "新建对话" : title,
+            mode: request.mode,
+            target: request.target,
+            branch: branch,
+            worktreePath: request.worktreePath,
+            baselineRevision: request.baselineRevision
+        )
+        let contract = TaskContract.compatibility(prompt: session.title, budget: request.budget)
+        try repository.saveTaskContract(contract, sessionID: session.id)
+        if request.target == .worktree,
+           let worktreePath = request.worktreePath,
+           let baselineRevision = request.baselineRevision {
+            try repository.saveWorktree(WorktreeRecord(
+                sessionID: session.id,
+                baseRevision: baselineRevision,
+                branch: branch,
+                worktreePath: worktreePath
+            ))
+        }
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: session.id,
+            commandID: eventCommandID,
+            causationID: commandID,
+            correlationID: commandID,
+            kind: SessionEventKind(rawValue: "session_created"),
+            payload: [
+                "sessionID": session.id,
+                "projectID": project.id,
+                "target": request.target.rawValue,
+                "branch": branch
+            ]
+        ))
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: session.id,
+            commandID: "\(eventCommandID)-task-contract",
+            causationID: commandID,
+            correlationID: commandID,
+            kind: SessionEventKind(rawValue: "task_contract_created"),
+            payload: [
+                "goal": contract.goal,
+                "requiredChanges": "\(contract.requiredChanges.count)",
+                "requiredTests": "\(contract.requiredTests.count)"
+            ]
+        ))
+        return session
+    }
+
     public func admit(_ input: SessionInput) throws -> AdmissionReceipt {
         guard try repository.session(id: input.sessionID) != nil else {
             throw HarnessSupervisorError.sessionNotFound
@@ -305,21 +378,227 @@ public actor SessionSupervisor: DurableSessionSupervisor {
         let indeterminate = events.filter { event in
             ["tool_indeterminate", "ssh_tool_indeterminate", "mcp_tool_indeterminate", "github_indeterminate", "github_push_indeterminate", "github_pr_indeterminate"].contains(event.type)
         }.count
-        let result = DeliveryGate.evaluate(contract: contract, graph: graph, hasDiff: hasDiff, pendingApprovals: max(0, pending), indeterminateSideEffects: indeterminate)
+        let findings: [ReviewFinding]
+        if let review = events.last(where: { $0.type == "review_completed" }),
+           let data = review.payload["findings"]?.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([ReviewFinding].self, from: data) {
+            findings = decoded
+        } else {
+            findings = []
+        }
+        let result = DeliveryGate.evaluate(
+            contract: contract,
+            graph: graph,
+            hasDiff: hasDiff,
+            pendingApprovals: max(0, pending),
+            indeterminateSideEffects: indeterminate,
+            reviewFindings: findings
+        )
         let trace = DeliveryTrace.project(sessionID: sessionID, events: events)
         let traceJSON = (try? JSONEncoder().encode(trace)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        _ = try repository.appendDurable(
-            sessionID: sessionID,
-            type: "verification_gate_evaluated",
+        let resultJSON = (try? JSONEncoder().encode(result)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: sessionID,
+            commandID: "supervisor-delivery-gate-\(sessionID)-\(events.last?.sequence ?? 0)",
+            causationID: events.last?.id.uuidString,
+            correlationID: sessionID,
+            kind: SessionEventKind(rawValue: "verification_gate_evaluated"),
             payload: [
                 "passed": result.passed ? "true" : "false",
                 "missing": result.missingRequirements.joined(separator: "|"),
+                "failed": result.failedEvidence.joined(separator: "|"),
                 "risks": result.unresolvedRisks.joined(separator: "|"),
-                "deliveryTrace": traceJSON
-            ],
-            commandID: "harness-gate-\(sessionID)-\(events.last?.sequence ?? 0)"
-        )
+                "deliveryTrace": traceJSON,
+                "result": resultJSON
+            ]
+        ))
+        let nextStatus: SessionStatus = result.passed
+            ? .delivered
+            : (result.unresolvedRisks.isEmpty ? .needsRepair : .needsAttention)
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: sessionID,
+            commandID: "supervisor-delivery-state-\(sessionID)-\(events.last?.sequence ?? 0)",
+            causationID: events.last?.id.uuidString,
+            correlationID: sessionID,
+            kind: .deliveryStateChanged,
+            payload: ["status": nextStatus.rawValue]
+        ))
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: sessionID,
+            commandID: "supervisor-session-status-\(sessionID)-\(events.last?.sequence ?? 0)",
+            causationID: events.last?.id.uuidString,
+            correlationID: sessionID,
+            kind: SessionEventKind(rawValue: "session_status_changed"),
+            payload: ["status": nextStatus.rawValue]
+        ))
+        if var state = try repository.runState(sessionID: sessionID) {
+            state.deliveryGateResult = result
+            try repository.saveRunState(state)
+        }
         return result
+    }
+
+    /// The only non-model mutation entry point exposed to daemon clients.
+    /// Each request is schema-checked, idempotent by command ID, and ends in
+    /// a Runtime 3 envelope so UI-only features cannot create a parallel
+    /// SQLite write path.
+    public func applyRuntimeMutation(_ mutation: SessionRuntimeMutation) throws -> String {
+        try ensureSession(mutation.sessionID)
+        let receiptCommandID = "supervisor-runtime-mutation-\(mutation.commandID)"
+        if let existing = try repository.eventEnvelope(commandID: receiptCommandID) {
+            return existing.payload["result"] ?? "{}"
+        }
+
+        let decoder = DeepSeekDaemonJSON.decoder
+        let encoder = DeepSeekDaemonJSON.encoder
+        let payload = Data(mutation.payloadJSON.utf8)
+        let result: String
+        switch mutation.kind {
+        case .event:
+            let event = try decoder.decode(RuntimeEventMutation.self, from: payload)
+            try recordRuntimeEvent(
+                sessionID: mutation.sessionID,
+                type: event.type,
+                payload: event.payload,
+                commandID: event.commandID ?? mutation.commandID,
+                causationID: event.causationID,
+                correlationID: event.correlationID
+            )
+            result = "{}"
+        case .createHandoff:
+            let request = try decoder.decode(RuntimeCreateHandoffMutation.self, from: payload)
+            let handoff = try repository.createHandoff(
+                sessionID: mutation.sessionID,
+                destination: request.destination,
+                baseRevision: request.baseRevision
+            )
+            result = String(decoding: try encoder.encode(handoff), as: UTF8.self)
+        case .saveHandoffFiles:
+            let request = try decoder.decode(RuntimeHandoffFilesMutation.self, from: payload)
+            try repository.saveHandoffFiles(handoffID: request.handoffID, files: request.files)
+            result = "{}"
+        case .updateHandoff:
+            let request = try decoder.decode(RuntimeHandoffStateMutation.self, from: payload)
+            try repository.updateHandoff(id: request.handoffID, state: request.state)
+            result = "{}"
+        case .saveTerminalSession:
+            try repository.saveTerminalSession(try decoder.decode(TerminalSessionRecord.self, from: payload))
+            result = "{}"
+        case .saveTerminalProcess:
+            try repository.saveTerminalProcess(try decoder.decode(TerminalProcessRecord.self, from: payload))
+            result = "{}"
+        case .saveTerminalPort:
+            try repository.saveTerminalPort(try decoder.decode(TerminalPortRecord.self, from: payload))
+            result = "{}"
+        case .appendTerminalEvent:
+            let event = try decoder.decode(TerminalAuditEvent.self, from: payload)
+            try repository.appendTerminalEvent(event)
+            try recordRuntimeEvent(
+                sessionID: mutation.sessionID,
+                type: "terminal_\(event.kind.rawValue)",
+                payload: ["terminalID": event.terminalID, "detail": SecretRedactor.redact(event.detail)],
+                commandID: "\(mutation.commandID)-timeline",
+                causationID: event.id,
+                correlationID: event.terminalID
+            )
+            if event.kind == .output {
+                try recordRuntimeEvent(
+                    sessionID: mutation.sessionID,
+                    type: "terminal_output_persisted",
+                    payload: ["terminalID": event.terminalID, "detail": SecretRedactor.redact(event.detail)],
+                    commandID: "\(mutation.commandID)-output",
+                    causationID: event.id,
+                    correlationID: event.terminalID
+                )
+            }
+            result = "{}"
+        case .appendTerminalHistory:
+            try repository.appendTerminalCommandHistory(try decoder.decode(TerminalCommandHistoryRecord.self, from: payload))
+            result = "{}"
+        case .updateWorktreeBinding:
+            let request = try decoder.decode(RuntimeWorktreeBindingMutation.self, from: payload)
+            try repository.updateWorktreeBinding(
+                sessionID: mutation.sessionID,
+                branch: request.branch,
+                worktreePath: request.worktreePath,
+                baselineRevision: request.baselineRevision
+            )
+            result = "{}"
+        case .saveWorktree:
+            try repository.saveWorktree(try decoder.decode(WorktreeRecord.self, from: payload))
+            result = "{}"
+        }
+
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: mutation.sessionID,
+            commandID: receiptCommandID,
+            causationID: mutation.commandID,
+            correlationID: mutation.sessionID,
+            kind: SessionEventKind(rawValue: "runtime_mutation_applied"),
+            payload: ["kind": mutation.kind.rawValue, "result": SecretRedactor.redact(result)]
+        ))
+        return result
+    }
+
+    public func recordRuntimeEvent(
+        sessionID: String,
+        type: String,
+        payload: [String: String],
+        commandID: String,
+        causationID: String? = nil,
+        correlationID: String? = nil
+    ) throws {
+        try ensureSession(sessionID)
+        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+            aggregateID: sessionID,
+            commandID: "supervisor-event-\(commandID)",
+            causationID: causationID,
+            correlationID: correlationID ?? sessionID,
+            kind: SessionEventKind(rawValue: type),
+            payload: SecretRedactor.redact(payload)
+        ))
+    }
+
+    public func persistRunState(_ state: AgentRunState) throws {
+        try ensureSession(state.sessionID)
+        try repository.saveRunState(state)
+    }
+
+    /// Validates the direct-terminal continuation and consumes allow-once
+    /// approval through the same Supervisor audit chain as model tool calls.
+    public func consumeDirectTerminalApproval(
+        sessionID: String,
+        approvalID: String?,
+        risk: CommandRisk,
+        commandHash: String
+    ) throws -> Bool {
+        guard let approvalID else { return false }
+        guard let approval = try repository.approval(id: approvalID),
+              approval.sessionID == sessionID,
+              approval.tool == "terminal.exec",
+              approval.risk == risk,
+              approval.decision == .allowOnce || approval.decision == .allowSession,
+              let data = approval.arguments.data(using: .utf8),
+              let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              metadata["source"] as? String == "deepseekd-direct-terminal",
+              metadata["commandHash"] as? String == commandHash else {
+            throw HarnessSupervisorError.approvalAlreadyResolved
+        }
+        let consumed = try repository.events(sessionID: sessionID).contains {
+            $0.type == "terminal_approval_consumed" && $0.payload["approvalID"] == approvalID
+        }
+        guard !consumed else { throw HarnessSupervisorError.approvalAlreadyResolved }
+        if approval.decision == .allowOnce {
+            try recordRuntimeEvent(
+                sessionID: sessionID,
+                type: "terminal_approval_consumed",
+                payload: ["approvalID": approvalID, "decision": "allow_once"],
+                commandID: "terminal-direct-consume-\(approvalID)",
+                causationID: approvalID,
+                correlationID: approvalID
+            )
+        }
+        return true
     }
 
     private func ensureSession(_ sessionID: String) throws {
@@ -336,6 +615,14 @@ public actor SessionSupervisor: DurableSessionSupervisor {
 
     private func driver(for sessionID: String) -> (any SessionExecutionDriver)? {
         executionDrivers[sessionID] ?? defaultExecutionDriver
+    }
+
+    private func sessionBranchSlug(_ title: String) -> String {
+        let normalized = title.lowercased().unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let compact = String(normalized).split(separator: "-", omittingEmptySubsequences: true).joined(separator: "-")
+        return compact.isEmpty ? "session" : String(compact.prefix(48))
     }
 
     @discardableResult
@@ -401,4 +688,33 @@ public actor SessionSupervisor: DurableSessionSupervisor {
     private func renewIfOwned(sessionID: String) {
         _ = try? repository.renewSessionLease(sessionID: sessionID, ownerInstanceID: instanceID)
     }
+}
+
+private struct RuntimeEventMutation: Codable, Sendable {
+    let type: String
+    let payload: [String: String]
+    let commandID: String?
+    let causationID: String?
+    let correlationID: String?
+}
+
+private struct RuntimeCreateHandoffMutation: Codable, Sendable {
+    let destination: HandoffDestination
+    let baseRevision: String
+}
+
+private struct RuntimeHandoffFilesMutation: Codable, Sendable {
+    let handoffID: String
+    let files: [HandoffFileState]
+}
+
+private struct RuntimeHandoffStateMutation: Codable, Sendable {
+    let handoffID: String
+    let state: HandoffState
+}
+
+private struct RuntimeWorktreeBindingMutation: Codable, Sendable {
+    let branch: String
+    let worktreePath: String
+    let baselineRevision: String
 }

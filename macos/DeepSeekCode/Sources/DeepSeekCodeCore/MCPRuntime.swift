@@ -31,10 +31,25 @@ public enum MCPHealth: String, Codable, Sendable {
     case unavailable
 }
 
+/// MCP callers must provide the same Pipeline context used by every other
+/// tool. This prevents a transport convenience API from silently inventing
+/// command/call identity or bypassing approval and evidence policy.
+public struct MCPToolInvocation: Sendable {
+    public let serverID: String
+    public let tool: String
+    public let context: ToolInvocationContext
+
+    public init(serverID: String, tool: String, context: ToolInvocationContext) {
+        self.serverID = serverID
+        self.tool = tool
+        self.context = context
+    }
+}
+
 public protocol MCPManager: Sendable {
     func connect(serverID: String, transport: any MCPTransport) async throws
     func discoverTools(serverID: String) async throws -> [MCPToolDescriptor]
-    func call(serverID: String, tool: String, argumentsJSON: String, sessionID: String) async throws -> String
+    func call(_ invocation: MCPToolInvocation) async throws -> ToolExecutionResult
     func health(serverID: String) async -> MCPHealth
     func disconnect(serverID: String) async
 }
@@ -100,43 +115,17 @@ public actor DefaultMCPManager: MCPManager {
         return values
     }
 
-    public func call(serverID: String, tool: String, argumentsJSON: String, sessionID: String) async throws -> String {
-        try await call(
-            serverID: serverID,
-            tool: tool,
-            argumentsJSON: argumentsJSON,
-            sessionID: sessionID,
-            commandID: "mcp-call-\(UUID().uuidString)",
-            callID: UUID().uuidString
-        )
-    }
-
-    /// Executes an MCP tool through the one ToolExecutionPipeline.  Callers
-    /// that retry a command must reuse both IDs; the pipeline will then retain
-    /// a single request/evidence/completion chain instead of replaying a host
-    /// call outside the event log.
-    public func call(
-        serverID: String,
-        tool: String,
-        argumentsJSON: String,
-        sessionID: String,
-        commandID: String,
-        callID: String
-    ) async throws -> String {
-        guard hosts[serverID] != nil else { throw MCPRuntimeError.invalidConfiguration }
+    public func call(_ invocation: MCPToolInvocation) async throws -> ToolExecutionResult {
+        guard hosts[invocation.serverID] != nil else { throw MCPRuntimeError.invalidConfiguration }
         guard let pipeline, router != nil else { throw MCPRuntimeError.pipelineRequired }
-        let registered = registry.tool(named: "mcp.\(serverID).\(tool)") ?? MCPToolRegistration.make(
-            serverID: serverID,
-            descriptor: MCPToolDescriptor(name: tool, description: "", inputSchema: .objectSchema())
-        )
-        let result = try await pipeline.execute(ToolInvocationContext(
-            sessionID: sessionID,
-            commandID: commandID,
-            callID: callID,
-            tool: registered,
-            argumentsJSON: argumentsJSON
-        ))
-        return result.output
+        let expectedToolName = "mcp.\(invocation.serverID).\(invocation.tool)"
+        guard invocation.context.tool.name == expectedToolName else {
+            throw MCPRuntimeError.invalidConfiguration
+        }
+        guard registry.tool(named: expectedToolName) != nil else {
+            throw MCPRuntimeError.invalidConfiguration
+        }
+        return try await pipeline.execute(invocation.context)
     }
 
     public func health(serverID: String) async -> MCPHealth {

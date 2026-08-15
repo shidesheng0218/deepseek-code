@@ -81,7 +81,8 @@ public enum ToolPreToolDecision: Equatable, Sendable {
 /// `executeAuthorized`; callers then enter this pipeline exactly once.  The
 /// router below is intentionally pure and never creates competing records.
 public final class ToolExecutionPipeline: @unchecked Sendable {
-    private let repository: SessionRepository
+    private let repository: SessionRepository?
+    private let eventStore: EventStore?
     private let router: ToolHostRouter
     private let preToolHooks: [HookDefinition]
     private let hookManifest: HostCapabilityManifest?
@@ -93,6 +94,23 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
         hookManifest: HostCapabilityManifest? = nil
     ) {
         self.repository = repository
+        self.eventStore = nil
+        self.router = router
+        self.preToolHooks = preToolHooks
+        self.hookManifest = hookManifest
+    }
+
+    /// Legacy/in-memory fixtures still use the exact same Pipeline and tool
+    /// lifecycle. They only differ in where their non-durable events are
+    /// recorded; production Runtime always injects a SQLite repository.
+    public init(
+        eventStore: EventStore,
+        router: ToolHostRouter,
+        preToolHooks: [HookDefinition] = [],
+        hookManifest: HostCapabilityManifest? = nil
+    ) {
+        self.repository = nil
+        self.eventStore = eventStore
         self.router = router
         self.preToolHooks = preToolHooks
         self.hookManifest = hookManifest
@@ -132,7 +150,7 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
             payload: basePayload(context),
             suffix: "requested"
         )
-        try? repository.recordToolInvocation(
+        recordToolInvocation(
             ToolInvocationRecord(
                 id: context.callID,
                 sessionID: context.sessionID,
@@ -163,7 +181,7 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
             payload: basePayload(context).merging(["code": code], uniquingKeysWith: { _, right in right }),
             suffix: "blocked"
         )
-        try? repository.recordToolInvocation(
+        recordToolInvocation(
             ToolInvocationRecord(
                 id: context.callID,
                 sessionID: context.sessionID,
@@ -230,7 +248,7 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
     /// no caller may silently retry a potentially side-effecting command.
     public func executeAuthorized(_ context: ToolInvocationContext) async throws -> ToolExecutionResult {
         try append(context, type: "tool_started", payload: basePayload(context), suffix: "started")
-        try? repository.recordToolInvocation(
+        recordToolInvocation(
             ToolInvocationRecord(
                 id: context.callID,
                 sessionID: context.sessionID,
@@ -280,7 +298,7 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
                 ], uniquingKeysWith: { _, right in right }),
                 suffix: "completed"
             )
-            try? repository.recordToolInvocation(
+            recordToolInvocation(
                 ToolInvocationRecord(
                     id: context.callID,
                     sessionID: context.sessionID,
@@ -327,7 +345,7 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
                 ], uniquingKeysWith: { _, right in right }),
                 suffix: "failed"
             )
-            try? repository.recordToolInvocation(
+            recordToolInvocation(
                 ToolInvocationRecord(
                     id: context.callID,
                     sessionID: context.sessionID,
@@ -363,7 +381,7 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
             ], uniquingKeysWith: { _, right in right }),
             suffix: "indeterminate"
         )
-        try? repository.recordToolInvocation(
+        recordToolInvocation(
             ToolInvocationRecord(
                 id: context.callID,
                 sessionID: context.sessionID,
@@ -414,7 +432,7 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
             ], uniquingKeysWith: { _, right in right }),
             suffix: "completed"
         )
-        try? repository.recordToolInvocation(
+        recordToolInvocation(
             ToolInvocationRecord(
                 id: context.callID,
                 sessionID: context.sessionID,
@@ -464,14 +482,28 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
     }
 
     private func append(_ context: ToolInvocationContext, type: String, payload: [String: String], suffix: String) throws {
-        _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
-            aggregateID: context.sessionID,
-            commandID: "pipeline-\(context.commandID)-\(context.callID)-\(suffix)",
-            causationID: context.callID,
-            correlationID: context.traceID,
-            kind: SessionEventKind(rawValue: type),
-            payload: payload
-        ))
+        if let repository {
+            _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
+                aggregateID: context.sessionID,
+                commandID: "pipeline-\(context.commandID)-\(context.callID)-\(suffix)",
+                causationID: context.callID,
+                correlationID: context.traceID,
+                kind: SessionEventKind(rawValue: type),
+                payload: payload
+            ))
+        } else if let eventStore {
+            try eventStore.append(
+                sessionID: context.sessionID,
+                event: SessionEvent(type: type, payload: SecretRedactor.redact(payload))
+            )
+        } else {
+            throw ToolExecutionPipelineError.eventStoreUnavailable
+        }
+    }
+
+    private func recordToolInvocation(_ record: ToolInvocationRecord, payload: [String: String]) {
+        guard let repository else { return }
+        try? repository.recordToolInvocation(record, payload: payload)
     }
 
     private func basePayload(_ context: ToolInvocationContext) -> [String: String] {
@@ -531,11 +563,13 @@ public final class ToolExecutionPipeline: @unchecked Sendable {
 public enum ToolExecutionPipelineError: LocalizedError, Sendable {
     case invalidArguments
     case deadlineExceeded
+    case eventStoreUnavailable
 
     public var errorDescription: String? {
         switch self {
         case .invalidArguments: "工具参数不是有效 JSON 对象"
         case .deadlineExceeded: "工具执行超时"
+        case .eventStoreUnavailable: "工具流水线没有可用的事件存储"
         }
     }
 }

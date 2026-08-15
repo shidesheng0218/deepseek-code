@@ -981,7 +981,15 @@ struct DeepSeekCodeChecks {
             store.prompt = "建立真实联网修复任务"
             store.createSession(title: "建立真实联网修复任务")
         }
-        let storeContract = await MainActor.run { store.activeTaskContract }
+        // Session creation is an IPC command to deepseekd. The GUI applies an
+        // optimistic card immediately, while the durable task contract arrives
+        // after the Supervisor's creation receipt is projected.
+        var storeContract: TaskContract?
+        for _ in 0..<500 {
+            storeContract = await MainActor.run { store.activeTaskContract }
+            if storeContract != nil { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         precondition(storeContract?.goal == "建立真实联网修复任务")
         let encodedContract = try JSONEncoder().encode(taskContract)
         let decodedContract = try JSONDecoder().decode(TaskContract.self, from: encodedContract)
@@ -1353,6 +1361,10 @@ struct DeepSeekCodeChecks {
         let quickChatStore = WorkspaceStore(storageDirectory: directory.appendingPathComponent("quick-chat-store", isDirectory: true), secretStore: InMemorySecretStore(), migrateElectronData: false)
         quickChatStore.prompt = "你是什么模型？"
         quickChatStore.createSession()
+        for _ in 0..<500 {
+            if await MainActor.run(body: { quickChatStore.hasActiveSession }) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         precondition(quickChatStore.hasActiveSession)
         precondition(quickChatStore.projectName == "快速对话")
         precondition(!quickChatStore.isInspectorVisible)
@@ -1665,6 +1677,10 @@ struct DeepSeekCodeChecks {
             [.reasoningDelta("先想一下"), .toolCall(id: "think-1", name: "read_file", argumentsJSON: "{\"path\":\"app.txt\"}"), .done],
             [.textDelta("继续。"), .done]
         ])
+        // A durable Agent run must always target an admitted Session. Earlier
+        // adapter tests relied on swallowed repository errors here; Runtime 3
+        // now correctly rejects event writes for a non-existent aggregate.
+        _ = try repository.importSession(StoredSession(id: "s-reasoning", projectID: project.id, title: "Reasoning 回填", mode: .acceptEdits))
         let reasoningHost = NativeAgentHost(client: reasoningToolClient, eventStore: events, workspace: workspace, repository: repository)
         for try await _ in reasoningHost.run(AgentRunRequest(sessionID: "s-reasoning", prompt: "检查 reasoning 回填", mode: .acceptEdits, model: "deepseek-chat")) {}
         precondition(reasoningToolClient.recordedRequests.count >= 2)

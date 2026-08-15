@@ -23,6 +23,7 @@ public enum DeepSeekDaemonMethod: String, Codable, CaseIterable, Sendable {
     case inputAdmit = "input.admit"
     case sessionRecover = "session.recover"
     case deliveryEvaluate = "delivery.evaluate"
+    case runtimeMutate = "runtime.mutate"
     case workerCreate = "worker.create"
     case workerList = "worker.list"
     case workerStart = "worker.start"
@@ -459,49 +460,20 @@ public actor DeepSeekDaemonCommandRouter {
                 return try response(request.id, DeepSeekDaemonHandshake(instanceID: instanceID, startedAt: startedAt))
             case .sessionCreate:
                 let payload = try decode(DeepSeekDaemonCreateSessionPayload.self, from: request.payload)
-                let path = URL(fileURLWithPath: payload.projectPath, isDirectory: true).standardizedFileURL.path
-                let projectName = payload.projectName?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let project = try repository.project(path: path)
-                    ?? repository.createProject(
-                        name: (projectName?.isEmpty == false ? projectName! : URL(fileURLWithPath: path).lastPathComponent),
-                        path: path
-                    )
-                let branch = payload.branch.isEmpty
-                    ? (payload.target == .local ? "main" : "deepseek/\(branchSlug(payload.title))")
-                    : payload.branch
-                let session = try repository.createSession(
-                    projectID: project.id,
-                    title: payload.title,
-                    mode: payload.mode,
-                    target: payload.target,
-                    branch: branch,
-                    worktreePath: payload.worktreePath,
-                    baselineRevision: payload.baselineRevision
+                let session = try await supervisor.createSession(
+                    SessionCreationRequest(
+                        projectPath: payload.projectPath,
+                        projectName: payload.projectName,
+                        title: payload.title,
+                        mode: payload.mode,
+                        target: payload.target,
+                        branch: payload.branch,
+                        worktreePath: payload.worktreePath,
+                        baselineRevision: payload.baselineRevision,
+                        budget: payload.budget
+                    ),
+                    commandID: "daemon-session-create-\(request.id)"
                 )
-                let contract = TaskContract.compatibility(prompt: payload.title, budget: payload.budget)
-                try repository.saveTaskContract(contract, sessionID: session.id)
-                _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
-                    aggregateID: session.id,
-                    commandID: "session-create-contract-\(session.id)",
-                    causationID: request.id,
-                    correlationID: request.id,
-                    kind: SessionEventKind(rawValue: "task_contract_created"),
-                    payload: [
-                        "goal": contract.goal,
-                        "requiredChanges": "\(contract.requiredChanges.count)",
-                        "requiredTests": "\(contract.requiredTests.count)"
-                    ]
-                ))
-                if payload.target == .worktree,
-                   let worktreePath = payload.worktreePath,
-                   let baselineRevision = payload.baselineRevision {
-                    try repository.saveWorktree(WorktreeRecord(
-                        sessionID: session.id,
-                        baseRevision: baselineRevision,
-                        branch: branch,
-                        worktreePath: worktreePath
-                    ))
-                }
                 return try response(request.id, session)
             case .sessionList:
                 let sessions = try repository.sessions().filter { !$0.archived }.map(DeepSeekDaemonSessionSummary.init(session:))
@@ -579,6 +551,10 @@ public actor DeepSeekDaemonCommandRouter {
             case .deliveryEvaluate:
                 let payload = try decode(DeepSeekDaemonSessionPayload.self, from: request.payload)
                 return try response(request.id, try await supervisor.evaluateDelivery(sessionID: payload.sessionID))
+            case .runtimeMutate:
+                let mutation = try decode(SessionRuntimeMutation.self, from: request.payload)
+                let output = try await supervisor.applyRuntimeMutation(mutation)
+                return DeepSeekDaemonResponse(id: request.id, ok: true, output: output)
             case .workerCreate:
                 guard let workerRuntime else { throw ChildAgentRuntimeError.failed("Worker Runtime 不可用") }
                 let payload = try decode(DeepSeekDaemonWorkerCreatePayload.self, from: request.payload)
@@ -659,10 +635,15 @@ public actor DeepSeekDaemonCommandRouter {
                     "background": payload.background,
                     "timeoutMs": payload.timeoutMilliseconds
                 ])
-                let approvedDirectCommand = try directTerminalApprovalAllows(payload, risk: risk)
+                let approvedDirectCommand = try await supervisor.consumeDirectTerminalApproval(
+                    sessionID: session.id,
+                    approvalID: payload.approvalID,
+                    risk: risk,
+                    commandHash: commandHash(payload.command)
+                )
                 if risk >= .l2, !approvedDirectCommand {
                     let hash = commandHash(payload.command)
-                    let approval = try repository.createApproval(
+                    let approval = try await supervisor.requestApproval(
                         sessionID: session.id,
                         tool: "terminal.exec",
                         risk: risk,
@@ -671,7 +652,8 @@ public actor DeepSeekDaemonCommandRouter {
                             "commandHash": hash,
                             "cwd": resolvedTerminalCWD(session: session, requested: payload.cwd),
                             "background": payload.background
-                        ])
+                        ]),
+                        commandID: "terminal-direct-approval-\(request.id)"
                     )
                     let router = ToolHostRouter(registry: ToolRegistry([tool]))
                     let pipeline = ToolExecutionPipeline(repository: repository, router: router)
@@ -685,14 +667,14 @@ public actor DeepSeekDaemonCommandRouter {
                     )
                     try pipeline.begin(context)
                     try pipeline.recordApprovalRequested(context, approvalID: approval.id)
-                    _ = try SessionEventCommitter(repository: repository).commit(SessionEventDraft(
-                        aggregateID: session.id,
+                    try await supervisor.recordRuntimeEvent(
+                        sessionID: session.id,
+                        type: "terminal_requested",
+                        payload: ["approvalID": approval.id, "risk": "L\(risk.rawValue)", "commandHash": hash],
                         commandID: "terminal-direct-request-\(approval.id)",
                         causationID: approval.id,
-                        correlationID: context.traceID,
-                        kind: SessionEventKind(rawValue: "terminal_requested"),
-                        payload: ["approvalID": approval.id, "risk": "L\(risk.rawValue)", "commandHash": hash]
-                    ))
+                        correlationID: context.traceID
+                    )
                     return try response(
                         request.id,
                         DeepSeekDaemonTerminalApprovalRequired(
@@ -836,36 +818,6 @@ public actor DeepSeekDaemonCommandRouter {
         let candidate = URL(fileURLWithPath: requested, isDirectory: true).resolvingSymlinksInPath().standardizedFileURL
         guard candidate.path == workspace.path || candidate.path.hasPrefix(workspace.path + "/") else { return fallback }
         return candidate.path
-    }
-
-    private func directTerminalApprovalAllows(_ payload: DeepSeekDaemonTerminalExecPayload, risk: CommandRisk) throws -> Bool {
-        guard let approvalID = payload.approvalID else { return false }
-        guard let approval = try repository.approval(id: approvalID),
-              approval.sessionID == payload.sessionID,
-              approval.tool == "terminal.exec",
-              approval.risk == risk,
-              approval.decision == .allowOnce || approval.decision == .allowSession,
-              let data = approval.arguments.data(using: .utf8),
-              let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              metadata["source"] as? String == "deepseekd-direct-terminal",
-              metadata["commandHash"] as? String == commandHash(payload.command) else {
-            if payload.approvalID != nil { throw DeepSeekDaemonTerminalError.approvalInvalid }
-            return false
-        }
-        let consumed = try repository.events(sessionID: payload.sessionID).contains {
-            $0.type == "terminal_approval_consumed" && $0.payload["approvalID"] == approvalID
-        }
-        guard !consumed else { throw DeepSeekDaemonTerminalError.approvalInvalid }
-        if approval.decision == .allowOnce {
-            _ = try repository.appendDurable(
-                sessionID: payload.sessionID,
-                type: "terminal_approval_consumed",
-                payload: ["approvalID": approvalID, "decision": "allow_once"],
-                commandID: "terminal-direct-consume-\(approvalID)",
-                causationID: approvalID
-            )
-        }
-        return true
     }
 
     private func isDirectTerminalApproval(approvalID: String, sessionID: String) throws -> Bool {

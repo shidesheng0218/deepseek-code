@@ -2372,7 +2372,7 @@ private struct ChangesPanel: View {
                             Text(gate.passed ? "Delivery gate passed" : "Delivery gate needs evidence")
                                 .font(.system(size: 11, weight: .semibold))
                             Spacer()
-                            Button("重新检查") { _ = store.evaluateDeliveryGate() }
+                            Button("重新检查") { store.requestDeliveryGateEvaluation() }
                                 .buttonStyle(.borderless)
                                 .font(.system(size: 10, weight: .medium))
                                 .foregroundStyle(.secondary)

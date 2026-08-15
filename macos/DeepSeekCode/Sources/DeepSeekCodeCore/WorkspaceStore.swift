@@ -166,10 +166,7 @@ public final class WorkspaceStore {
     private let providerCatalog: ProviderCatalog?
     private let secretStore: (any SecretStore)?
     private let attachmentStore: AttachmentStore?
-    private let eventStore: EventStore?
     private let repository: SessionRepository?
-    private let sessionSupervisor: SessionSupervisor?
-    private let harnessDaemon: LocalHarnessDaemon?
     private var connectedDaemonClient: DeepSeekDaemonClient?
     private var controlPlane: LocalControlPlane?
     private var controlPlaneEventObserverID: UUID?
@@ -188,7 +185,6 @@ public final class WorkspaceStore {
     private let terminalHelperManager: TerminalHelperProcessManager?
     private var terminalReadTasks: [String: Task<Void, Never>] = [:]
     private var terminalOutputBuffers: [String: TerminalOutputBuffer] = [:]
-    private var agentRunControls: [String: AgentRunControl] = [:]
     private var agentRunTasks: [String: Task<Void, Never>] = [:]
     private var isSyncingEditorBuffer = false
     private let sshConnectionManager = SSHConnectionManager()
@@ -225,16 +221,7 @@ public final class WorkspaceStore {
         storageDirectory = customStorageDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.appendingPathComponent("DeepSeekCode", isDirectory: true) ?? FileManager.default.temporaryDirectory.appendingPathComponent("DeepSeekCode", isDirectory: true)
         _ = try? SessionMigrationCoordinator.backupLegacyStorageIfNeeded(root: storageDirectory)
         providerCatalog = try? ProviderCatalog(directory: storageDirectory)
-        eventStore = try? EventStore(directory: storageDirectory.appendingPathComponent("LegacyEvents", isDirectory: true))
         repository = try? SessionRepository(directory: storageDirectory.appendingPathComponent("Database", isDirectory: true))
-        if let repository {
-            let supervisor = SessionSupervisor(repository: repository)
-            sessionSupervisor = supervisor
-            harnessDaemon = LocalHarnessDaemon(repository: repository, supervisor: supervisor)
-        } else {
-            sessionSupervisor = nil
-            harnessDaemon = nil
-        }
         agentWorkerRegistry = AgentWorkerRegistry(repository: repository)
         workerSessionCoordinator = repository.map { WorkerSessionCoordinator(repository: $0) }
         networkRuntime = NetworkRuntime(policy: .default, repository: repository)
@@ -617,7 +604,11 @@ public final class WorkspaceStore {
                 sessionBudget = SessionBudget(maxToolTurns: 40, maxWallClockSeconds: max(30, task.maxRuntimeMinutes * 60), maxInputTokens: 120_000, maxOutputTokens: 24_000)
                 let session = try await createSessionThroughDaemon(title: "Scheduled · \(task.prompt)")
                 selectCreatedSession(session)
-                try? repository?.append(sessionID: session.id, type: "scheduled_trigger_consumed", payload: ["runID": trigger.id, "taskID": task.id])
+                try? await recordRuntimeEvent(
+                    sessionID: session.id,
+                    type: "scheduled_trigger_consumed",
+                    payload: ["runID": trigger.id, "taskID": task.id]
+                )
                 startDaemonAgentRun(sessionID: session.id, parts: [.text(task.prompt)])
                 await agentRunTasks[session.id]?.value
                 refreshSelectedSession()
@@ -734,7 +725,8 @@ public final class WorkspaceStore {
             usageSummary = usageLedger.total
             updateSelectedSessionListEntry(storedSession: stored, projected: projection)
         }
-        pendingApproval = ((try? repository.runState(sessionID: selectedSessionID)) ?? nil)?.pendingApproval
+        let storedRunState = (try? repository.runState(sessionID: selectedSessionID)) ?? nil
+        pendingApproval = storedRunState?.pendingApproval
         activeTaskContract = try? repository.taskContract(sessionID: selectedSessionID)
         githubDeliveries = (try? repository.githubDeliveries(sessionID: selectedSessionID)) ?? []
         if let ciEvent = events.last(where: { $0.type == "ci_failure_evidence" }),
@@ -744,7 +736,7 @@ public final class WorkspaceStore {
         } else {
             ciFailureEvidence = nil
         }
-        deliveryGateResult = evaluateDeliveryGate()
+        deliveryGateResult = storedRunState?.deliveryGateResult ?? deliveryGateResult(from: events)
         activityItems = events.suffix(40).compactMap { event in
             switch event.type {
             case "tool_completed": ActivityItem(title: event.payload["tool"] ?? "工具", detail: "工具调用完成", state: event.payload["ok"] == "true" ? "完成" : "失败")
@@ -902,7 +894,7 @@ public final class WorkspaceStore {
     }
 
     public func prepareHandoff() {
-        guard let repository, hasActiveSession, selectedSession.target == .worktree, let worktreePath = selectedSessionWorktreePath else {
+        guard hasActiveSession, selectedSession.target == .worktree, let worktreePath = selectedSessionWorktreePath else {
             handoffStatusMessage = "只有 Worktree Session 可以执行 Handoff"
             return
         }
@@ -919,12 +911,21 @@ public final class WorkspaceStore {
                     return try git.textFiles(revision: baseline)
                 }.value
                 let preview = try WorktreeHandoffEngine().preview(baseFiles: baseFiles, localRoot: localRoot, incomingRoot: incomingRoot)
-                let transaction = try repository.createHandoff(sessionID: selectedSessionID, destination: .local, baseRevision: baseline)
+                let created = try await submitRuntimeMutation(
+                    .createHandoff,
+                    sessionID: selectedSessionID,
+                    payload: WorkspaceCreateHandoffPayload(destination: .local, baseRevision: baseline)
+                )
+                let transaction = try DeepSeekDaemonJSON.decoder.decode(HandoffTransaction.self, from: Data(created.utf8))
                 handoffPreview = preview
                 activeHandoffID = transaction.id
-                try repository.saveHandoffFiles(handoffID: transaction.id, files: preview.files)
+                _ = try await submitRuntimeMutation(
+                    .saveHandoffFiles,
+                    sessionID: selectedSessionID,
+                    payload: WorkspaceHandoffFilesPayload(handoffID: transaction.id, files: preview.files)
+                )
                 handoffStatusMessage = preview.isClean ? "Handoff 已准备，可应用无冲突文件" : "发现 \(preview.conflicts.count) 个冲突，请先解决"
-                try repository.append(sessionID: selectedSessionID, type: "handoff_previewed", payload: ["handoffID": transaction.id, "conflicts": "\(preview.conflicts.count)"])
+                try await recordRuntimeEvent(sessionID: selectedSessionID, type: "handoff_previewed", payload: ["handoffID": transaction.id, "conflicts": "\(preview.conflicts.count)"])
             } catch {
                 handoffStatusMessage = "Handoff 预览失败：\(error.localizedDescription)"
             }
@@ -932,7 +933,7 @@ public final class WorkspaceStore {
     }
 
     public func applyHandoff(paths: Set<String>? = nil) {
-        guard let repository, let handoffPreview, let activeHandoffID, let workspace = try? toolHost() else { return }
+        guard let handoffPreview, let activeHandoffID, let workspace = try? toolHost() else { return }
         let selected = handoffPreview.files.filter { paths == nil || paths?.contains($0.path) == true }
         guard selected.allSatisfy({ $0.state != .conflict }) else {
             handoffStatusMessage = "冲突文件不能自动应用"
@@ -940,17 +941,25 @@ public final class WorkspaceStore {
         }
         Task {
             do {
-                try repository.updateHandoff(id: activeHandoffID, state: .applying)
+                _ = try await submitRuntimeMutation(
+                    .updateHandoff,
+                    sessionID: selectedSessionID,
+                    payload: WorkspaceHandoffStatePayload(handoffID: activeHandoffID, state: .applying)
+                )
                 let result = try WorktreeHandoffEngine().applyCleanFiles(selected, to: workspace)
-                try repository.updateHandoff(id: activeHandoffID, state: .applied)
-                try repository.append(sessionID: selectedSessionID, type: "handoff_applied", payload: ["handoffID": activeHandoffID, "checkpointID": result.checkpointID.uuidString, "files": result.changedFiles.joined(separator: ",")])
+                _ = try await submitRuntimeMutation(
+                    .updateHandoff,
+                    sessionID: selectedSessionID,
+                    payload: WorkspaceHandoffStatePayload(handoffID: activeHandoffID, state: .applied)
+                )
+                try await recordRuntimeEvent(sessionID: selectedSessionID, type: "handoff_applied", payload: ["handoffID": activeHandoffID, "checkpointID": result.checkpointID.uuidString, "files": result.changedFiles.joined(separator: ",")])
                 let evidence = EvidenceRecord(taskID: selectedSessionID, kind: .checkpoint, title: "Handoff", detail: "已应用 \(result.changedFiles.count) 个文件；Checkpoint \(result.checkpointID.uuidString)", succeeded: true)
                 verificationGraph = VerificationGraph(
                     taskID: selectedSessionID,
                     nodes: verificationGraph.nodes + [VerificationNode(title: "Handoff", state: .passed, evidenceIDs: [evidence.id])],
                     evidenceRecords: verificationGraph.evidenceRecords + [evidence]
                 )
-                try repository.append(sessionID: selectedSessionID, type: "evidence_recorded", payload: [
+                try await recordRuntimeEvent(sessionID: selectedSessionID, type: "evidence_recorded", payload: [
                     "id": evidence.id,
                     "kind": evidence.kind.rawValue,
                     "title": evidence.title,
@@ -960,15 +969,26 @@ public final class WorkspaceStore {
                 handoffStatusMessage = "已应用 \(result.changedFiles.count) 个文件，Checkpoint \(result.checkpointID.uuidString.prefix(8))"
                 refreshGitStatus()
             } catch {
-                try? repository.updateHandoff(id: activeHandoffID, state: .indeterminate)
+                _ = try? await submitRuntimeMutation(
+                    .updateHandoff,
+                    sessionID: selectedSessionID,
+                    payload: WorkspaceHandoffStatePayload(handoffID: activeHandoffID, state: .indeterminate)
+                )
                 handoffStatusMessage = "Handoff 应用失败：\(error.localizedDescription)"
             }
         }
     }
 
     public func abortHandoff() {
-        guard let repository, let activeHandoffID else { return }
-        try? repository.updateHandoff(id: activeHandoffID, state: .aborted)
+        guard let activeHandoffID else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await self.submitRuntimeMutation(
+                .updateHandoff,
+                sessionID: self.selectedSessionID,
+                payload: WorkspaceHandoffStatePayload(handoffID: activeHandoffID, state: .aborted)
+            )
+        }
         handoffPreview = nil
         handoffStatusMessage = "已放弃 Handoff；Worktree 保留"
     }
@@ -1014,6 +1034,41 @@ public final class WorkspaceStore {
     }
 
     private func submitTask(sessionID: String, parts: [ContentPart]) {
+        let route = TaskRouter.route(TaskRoutingInput(
+            prompt: parts.plainText,
+            mode: mode,
+            hasAttachments: parts.contains { part in
+                switch part {
+                case .text, .codeSelection, .toolEvidence: false
+                case .image, .document, .browserEvidence, .computerEvidence: true
+                }
+            },
+            hasProject: !projectPath.isEmpty
+        ))
+        let target = sessions.first(where: { $0.id == sessionID })?.target ?? executionTarget
+        let hasEnabledHooks = hooks.contains { $0.enabled }
+        let hasEnabledMCP = mcpServers.contains { $0.enabled }
+        guard DaemonExecutionEligibility.isEligible(
+            target: target,
+            parts: parts,
+            route: route,
+            hasEnabledHooks: hasEnabledHooks,
+            hasEnabledMCP: hasEnabledMCP
+        ) else {
+            statusMessage = daemonCapabilityMessage(
+                route: route,
+                hasAttachments: parts.contains { part in
+                    switch part {
+                    case .text, .codeSelection, .toolEvidence: false
+                    case .image, .document, .browserEvidence, .computerEvidence: true
+                    }
+                },
+                hasEnabledHooks: hasEnabledHooks,
+                hasEnabledMCP: hasEnabledMCP,
+                target: target
+            )
+            return
+        }
         if agentWorkers.contains(where: { $0.sessionID == sessionID && $0.kind == .main && $0.isLive }) {
             statusMessage = "正在加入本轮结束后的输入队列…"
             Task { [weak self] in
@@ -1040,6 +1095,21 @@ public final class WorkspaceStore {
         statusMessage = "Agent 正在准备…"
         updateSelectedSessionStatus(.running)
         startDaemonAgentRun(sessionID: sessionID, parts: parts)
+    }
+
+    private func daemonCapabilityMessage(
+        route: TaskRoute,
+        hasAttachments: Bool,
+        hasEnabledHooks: Bool,
+        hasEnabledMCP: Bool,
+        target: SessionTarget
+    ) -> String {
+        if target == .ssh { return "当前 daemon 尚未接管 SSH Session；任务未执行" }
+        if hasEnabledHooks { return "当前项目启用了 Hook，但 daemon 尚未加载 Hook Runtime；任务未执行" }
+        if hasEnabledMCP { return "当前项目启用了 MCP，但 daemon 尚未加载 MCP Runtime；任务未执行" }
+        if route.needsBrowser { return "该任务需要 Browser 验证，但 daemon Browser Runtime 尚未可用；任务未执行" }
+        if hasAttachments { return "该任务包含附件，但当前 daemon Capability Profile 未声明附件执行；任务未执行" }
+        return "当前任务不满足 daemon Capability Profile；任务未执行"
     }
 
     /// Builds any required local Worktree first, then delegates all durable
@@ -1164,6 +1234,53 @@ public final class WorkspaceStore {
         return response
     }
 
+    /// GUI mutations are forwarded to deepseekd, which delegates them to the
+    /// SessionSupervisor.  WorkspaceStore deliberately keeps no repository
+    /// write capability: it updates its local projection only after sending a
+    /// durable command.
+    private func submitRuntimeMutation<T: Encodable>(
+        _ kind: SessionRuntimeMutationKind,
+        sessionID: String,
+        payload: T,
+        commandID: String = UUID().uuidString
+    ) async throws -> String {
+        let payloadJSON = String(decoding: try DeepSeekDaemonJSON.encoder.encode(payload), as: UTF8.self)
+        let client = try await daemonClient()
+        let response = try await sendDaemon(
+            .runtimeMutate,
+            payload: SessionRuntimeMutation(
+                kind: kind,
+                sessionID: sessionID,
+                commandID: commandID,
+                payloadJSON: payloadJSON
+            ),
+            client: client
+        )
+        return response.output
+    }
+
+    private func recordRuntimeEvent(
+        sessionID: String,
+        type: String,
+        payload: [String: String],
+        commandID: String = UUID().uuidString,
+        causationID: String? = nil,
+        correlationID: String? = nil
+    ) async throws {
+        _ = try await submitRuntimeMutation(
+            .event,
+            sessionID: sessionID,
+            payload: WorkspaceRuntimeEventPayload(
+                type: type,
+                payload: payload,
+                commandID: commandID,
+                causationID: causationID,
+                correlationID: correlationID
+            ),
+            commandID: commandID
+        )
+    }
+
     private func followDaemonSession(sessionID: String, workerID: String, client: DeepSeekDaemonClient) async {
         var cursor = (try? repository?.events(sessionID: sessionID).last?.sequence) ?? 0
         let deadline = Date().addingTimeInterval(600)
@@ -1192,7 +1309,7 @@ public final class WorkspaceStore {
                 if [.completed, .delivered, .needsRepair, .needsAttention, .failed].contains(receipt.status) {
                     let state: AgentWorkerState = receipt.status == .failed || receipt.status == .needsAttention ? .needsAttention : .completed
                     agentWorkerRegistry.transition(id: workerID, state: state, detail: receipt.status.title)
-                    finalizeTaskContract(sessionID: sessionID)
+                    await finalizeTaskContract(sessionID: sessionID)
                     break
                 }
                 try await Task.sleep(nanoseconds: 150_000_000)
@@ -1221,74 +1338,6 @@ public final class WorkspaceStore {
         let parts = partsOverride.isEmpty ? [.text(prompt)] : partsOverride
         guard !sessionID.isEmpty, !parts.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         startDaemonAgentRun(sessionID: sessionID, parts: parts)
-    }
-
-    /// Completes exactly the promoted Inbox item whose foreground run reached
-    /// a safe boundary, then starts the next queued input. Accepted items are
-    /// never consumed before the model/tool run has actually settled.
-    private func finishForegroundInputAndContinue(
-        sessionID: String,
-        completedInputID: String?,
-        supervisor: SessionSupervisor
-    ) async {
-        let pending = repository.flatMap { try? $0.runState(sessionID: sessionID) }?.pendingApproval
-        guard pending == nil else {
-            await supervisor.release(sessionID: sessionID)
-            return
-        }
-        let currentID = completedInputID
-            ?? ((try? repository?.sessionInputs(sessionID: sessionID)) ?? [])
-                .first(where: { $0.state == .promoted })?.id
-        if let currentID {
-            _ = try? await supervisor.consumePromotedInput(id: currentID)
-        }
-        if let next = try? await supervisor.promoteNextInput(sessionID: sessionID) {
-            await supervisor.release(sessionID: sessionID)
-            statusMessage = "正在处理已排队的补充任务…"
-            startAgentRun(
-                promptOverride: next.parts.plainText,
-                partsOverride: next.parts,
-                sessionIDOverride: sessionID,
-                inputIDOverride: next.id
-            )
-        } else {
-            await supervisor.release(sessionID: sessionID)
-        }
-    }
-
-    private func requestPauseForSupervisor(sessionID: String) async {
-        if let control = agentRunControls[sessionID] {
-            await control.requestPause()
-        }
-    }
-
-    private func requestResumeForSupervisor(sessionID: String) async {
-        if let control = agentRunControls[sessionID] {
-            await control.resume()
-        }
-    }
-
-    private func requestCancelForSupervisor(sessionID: String) async {
-        if let control = agentRunControls[sessionID] {
-            await control.requestStop()
-        }
-    }
-
-    private func resumeAgentApprovalForSupervisor(sessionID: String, approvalID: String, decision: ApprovalDecision) async {
-        do {
-            let client = try await daemonClient()
-            _ = try await sendDaemon(
-                .approvalResolve,
-                payload: DeepSeekDaemonApprovalPayload(sessionID: sessionID, approvalID: approvalID, decision: decision),
-                client: client
-            )
-            pendingApproval = nil
-            if let worker = agentWorkers.first(where: { $0.sessionID == sessionID && $0.kind == .main }) {
-                await followDaemonSession(sessionID: sessionID, workerID: worker.id, client: client)
-            }
-        } catch {
-            statusMessage = "审批恢复失败：\(error.localizedDescription)"
-        }
     }
 
     public func pauseAgent(workerID: String) {
@@ -1594,36 +1643,38 @@ public final class WorkspaceStore {
     /// Evaluates delivery from persisted evidence rather than the Agent's final text.
     @discardableResult
     public func evaluateDeliveryGate() -> DeliveryGateResult? {
-        guard let contract = activeTaskContract, hasActiveSession else { return nil }
-        guard contract.requiresDeliveryGate else {
-            deliveryGateResult = nil
-            return nil
-        }
-        let hasDiff = !gitDiffOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || verificationGraph.evidenceRecords.contains { $0.kind == .diff && $0.succeeded }
-        let indeterminate = repository.map { repo in
-            ((try? repo.events(sessionID: selectedSessionID)) ?? []).filter { $0.type == "tool_indeterminate" || $0.type == "tool_indeterminate" || $0.type == "ssh_tool_indeterminate" || $0.type == "mcp_tool_indeterminate" }.count
-        } ?? 0
-        let result = DeliveryGate.evaluate(contract: contract, graph: verificationGraph, hasDiff: hasDiff, pendingApprovals: pendingApproval == nil ? 0 : 1, indeterminateSideEffects: indeterminate, reviewFindings: reviewFindings)
-        deliveryGateResult = result
-        return result
+        deliveryGateResult
     }
 
-    private func finalizeTaskContract(sessionID: String) {
-        guard sessionID == selectedSessionID, let result = evaluateDeliveryGate(), let repository else { return }
-        let payload: [String: String] = [
-            "passed": result.passed ? "true" : "false",
-            "missing": result.missingRequirements.joined(separator: "|"),
-            "failed": result.failedEvidence.joined(separator: "|"),
-            "risks": result.unresolvedRisks.joined(separator: "|")
-        ]
-        try? repository.append(sessionID: sessionID, type: "verification_gate_evaluated", payload: payload)
-        let nextStatus: SessionStatus = result.passed ? .delivered : (result.unresolvedRisks.isEmpty ? .needsRepair : .needsAttention)
-        try? repository.append(sessionID: sessionID, type: "session_status_changed", payload: ["status": nextStatus.rawValue])
-        if var value = try? repository.runState(sessionID: sessionID) {
-            value.deliveryGateResult = result
-            try? repository.saveRunState(value)
+    public func requestDeliveryGateEvaluation() {
+        guard hasActiveSession else { return }
+        Task { [weak self] in
+            await self?.finalizeTaskContract(sessionID: self?.selectedSessionID ?? "")
         }
-        statusMessage = result.passed ? "任务已通过交付门禁" : "任务未完成：\(result.missingRequirements.joined(separator: "、"))"
+    }
+
+    private func finalizeTaskContract(sessionID: String) async {
+        guard sessionID == selectedSessionID else { return }
+        do {
+            let client = try await daemonClient()
+            let response = try await sendDaemon(
+                .deliveryEvaluate,
+                payload: DeepSeekDaemonSessionPayload(sessionID: sessionID),
+                client: client
+            )
+            let result = try DeepSeekDaemonJSON.decoder.decode(DeliveryGateResult.self, from: Data(response.output.utf8))
+            deliveryGateResult = result
+            refreshSelectedSession()
+            statusMessage = result.passed ? "任务已通过交付门禁" : "任务未完成：\(result.missingRequirements.joined(separator: "、"))"
+        } catch {
+            statusMessage = "交付门禁检查失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func deliveryGateResult(from events: [SessionEvent]) -> DeliveryGateResult? {
+        guard let raw = events.last(where: { $0.type == "verification_gate_evaluated" })?.payload["result"],
+              let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(DeliveryGateResult.self, from: data)
     }
 
     public func resolvePendingApproval(_ decision: ApprovalDecision) {
@@ -1646,7 +1697,7 @@ public final class WorkspaceStore {
                             projectID: selectedProjectID,
                             scope: .session
                         )
-                        _ = try? repository?.appendDurable(sessionID: selectedSessionID, type: "web_research_session_granted", payload: [
+                        try? await recordRuntimeEvent(sessionID: selectedSessionID, type: "web_research_session_granted", payload: [
                             "approvalID": pending.id,
                             "requestedTool": pending.tool,
                             "grantIDs": grants.map(\.id).joined(separator: ","),
@@ -1924,7 +1975,10 @@ public final class WorkspaceStore {
         selectedRightPanel = .browser
         isInspectorVisible = true
         if let terminalID = browserSourceTerminalID {
-            try? repository?.append(sessionID: selectedSessionID, type: "terminal_browser_linked", payload: ["terminalID": terminalID, "port": "\(port)", "url": browserURL])
+            Task { [weak self] in
+                guard let self else { return }
+                try? await self.recordRuntimeEvent(sessionID: self.selectedSessionID, type: "terminal_browser_linked", payload: ["terminalID": terminalID, "port": "\(port)", "url": self.browserURL])
+            }
         }
         statusMessage = "已将 localhost:\(port) 交给 Browser 验证"
     }
@@ -1976,9 +2030,9 @@ public final class WorkspaceStore {
                 terminalOutputBuffers[record.id] = TerminalOutputBuffer()
                 activeTerminalID = record.id
                 terminalTarget = record.target
-                try? repository?.saveTerminalSession(record)
+                _ = try? await submitRuntimeMutation(.saveTerminalSession, sessionID: record.sessionID, payload: record)
                 let commandHash = SHA256.hash(data: Data((command ?? "").utf8)).map { String(format: "%02x", $0) }.joined()
-                try? repository?.saveTerminalProcess(TerminalProcessRecord(
+                _ = try? await submitRuntimeMutation(.saveTerminalProcess, sessionID: record.sessionID, payload: TerminalProcessRecord(
                     terminalID: record.id,
                     pid: record.pid,
                     processGroup: record.pid,
@@ -1986,7 +2040,7 @@ public final class WorkspaceStore {
                     cwd: record.cwd
                 ))
                 if let command {
-                    try? repository?.appendTerminalCommandHistory(TerminalCommandHistoryRecord(
+                    _ = try? await submitRuntimeMutation(.appendTerminalHistory, sessionID: record.sessionID, payload: TerminalCommandHistoryRecord(
                         sessionID: record.sessionID,
                         terminalID: record.id,
                         command: command,
@@ -2044,7 +2098,10 @@ public final class WorkspaceStore {
             for port in TerminalPortDetector.ports(in: text) where !terminalPorts.contains(where: { $0.terminalID == id && $0.port == port }) {
                 let discovered = TerminalPortRecord(terminalID: id, port: port)
                 terminalPorts.append(discovered)
-                try? repository?.saveTerminalPort(discovered)
+                Task { [weak self] in
+                    guard let self else { return }
+                    _ = try? await self.submitRuntimeMutation(.saveTerminalPort, sessionID: record.sessionID, payload: discovered)
+                }
                 appendTerminalEvent(record, kind: .portDiscovered, detail: "localhost:\(port)")
             }
         }
@@ -2055,7 +2112,10 @@ public final class WorkspaceStore {
         if let index = terminalSessions.firstIndex(where: { $0.id == record.id }) { terminalSessions[index] = record }
         else { terminalSessions.append(record) }
         if record.id == activeTerminalID { syncLegacyTerminalProjection() }
-        if let repository { try? repository.saveTerminalSession(record) }
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await self.submitRuntimeMutation(.saveTerminalSession, sessionID: record.sessionID, payload: record)
+        }
         let becameFinal = [.exited, .failed, .stopped].contains(record.state) && ![.exited, .failed, .stopped].contains(previous?.state ?? .starting)
         if becameFinal {
             let command = record.command ?? "Interactive Terminal"
@@ -2077,10 +2137,9 @@ public final class WorkspaceStore {
 
     private func appendTerminalEvent(_ record: TerminalSessionRecord, kind: TerminalEventKind, detail: String, protectedInput: Bool = false) {
         let event = TerminalAuditEvent(terminalID: record.id, sessionID: record.sessionID, kind: kind, detail: detail, protectedInput: protectedInput)
-        try? repository?.appendTerminalEvent(event)
-        try? repository?.append(sessionID: record.sessionID, type: "terminal_\(kind.rawValue)", payload: ["terminalID": record.id, "detail": event.detail])
-        if kind == .output {
-            try? repository?.append(sessionID: record.sessionID, type: "terminal_output_persisted", payload: ["terminalID": record.id, "detail": event.detail])
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await self.submitRuntimeMutation(.appendTerminalEvent, sessionID: record.sessionID, payload: event)
         }
     }
 
@@ -2118,27 +2177,10 @@ public final class WorkspaceStore {
             nodes: verificationGraph.nodes,
             evidenceRecords: verificationGraph.evidenceRecords + [evidence]
         )
-        if let repository, !selectedSessionID.isEmpty {
+        if !selectedSessionID.isEmpty {
             let encodedFindings = (try? JSONEncoder().encode(findings)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-            try? repository.append(
-                sessionID: selectedSessionID,
-                type: "review_completed",
-                payload: [
-                    "findings": encodedFindings,
-                    "count": "\(findings.count)"
-                ]
-            )
-            try? repository.append(
-                sessionID: selectedSessionID,
-                type: "evidence_recorded",
-                payload: [
-                    "id": evidence.id,
-                    "kind": evidence.kind.rawValue,
-                    "title": evidence.title,
-                    "detail": evidence.detail,
-                    "succeeded": "true"
-                ]
-            )
+            try? await recordRuntimeEvent(sessionID: selectedSessionID, type: "review_completed", payload: ["findings": encodedFindings, "count": "\(findings.count)"])
+            try? await recordRuntimeEvent(sessionID: selectedSessionID, type: "evidence_recorded", payload: ["id": evidence.id, "kind": evidence.kind.rawValue, "title": evidence.title, "detail": evidence.detail, "succeeded": "true"])
         }
         if let workerContext {
             let hash = SHA256.hash(data: Data((findings.isEmpty ? "通过" : "发现问题").utf8)).map { String(format: "%02x", $0) }.joined()
@@ -2248,8 +2290,8 @@ public final class WorkspaceStore {
                 nodes: verificationGraph.nodes,
                 evidenceRecords: verificationGraph.evidenceRecords + [evidence]
             )
-            if let repository, !selectedSessionID.isEmpty {
-                try? repository.append(sessionID: selectedSessionID, type: "usage_recorded", payload: [
+            if !selectedSessionID.isEmpty {
+                try? await recordRuntimeEvent(sessionID: selectedSessionID, type: "usage_recorded", payload: [
                     "feature": UsageFeature.reviewWorker.rawValue,
                     "model": model,
                     "input": "\(inputTokens)",
@@ -2259,8 +2301,8 @@ public final class WorkspaceStore {
                     "succeeded": "true"
                 ])
                 let encodedFindings = (try? JSONEncoder().encode(reviewFindings)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-                try? repository.append(sessionID: selectedSessionID, type: "review_completed", payload: ["findings": encodedFindings, "count": "\(reviewFindings.count)", "worker": "deepseek"])
-                try? repository.append(sessionID: selectedSessionID, type: "evidence_recorded", payload: [
+                try? await recordRuntimeEvent(sessionID: selectedSessionID, type: "review_completed", payload: ["findings": encodedFindings, "count": "\(reviewFindings.count)", "worker": "deepseek"])
+                try? await recordRuntimeEvent(sessionID: selectedSessionID, type: "evidence_recorded", payload: [
                     "id": evidence.id,
                     "kind": evidence.kind.rawValue,
                     "title": evidence.title,
@@ -2337,37 +2379,19 @@ public final class WorkspaceStore {
             nodes: verificationGraph.nodes + [VerificationNode(title: "浏览器验证", state: evidence.succeeded ? .passed : .failed, evidenceIDs: [evidence.id])],
             evidenceRecords: verificationGraph.evidenceRecords + [evidence]
         )
-        if let repository, !selectedSessionID.isEmpty {
+        if !selectedSessionID.isEmpty {
             let bundleJSON = (try? JSONEncoder().encode(effectiveBundle)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            try? repository.append(sessionID: selectedSessionID, type: "browser_evidence_recorded", payload: ["bundle": bundleJSON])
-            try? repository.append(
-                sessionID: selectedSessionID,
-                type: "evidence_recorded",
-                payload: [
-                    "id": evidence.id,
-                    "kind": evidence.kind.rawValue,
-                    "title": evidence.title,
-                    "detail": evidence.detail,
-                    "succeeded": evidence.succeeded ? "true" : "false"
-                ]
-            )
-            for assertionID in bundle.passedAssertions {
-                try? repository.append(sessionID: selectedSessionID, type: "evidence_recorded", payload: [
-                    "id": UUID().uuidString,
-                    "kind": EvidenceKind.browser.rawValue,
-                    "title": "Browser assertion:\(assertionID)",
-                    "detail": "浏览器断言已通过",
-                    "succeeded": "true"
-                ])
-            }
-            for assertionID in bundle.failedAssertions {
-                try? repository.append(sessionID: selectedSessionID, type: "evidence_recorded", payload: [
-                    "id": UUID().uuidString,
-                    "kind": EvidenceKind.browser.rawValue,
-                    "title": "Browser assertion:\(assertionID)",
-                    "detail": "浏览器断言未通过",
-                    "succeeded": "false"
-                ])
+            let sessionID = selectedSessionID
+            Task { [weak self] in
+                guard let self else { return }
+                try? await self.recordRuntimeEvent(sessionID: sessionID, type: "browser_evidence_recorded", payload: ["bundle": bundleJSON])
+                try? await self.recordRuntimeEvent(sessionID: sessionID, type: "evidence_recorded", payload: ["id": evidence.id, "kind": evidence.kind.rawValue, "title": evidence.title, "detail": evidence.detail, "succeeded": evidence.succeeded ? "true" : "false"])
+                for assertionID in effectiveBundle.passedAssertions {
+                    try? await self.recordRuntimeEvent(sessionID: sessionID, type: "evidence_recorded", payload: ["id": UUID().uuidString, "kind": EvidenceKind.browser.rawValue, "title": "Browser assertion:\(assertionID)", "detail": "浏览器断言已通过", "succeeded": "true"])
+                }
+                for assertionID in effectiveBundle.failedAssertions {
+                    try? await self.recordRuntimeEvent(sessionID: sessionID, type: "evidence_recorded", payload: ["id": UUID().uuidString, "kind": EvidenceKind.browser.rawValue, "title": "Browser assertion:\(assertionID)", "detail": "浏览器断言未通过", "succeeded": "false"])
+                }
             }
         }
         activityItems.append(ActivityItem(title: evidence.title, detail: evidence.detail, state: evidence.succeeded ? "通过" : "需处理"))
@@ -2391,18 +2415,11 @@ public final class WorkspaceStore {
             nodes: verificationGraph.nodes,
             evidenceRecords: verificationGraph.evidenceRecords + [evidence]
         )
-        if let repository, !selectedSessionID.isEmpty {
-            try? repository.append(
-                sessionID: selectedSessionID,
-                type: "evidence_recorded",
-                payload: [
-                    "id": evidence.id,
-                    "kind": evidence.kind.rawValue,
-                    "title": evidence.title,
-                    "detail": evidence.detail,
-                    "succeeded": evidence.succeeded ? "true" : "false"
-                ]
-            )
+        if !selectedSessionID.isEmpty {
+            let sessionID = selectedSessionID
+            Task { [weak self] in
+                try? await self?.recordRuntimeEvent(sessionID: sessionID, type: "evidence_recorded", payload: ["id": evidence.id, "kind": evidence.kind.rawValue, "title": evidence.title, "detail": evidence.detail, "succeeded": evidence.succeeded ? "true" : "false"])
+            }
         }
     }
 
@@ -2543,9 +2560,17 @@ public final class WorkspaceStore {
                     .appendingPathComponent("Worktrees", isDirectory: true)
                     .appendingPathComponent(session.id, isDirectory: true)
                 _ = try git.createWorktree(path: worktreePath, branch: session.branch, base: baseline)
-                try repository.updateWorktreeBinding(sessionID: session.id, branch: session.branch, worktreePath: worktreePath.path, baselineRevision: baseline)
-                try repository.saveWorktree(WorktreeRecord(sessionID: session.id, baseRevision: baseline, branch: session.branch, worktreePath: worktreePath.path))
-                try repository.append(sessionID: session.id, type: "worktree_created", payload: ["path": worktreePath.path, "baseRevision": baseline, "branch": session.branch])
+                _ = try await submitRuntimeMutation(
+                    .updateWorktreeBinding,
+                    sessionID: session.id,
+                    payload: WorkspaceWorktreeBindingPayload(branch: session.branch, worktreePath: worktreePath.path, baselineRevision: baseline)
+                )
+                _ = try await submitRuntimeMutation(
+                    .saveWorktree,
+                    sessionID: session.id,
+                    payload: WorktreeRecord(sessionID: session.id, baseRevision: baseline, branch: session.branch, worktreePath: worktreePath.path)
+                )
+                try await recordRuntimeEvent(sessionID: session.id, type: "worktree_created", payload: ["path": worktreePath.path, "baseRevision": baseline, "branch": session.branch])
                 selectedSessionID = session.id
                 reloadWorkspace()
                 refreshSelectedSession()
@@ -3255,4 +3280,33 @@ public final class WorkspaceStore {
               let encoded = String(data: data, encoding: .utf8) else { return "\"\"" }
         return String(encoded.dropFirst().dropLast())
     }
+}
+
+private struct WorkspaceRuntimeEventPayload: Codable, Sendable {
+    let type: String
+    let payload: [String: String]
+    let commandID: String?
+    let causationID: String?
+    let correlationID: String?
+}
+
+private struct WorkspaceCreateHandoffPayload: Codable, Sendable {
+    let destination: HandoffDestination
+    let baseRevision: String
+}
+
+private struct WorkspaceHandoffFilesPayload: Codable, Sendable {
+    let handoffID: String
+    let files: [HandoffFileState]
+}
+
+private struct WorkspaceHandoffStatePayload: Codable, Sendable {
+    let handoffID: String
+    let state: HandoffState
+}
+
+private struct WorkspaceWorktreeBindingPayload: Codable, Sendable {
+    let branch: String
+    let worktreePath: String
+    let baselineRevision: String
 }

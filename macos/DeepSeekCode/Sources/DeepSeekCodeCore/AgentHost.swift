@@ -105,8 +105,7 @@ public final class NativeAgentHost: @unchecked Sendable {
     private let repository: SessionRepository?
     private let projectTrusted: Bool
     private let sandboxAvailable: Bool
-    private let toolRouter: ToolHostRouter?
-    private let toolPipeline: ToolExecutionPipeline?
+    private let toolPipeline: ToolExecutionPipeline
     private let toolRegistry: ToolRegistry
     private let hooks: [HookDefinition]
     private let failureInjector: any FailureInjector
@@ -114,31 +113,54 @@ public final class NativeAgentHost: @unchecked Sendable {
     private let networkRuntime: NetworkRuntime?
     private let hookManifest: HostCapabilityManifest?
     private let permissionLeaseStore: PermissionLeaseStore
+    /// NativeAgentHost is deliberately a provider/tool adapter. Durable
+    /// RunState and event writes are delegated to this Supervisor adapter so
+    /// the model loop never becomes a second repository writer.
+    private let runtimeSupervisor: SessionSupervisor?
 
     public init(client: any ChatStreaming, eventStore: EventStore, workspace: WorkspaceToolHost? = nil, repository: SessionRepository? = nil, projectTrusted: Bool = false, sandboxAvailable: Bool = false, toolRouter: ToolHostRouter? = nil, toolRegistry: ToolRegistry? = nil, hooks: [HookDefinition] = [], failureInjector: any FailureInjector = NoopFailureInjector(), defaultPricing: ProviderProfile? = nil, networkRuntime: NetworkRuntime? = nil, hookManifest: HostCapabilityManifest? = nil) {
+        let resolvedRegistry = toolRegistry ?? AgentToolSchemas.registry
+        let resolvedRouter: ToolHostRouter
+        if let toolRouter {
+            resolvedRouter = toolRouter
+        } else {
+            let router = ToolHostRouter(registry: resolvedRegistry)
+            if let workspace {
+                router.register(host: LocalWorkspaceToolHost(workspace: workspace), forPrefix: "")
+            }
+            resolvedRouter = router
+        }
         self.client = client
         self.eventWriter = EventBatcher(store: eventStore)
         self.workspace = workspace
         self.repository = repository
         self.projectTrusted = projectTrusted
         self.sandboxAvailable = sandboxAvailable
-        self.toolRouter = toolRouter
-        self.toolPipeline = {
-            guard let repository, let toolRouter else { return nil }
-            return ToolExecutionPipeline(
+        if let repository {
+            self.toolPipeline = ToolExecutionPipeline(
                 repository: repository,
-                router: toolRouter,
+                router: resolvedRouter,
                 preToolHooks: hooks,
                 hookManifest: hookManifest
             )
-        }()
-        self.toolRegistry = toolRegistry ?? AgentToolSchemas.registry
+        } else {
+            self.toolPipeline = ToolExecutionPipeline(
+                eventStore: eventStore,
+                router: resolvedRouter,
+                preToolHooks: hooks,
+                hookManifest: hookManifest
+            )
+        }
+        self.toolRegistry = resolvedRegistry
         self.hooks = hooks
         self.failureInjector = failureInjector
         self.defaultPricing = defaultPricing
         self.networkRuntime = networkRuntime
         self.hookManifest = hookManifest
         self.permissionLeaseStore = PermissionLeaseStore(repository: repository)
+        self.runtimeSupervisor = repository.map {
+            SessionSupervisor(repository: $0, instanceID: "agent-host-runtime-adapter-\(UUID().uuidString)")
+        }
     }
 
     public func run(_ request: AgentRunRequest) -> AsyncThrowingStream<AgentEvent, Error> {
@@ -188,11 +210,10 @@ public final class NativeAgentHost: @unchecked Sendable {
         return AsyncThrowingStream { continuation in
             Task {
                 do {
-                    guard try repository.resolvePendingApproval(id: approvalID, decision: decision) else {
-                        throw AgentHostError.approvalAlreadyResolved
-                    }
                     var resumedState = state
-                    await persist(sessionID: sessionID, type: "approval_resolved", payload: ["approvalID": approvalID, "decision": decision.rawValue])
+                    // Approval state is CAS-resolved by the outer
+                    // SessionSupervisor after this driver returns. The host
+                    // only resumes the exact persisted continuation.
                     if decision == .allowOnce || decision == .allowSession {
                         await persist(sessionID: sessionID, type: "tool_approved", payload: ["approvalID": approvalID, "tool": pending.tool])
                     }
@@ -241,7 +262,18 @@ public final class NativeAgentHost: @unchecked Sendable {
                     resumedState.messages.append(ChatMessage(role: "tool", content: output, toolCallID: pending.toolCallID))
                     resumedState.resolveApproval(decision: decision)
                     resumedState.turn += 1
-                    try repository.saveRunState(resumedState)
+                    try await runtimeSupervisor?.persistRunState(resumedState)
+                    // NativeAgentHost may be exercised directly by a local
+                    // adapter test, but it never resolves SQLite approval
+                    // state itself.  Route the CAS transition through a
+                    // Supervisor after the exact continuation settles. In a
+                    // daemon-owned run the outer Supervisor observes this
+                    // completed transition and does not append a duplicate.
+                    try await runtimeSupervisor?.resolveApproval(
+                        sessionID: sessionID,
+                        approvalID: approvalID,
+                        decision: decision
+                    )
                     let route = TaskRouter.route(TaskRoutingInput(prompt: resumedState.prompt, mode: resumedState.mode, hasProject: self.workspace != nil))
                     let qualityPlan = TaskQualityPlanner.plan(route: route)
                     print("→ [AGENTHOST] Continuing Agent stream with new turn...")
@@ -294,7 +326,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                 var messages = initialMessages
                 var runState = initialState
                 runState.status = .running
-                try? repository?.saveRunState(runState)
+                try? await runtimeSupervisor?.persistRunState(runState)
                 // Public research is bounded and read-only. Give each Session
                 // a short-lived search/fetch grant before the model begins so
                 // explicit web tools do not degrade into unnecessary approvals.
@@ -354,7 +386,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                             "estimatedTokens": "\(contextAssembly.selection.estimatedTokens)"
                         ])
                         runState.messages = messages
-                        try? repository?.saveRunState(runState)
+                        try? await runtimeSupervisor?.persistRunState(runState)
                         let featureMaxTokens = outputTokenCap(for: route, mode: request.mode)
                         let availableTools = ToolAvailabilityResolver.resolve(
                             providerCapabilities: request.pricing?.capabilities ?? .deepSeekTextOnly,
@@ -449,11 +481,11 @@ public final class NativeAgentHost: @unchecked Sendable {
                             return currentAssistantIndex!
                         }
 
-                        func updateCurrentAssistant(_ transform: (ChatMessage) -> ChatMessage) {
+                        func updateCurrentAssistant(_ transform: (ChatMessage) -> ChatMessage) async {
                             let index = currentAssistantMessageIndex()
                             messages[index] = transform(messages[index])
                             runState.messages = messages
-                            try? repository?.saveRunState(runState)
+                            try? await runtimeSupervisor?.persistRunState(runState)
                         }
 
                         for try await event in client.stream(chat) {
@@ -463,7 +495,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 if firstTokenLatencyMilliseconds == nil {
                                     firstTokenLatencyMilliseconds = UsageLatency.milliseconds(startedAt: modelRequestStartedAt)
                                 }
-                                updateCurrentAssistant { current in
+                                await updateCurrentAssistant { current in
                                     return ChatMessage(
                                         role: current.role,
                                         parts: current.parts + [.text(text)],
@@ -484,7 +516,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 await persist(sessionID: request.sessionID, type: "assistant_text", payload: ["text": text])
                                 continue
                             case let .reasoningDelta(text):
-                                updateCurrentAssistant { current in
+                                await updateCurrentAssistant { current in
                                     return ChatMessage(
                                         role: current.role,
                                         parts: current.parts,
@@ -510,7 +542,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                 continue
                             }
                             if !calls.isEmpty {
-                                updateCurrentAssistant { current in
+                                await updateCurrentAssistant { current in
                                     let existingCalls = current.toolCalls ?? []
                                     var mergedCalls = existingCalls
                                     for call in calls {
@@ -577,7 +609,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                     }
                                 }
                                 runState.messages = messages
-                                try? repository?.saveRunState(runState)
+                                try? await runtimeSupervisor?.persistRunState(runState)
                                 continue
                             }
                             for call in calls {
@@ -600,8 +632,23 @@ public final class NativeAgentHost: @unchecked Sendable {
                                         ])
                                     }
                                 case let .approvalRequired(risk):
-                                    let approvalID = (try? repository?.createApproval(sessionID: request.sessionID, tool: call.name, risk: risk, arguments: call.argumentsJSON))??.id ?? UUID().uuidString
                                     let commandID = "tool-\(request.sessionID)-\(call.id)"
+                                    let approvalID: String
+                                    if let runtimeSupervisor {
+                                        approvalID = try await runtimeSupervisor.requestApproval(
+                                            sessionID: request.sessionID,
+                                            tool: call.name,
+                                            risk: risk,
+                                            arguments: call.argumentsJSON,
+                                            commandID: commandID
+                                        ).id
+                                    } else {
+                                        // Ephemeral fixtures with no durable
+                                        // repository cannot create an approval
+                                        // record, but still retain their legacy
+                                        // in-memory pause behaviour.
+                                        approvalID = UUID().uuidString
+                                    }
                                     runState.requestApproval(
                                         approvalID: approvalID,
                                         commandID: commandID,
@@ -611,7 +658,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                         risk: risk
                                     )
                                     runState.messages = messages
-                                    try? repository?.saveRunState(runState)
+                                    try? await runtimeSupervisor?.persistRunState(runState)
                                     continuation.yield(.approvalRequired(tool: call.name, risk: risk))
                                     let argumentsHash = runState.pendingApproval?.continuation?.argumentsHash ?? ApprovalContinuation.hash(call.argumentsJSON)
                                     await persist(sessionID: request.sessionID, type: "approval_requested", payload: [
@@ -646,7 +693,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                     ])
                                 }
                                 runState.messages = messages
-                                try? repository?.saveRunState(runState)
+                                try? await runtimeSupervisor?.persistRunState(runState)
                             }
                         }
                         let committedAssistantIndex = currentAssistantMessageIndex()
@@ -698,7 +745,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                                     "risks": result.unresolvedRisks.joined(separator: "|")
                                 ])
                             }
-                            try? repository?.saveRunState(runState)
+                            try? await runtimeSupervisor?.persistRunState(runState)
                             await persistProtocol(
                                 sessionID: request.sessionID,
                                 kind: .turnEnded,
@@ -725,7 +772,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                     throw AgentHostError.budgetExceeded("已达到 Session 工具轮次预算")
                 } catch is CancellationError {
                     runState.status = .cancelled
-                    try? repository?.saveRunState(runState)
+                    try? await runtimeSupervisor?.persistRunState(runState)
                     await persistProtocol(
                         sessionID: request.sessionID,
                         kind: .turnEnded,
@@ -740,7 +787,7 @@ public final class NativeAgentHost: @unchecked Sendable {
                 } catch {
                     let message = error.localizedDescription
                     runState.fail()
-                    try? repository?.saveRunState(runState)
+                    try? await runtimeSupervisor?.persistRunState(runState)
                     continuation.yield(.failed(message))
                     await persistProtocol(
                         sessionID: request.sessionID,
@@ -827,10 +874,18 @@ public final class NativeAgentHost: @unchecked Sendable {
 
     private func persist(sessionID: String, type: String, payload: [String: String]) async {
         let redacted = SecretRedactor.redact(payload)
-        if let repository {
-            // SQLite durable log is the single runtime truth. JSONL remains a
-            // legacy import/export fallback and must not receive a second copy.
-            _ = try? repository.appendDurable(sessionID: sessionID, type: type, payload: redacted)
+        if let runtimeSupervisor {
+            // SQLite durable log is owned by SessionSupervisor. JSONL remains
+            // a legacy import/export fallback and must not receive a second
+            // copy from the model adapter.
+            try? await runtimeSupervisor.recordRuntimeEvent(
+                sessionID: sessionID,
+                type: type,
+                payload: redacted,
+                commandID: "agent-host-event-\(sessionID)-\(UUID().uuidString)",
+                causationID: nil,
+                correlationID: sessionID
+            )
         } else {
             await eventWriter.append(sessionID: sessionID, event: SessionEvent(type: type, payload: redacted))
         }
@@ -845,15 +900,15 @@ public final class NativeAgentHost: @unchecked Sendable {
         correlationID: String
     ) async {
         let redacted = SecretRedactor.redact(payload)
-        if let repository {
-            _ = try? SessionEventCommitter(repository: repository).commit(SessionEventDraft(
-                aggregateID: sessionID,
+        if let runtimeSupervisor {
+            try? await runtimeSupervisor.recordRuntimeEvent(
+                sessionID: sessionID,
+                type: kind.rawValue,
+                payload: redacted,
                 commandID: commandID,
                 causationID: causationID,
-                correlationID: correlationID,
-                kind: kind,
-                payload: redacted
-            ))
+                correlationID: correlationID
+            )
         } else {
             await eventWriter.append(sessionID: sessionID, event: SessionEvent(type: kind.rawValue, payload: redacted))
         }
@@ -936,15 +991,13 @@ public final class NativeAgentHost: @unchecked Sendable {
                 projectID: projectID(for: sessionID)
             )
         }
-        if let toolPipeline, let pipelineContext {
-            try toolPipeline.begin(pipelineContext)
-        } else {
-            await persist(sessionID: sessionID, type: "tool_requested", payload: [
-                "tool": call.name,
-                "callID": call.id,
-                "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"
-            ])
+        guard let pipelineContext else {
+            return .blocked(
+                output: json(["ok": false, "code": "TOOL_NOT_REGISTERED", "message": "工具未注册，不能绕过工具流水线执行"]),
+                risk: .l2
+            )
         }
+        try toolPipeline.begin(pipelineContext)
         let researchCapability = webReadCapability(for: call.name)
         let researchURL = researchURL(for: call)
         let activePermissionLease = !approvedByUser
@@ -988,23 +1041,16 @@ public final class NativeAgentHost: @unchecked Sendable {
                 break
             }
         }
-        if let toolPipeline, let pipelineContext {
-            switch await toolPipeline.evaluatePreToolHooks(pipelineContext) {
-            case .allow:
-                break
-            case .requireApproval:
-                return .approvalRequired(.l2)
-            case let .blocked(reason):
-                return .blocked(
-                    output: json(["ok": false, "code": "HOOK_BLOCKED", "message": reason]),
-                    risk: .l2
-                )
-            }
-        } else if let hookResult = await runPreToolHooks(call: call, sessionID: sessionID) {
-            // Compatibility-only fallback for hosts without a registered
-            // ToolExecutionPipeline. Production Runtime/daemon hosts always
-            // construct the pipeline above.
-            return hookResult
+        switch await toolPipeline.evaluatePreToolHooks(pipelineContext) {
+        case .allow:
+            break
+        case .requireApproval:
+            return .approvalRequired(.l2)
+        case let .blocked(reason):
+            return .blocked(
+                output: json(["ok": false, "code": "HOOK_BLOCKED", "message": reason]),
+                risk: .l2
+            )
         }
         var permissionDecision = approvedByUser
             ? approvedPermission(for: call, mode: mode, workerKind: workerKind)
@@ -1037,22 +1083,10 @@ public final class NativeAgentHost: @unchecked Sendable {
                 let output: String
                 let finalizedByPipeline: Bool
                 let succeeded: Bool
-                if let toolPipeline, let pipelineContext {
-                    let result = try await toolPipeline.executeAuthorized(pipelineContext)
-                    output = result.output
-                    succeeded = result.succeeded
-                    finalizedByPipeline = true
-                } else if let toolRouter, let registered {
-                    await persist(sessionID: sessionID, type: "tool_started", payload: ["tool": call.name, "callID": call.id, "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"])
-                    output = try await toolRouter.execute(tool: registered, argumentsJSON: call.argumentsJSON, sessionID: sessionID)
-                    succeeded = true
-                    finalizedByPipeline = false
-                } else {
-                    await persist(sessionID: sessionID, type: "tool_started", payload: ["tool": call.name, "callID": call.id, "risk": "L\(permissionRisk(for: call, mode: mode, workerKind: workerKind).rawValue)"])
-                    output = try executeTool(name: call.name, argumentsJSON: call.argumentsJSON)
-                    succeeded = true
-                    finalizedByPipeline = false
-                }
+                let result = try await toolPipeline.executeAuthorized(pipelineContext)
+                output = result.output
+                succeeded = result.succeeded
+                finalizedByPipeline = true
                 if call.name == "apply_patch" {
                     try await inject(.afterPatchApplied, sessionID: sessionID, tool: call.name)
                 } else if canonicalName.hasPrefix("browser.") {
@@ -1067,33 +1101,6 @@ public final class NativeAgentHost: @unchecked Sendable {
         case let .block(risk):
             return .blocked(output: json(["ok": false, "code": "POLICY_BLOCKED", "risk": "L\(risk.rawValue)"]), risk: risk)
         }
-    }
-
-    private func runPreToolHooks(call: IncrementalToolCall, sessionID: String) async -> ToolExecution? {
-        let matching = hooks.filter { $0.lifecycle == .preToolUse && $0.enabled }
-        guard !matching.isEmpty else { return nil }
-        await persist(sessionID: sessionID, type: "hook_pre_tool", payload: ["tool": call.name, "hookCount": "\(matching.count)"])
-        for hook in matching {
-            do {
-                let result = try await HookRunner.execute(hook, payload: [
-                    "sessionID": sessionID,
-                    "tool": call.name,
-                    "arguments": SecretRedactor.redact(call.argumentsJSON),
-                    "risk": "L2"
-                ], manifest: hookManifest)
-                switch result.decision {
-                case .allow, .observe:
-                    continue
-                case let .block(reason):
-                    return .blocked(output: json(["ok": false, "code": "HOOK_BLOCKED", "message": reason]), risk: .l2)
-                case .requireApproval:
-                    return .approvalRequired(.l2)
-                }
-            } catch {
-                return .blocked(output: json(["ok": false, "code": "HOOK_FAILED", "message": error.localizedDescription]), risk: .l2)
-            }
-        }
-        return nil
     }
 
     private func qualityDecisionName(_ decision: ToolDecision) -> String {
@@ -1182,46 +1189,6 @@ public final class NativeAgentHost: @unchecked Sendable {
             "reason": "故障注入：模拟执行结果未知"
         ])
         throw AgentHostError.failureInjected(point)
-    }
-
-    private func executeTool(name: String, argumentsJSON: String) throws -> String {
-        guard let workspace else { throw AgentHostError.workspaceUnavailable }
-        let arguments = decode(argumentsJSON) ?? [:]
-        switch name {
-        case "list_directory":
-            let path = arguments["path"] as? String ?? "."
-            let values = try workspace.listDirectory(path: path).map { ["name": $0.name, "type": $0.isDirectory ? "directory" : "file"] }
-            return json(["ok": true, "entries": values])
-        case "read_file":
-            let path = arguments["path"] as? String ?? ""
-            let startLine = arguments["startLine"] as? Int ?? 1
-            let maxLines = arguments["maxLines"] as? Int ?? 200
-            let value = try workspace.readFile(path: path, startLine: startLine, maxLines: maxLines)
-            return json(["ok": true, "content": value.content, "sha256": value.sha256, "truncated": value.truncated])
-        case "search_workspace":
-            let query = arguments["query"] as? String ?? ""
-            let matches = try workspace.searchWorkspace(query: query).map { ["path": $0.path, "line": $0.line, "text": $0.text] }
-            return json(["ok": true, "matches": matches])
-        case "apply_patch":
-            let label = arguments["label"] as? String ?? "Agent patch"
-            let rawChanges = arguments["changes"] as? [[String: Any]] ?? []
-            let changes = rawChanges.compactMap { value -> PatchChange? in
-                guard let path = value["path"] as? String, let content = value["content"] as? String else { return nil }
-                return PatchChange(path: path, content: content, expectedHash: value["expectedHash"] as? String)
-            }
-            let result = try workspace.applyPatch(changes: changes, label: label)
-            return json(["ok": true, "checkpointID": result.checkpointID.uuidString, "changedFiles": result.changedFiles])
-        case "inspect_git":
-            let result = try workspace.gitStatus()
-            return json(["ok": result.exitCode == 0, "output": result.stdout, "stderr": result.stderr])
-        case "run_command":
-            let command = arguments["command"] as? String ?? ""
-            let timeout = arguments["timeoutMs"] as? Double ?? 120_000
-            let result = try workspace.run(command: command, timeout: timeout / 1_000)
-            return json(["ok": result.exitCode == 0, "stdout": result.stdout, "stderr": result.stderr, "exitCode": result.exitCode])
-        default:
-            throw AgentHostError.toolNotFound(name)
-        }
     }
 
     private func decode(_ value: String) -> [String: Any]? {
