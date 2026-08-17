@@ -116,6 +116,10 @@ struct DeepSeekCodeRuntimeV2Checks {
             contentsOf: packageRoot.appendingPathComponent("Sources/DeepSeekCodeCore/AgentHost.swift"),
             encoding: .utf8
         )
+        let nativeRunnerSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/DeepSeekCodeCore/NativeDaemonSessionRunner.swift"),
+            encoding: .utf8
+        )
         precondition(!agentHostSource.contains("repository?.createApproval("))
         precondition(!agentHostSource.contains("toolRouter.execute("))
         precondition(!agentHostSource.contains("executeTool(name:"))
@@ -124,6 +128,7 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(!workspaceStoreSource.contains("repository.append(sessionID: sessionID, type: \"session_status_changed\""))
         precondition(!workspaceStoreSource.contains("SessionSupervisor(repository: repository)"))
         precondition(!workspaceStoreSource.contains("LocalHarnessDaemon("))
+        precondition(workspaceStoreSource.contains("profile: daemonRuntimeProfile"))
         // Runtime 3 has one writable owner. The GUI is a projection/client;
         // it must never mutate handoff, terminal, evidence, or event tables
         // behind deepseekd's back.
@@ -154,6 +159,10 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(!agentHostSource.contains("repository.saveRunState("))
         precondition(!agentHostSource.contains("repository?.saveRunState("))
         precondition(!agentHostSource.contains("repository.appendDurable("))
+        // Production daemon hosts must receive the daemon's one Supervisor;
+        // NativeAgentHost must not manufacture an adapter actor per model run.
+        precondition(!agentHostSource.contains("agent-host-runtime-adapter-"))
+        precondition(nativeRunnerSource.contains("installRuntimeSupervisor"))
         // The daemon routes direct-terminal lifecycle events through its
         // Supervisor too; it may transport requests, but not append a second
         // terminal timeline directly.
@@ -463,6 +472,35 @@ struct DeepSeekCodeRuntimeV2Checks {
         precondition(assembledProfile.capabilities.map(\.rawValue) == ["network.broker", "web.fetch"])
         precondition(assembledProfile.permissionMode == .trustedWorkspace)
 
+        // Daemon admission must come from the declared runtime capability
+        // profile, rather than a second hand-written exclusion list in the
+        // GUI. Browser tasks remain blocked until a durable Browser Host is
+        // actually installed in that profile.
+        let daemonProfile = try DaemonRuntimeProfile.make(
+            terminalAvailable: true,
+            attachmentAvailable: true,
+            hooksAvailable: false,
+            mcpAvailable: false,
+            browserAvailable: false,
+            sshAvailable: false
+        )
+        precondition(DaemonExecutionEligibility.isEligible(
+            target: .local,
+            parts: [.text("读取项目结构")],
+            route: TaskRouter.route(TaskRoutingInput(prompt: "读取项目结构", mode: .acceptEdits, hasProject: true)),
+            hasEnabledHooks: false,
+            hasEnabledMCP: false,
+            profile: daemonProfile
+        ))
+        precondition(!DaemonExecutionEligibility.isEligible(
+            target: .local,
+            parts: [.text("修复页面")],
+            route: TaskRouter.route(TaskRoutingInput(prompt: "修复页面并在浏览器验证", mode: .acceptEdits, hasProject: true)),
+            hasEnabledHooks: false,
+            hasEnabledMCP: false,
+            profile: daemonProfile
+        ))
+
         let leaseStore = PermissionLeaseStore()
         let leaseKey = PermissionLeaseKey(projectID: project.id, sessionID: protocolSession.id, effect: .workspaceWrite, toolName: "apply_patch")
         let lease = try leaseStore.grant(key: leaseKey, duration: 60)
@@ -720,6 +758,11 @@ struct DeepSeekCodeRuntimeV2Checks {
         ]).run()
         precondition(benchmark.total == 2)
         precondition(benchmark.passed == 2)
+        let benchmarkGate = BenchmarkReleaseGate.evaluate(
+            benchmark,
+            requirement: BenchmarkReleaseRequirement(minimumFixtures: 2, minimumPassRate: 1.0, requireEvidence: true)
+        )
+        precondition(benchmarkGate.passed)
 
         // Harness 2.0 contract: all mutating lifecycle commands go through
         // the durable Supervisor and remain idempotent across retries.

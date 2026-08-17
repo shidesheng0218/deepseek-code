@@ -88,6 +88,9 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
     private let attachmentStore: AttachmentStore?
     private let projectTrusted: Bool
     private let sandboxAvailable: Bool
+    private let hooks: [HookDefinition]
+    private let capabilityProfile: RuntimeProfile
+    private var runtimeSupervisor: SessionSupervisor?
 
     public init(
         repository: SessionRepository,
@@ -99,7 +102,9 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
         storageRoot: URL,
         terminalHost: (any PersistentTerminalHost)? = nil,
         projectTrusted: Bool = false,
-        sandboxAvailable: Bool? = nil
+        sandboxAvailable: Bool? = nil,
+        hooks: [HookDefinition] = [],
+        capabilityProfile: RuntimeProfile? = nil
     ) {
         self.repository = repository
         self.eventStore = eventStore
@@ -109,12 +114,31 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
         self.networkRuntime = networkRuntime ?? NetworkRuntime(policy: .default, repository: repository)
         self.storageRoot = storageRoot
         self.terminalHost = terminalHost
-        self.attachmentStore = try? AttachmentStore(
+        let resolvedAttachmentStore = try? AttachmentStore(
             directory: storageRoot.appendingPathComponent("Attachments", isDirectory: true),
             secretStore: secretStore
         )
+        self.attachmentStore = resolvedAttachmentStore
         self.projectTrusted = projectTrusted
         self.sandboxAvailable = sandboxAvailable ?? SandboxRuntime.availability.available
+        self.hooks = hooks.filter { $0.enabled && $0.trusted }
+        self.capabilityProfile = capabilityProfile ?? (try? DaemonRuntimeProfile.make(
+            terminalAvailable: terminalHost != nil,
+            attachmentAvailable: resolvedAttachmentStore != nil,
+            hooksAvailable: self.hooks.isEmpty == false,
+            mcpAvailable: false,
+            browserAvailable: false,
+            sshAvailable: false
+        )) ?? DaemonRuntimeProfile.conservative
+    }
+
+    public var runtimeCapabilities: RuntimeProfile { capabilityProfile }
+
+    /// Called once while deepseekd is assembled. The runner passes this exact
+    /// actor to every NativeAgentHost it creates, preserving one write owner
+    /// for a daemon lifetime instead of creating a Supervisor per model turn.
+    public func installRuntimeSupervisor(_ supervisor: SessionSupervisor) {
+        runtimeSupervisor = supervisor
     }
 
     public func run(session: StoredSession, input: SessionInputRecord, control: AgentRunControl) async throws {
@@ -157,10 +181,17 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
         let registry = ToolRegistry(supportedTools())
         let router = ToolHostRouter(registry: registry, repository: repository)
         router.register(host: LocalWorkspaceToolHost(workspace: workspace), forPrefix: "")
-        let webHost = WebToolHost(runtime: networkRuntime, projectID: project.id)
-        router.register(host: webHost, for: "web_search")
-        router.register(host: webHost, for: "web_fetch")
-        if let terminalHost {
+        let installedCapabilities = Set(capabilityProfile.capabilities)
+        if installedCapabilities.contains(DaemonRuntimeProfile.webSearch) || installedCapabilities.contains(DaemonRuntimeProfile.webFetch) {
+            let webHost = WebToolHost(runtime: networkRuntime, projectID: project.id)
+            if installedCapabilities.contains(DaemonRuntimeProfile.webSearch) {
+                router.register(host: webHost, for: "web_search")
+            }
+            if installedCapabilities.contains(DaemonRuntimeProfile.webFetch) {
+                router.register(host: webHost, for: "web_fetch")
+            }
+        }
+        if let terminalHost, installedCapabilities.contains(DaemonRuntimeProfile.terminal) {
             let terminalTools = AgentToolSchemas.registry.allTools().filter { $0.name == "run_command" || $0.name.hasPrefix("terminal.") }
             terminalTools.forEach { registry.register($0) }
             router.register(
@@ -256,16 +287,18 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
             eventStore: eventStore,
             workspace: workspace,
             repository: repository,
+            runtimeSupervisor: runtimeSupervisor,
             projectTrusted: projectTrusted,
             sandboxAvailable: sandboxAvailable,
             toolRouter: router,
             toolRegistry: registry,
+            hooks: hooks,
             defaultPricing: profile,
             networkRuntime: networkRuntime,
             hookManifest: HostCapabilityManifest(
                 hostID: "deepseekd.\(session.id)",
                 allowedPaths: [workspaceURL.path],
-                allowedEffects: [.readOnly],
+                allowedEffects: hooks.isEmpty ? [.readOnly] : [.readOnly, .process],
                 maxOutputBytes: 32_000,
                 timeoutMilliseconds: 10_000
             )
@@ -286,11 +319,11 @@ public final class NativeDaemonSessionRunner: DaemonSessionRunner, @unchecked Se
     }
 
     private func supportedTools() -> [RegisteredTool] {
-        var supportedNames: Set<String> = [
-            "list_directory", "read_file", "search_workspace", "workspace_read_evidence",
-            "apply_patch", "inspect_git", "lsp_query", "web_search", "web_fetch"
-        ]
-        if terminalHost != nil {
+        let installedCapabilities = Set(capabilityProfile.capabilities)
+        var supportedNames: Set<String> = ["list_directory", "read_file", "search_workspace", "workspace_read_evidence", "apply_patch", "inspect_git", "lsp_query"]
+        if installedCapabilities.contains(DaemonRuntimeProfile.webSearch) { supportedNames.insert("web_search") }
+        if installedCapabilities.contains(DaemonRuntimeProfile.webFetch) { supportedNames.insert("web_fetch") }
+        if terminalHost != nil, installedCapabilities.contains(DaemonRuntimeProfile.terminal) {
             supportedNames.formUnion(AgentToolSchemas.registry.allTools().map(\.name).filter { $0 == "run_command" || $0.hasPrefix("terminal.") })
         }
         return AgentToolSchemas.registry.allTools().filter { supportedNames.contains($0.name) }

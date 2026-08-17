@@ -510,6 +510,7 @@ struct DeepSeekCodeChecks {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("deepseek-checks-\(UUID().uuidString)")
 
         let repository = try SessionRepository(directory: directory.appendingPathComponent("database", isDirectory: true))
+        let agentSupervisor = SessionSupervisor(repository: repository, instanceID: "core-check-agent-supervisor")
         precondition(sqliteTableExists(
             directory.appendingPathComponent("database/sessions.sqlite3"),
             name: "session_event_log"
@@ -1599,7 +1600,7 @@ struct DeepSeekCodeChecks {
             .textDelta("根因：状态没有同步。\n变更：补齐状态更新。\n验证结果：本地检查通过。\n仍存风险：无。"),
             .done
         ]])
-        let qualityAgent = NativeAgentHost(client: qualityAgentClient, eventStore: events, repository: repository)
+        let qualityAgent = NativeAgentHost(client: qualityAgentClient, eventStore: events, repository: repository, runtimeSupervisor: agentSupervisor)
         for try await _ in qualityAgent.run(AgentRunRequest(sessionID: qualitySession.id, prompt: "修复登录状态错误", mode: .acceptEdits, model: DeepSeekModelCatalog.proModel)) {}
         precondition(qualityAgentClient.recordedRequests.first?.messages.first?.content.contains("根因") == true)
         precondition(qualityAgentClient.recordedRequests.first?.messages.first?.content.contains("像有经验的同事") == true)
@@ -1621,6 +1622,7 @@ struct DeepSeekCodeChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: researchToolRouter,
             toolRegistry: researchRegistry
         )
@@ -1649,7 +1651,7 @@ struct DeepSeekCodeChecks {
         let strictDeliverySession = try repository.createSession(projectID: project.id, title: "严格交付门禁", mode: .acceptEdits)
         let strictContract = TaskContract(goal: "修复登录", requiredChanges: ["app.txt"], requiredTests: [.test("swift test")])
         try repository.saveTaskContract(strictContract, sessionID: strictDeliverySession.id)
-        let strictHost = NativeAgentHost(client: StaticChatClient(events: [.textDelta("已处理。"), .done]), eventStore: events, repository: repository)
+        let strictHost = NativeAgentHost(client: StaticChatClient(events: [.textDelta("已处理。"), .done]), eventStore: events, repository: repository, runtimeSupervisor: agentSupervisor)
         for try await _ in strictHost.run(AgentRunRequest(sessionID: strictDeliverySession.id, prompt: strictContract.goal, mode: .acceptEdits, model: "deepseek-chat", taskContract: strictContract)) {}
         let strictStatusEvents = try repository.events(sessionID: strictDeliverySession.id)
         precondition(strictStatusEvents.contains { $0.type == "session_status_changed" && $0.payload["status"] == SessionStatus.needsRepair.rawValue })
@@ -1661,7 +1663,7 @@ struct DeepSeekCodeChecks {
             [.textDelta("已读取 app.txt。"), .done]
         ])
         _ = try repository.importSession(StoredSession(id: "s2", projectID: project.id, title: "读取 app.txt", mode: .plan))
-        let toolHost = NativeAgentHost(client: toolClient, eventStore: events, workspace: workspace, repository: repository)
+        let toolHost = NativeAgentHost(client: toolClient, eventStore: events, workspace: workspace, repository: repository, runtimeSupervisor: agentSupervisor)
         var toolEvents: [AgentEvent] = []
         for try await event in toolHost.run(AgentRunRequest(sessionID: "s2", prompt: "读取 app.txt", mode: .plan, model: "deepseek-chat")) {
             toolEvents.append(event)
@@ -1681,7 +1683,7 @@ struct DeepSeekCodeChecks {
         // adapter tests relied on swallowed repository errors here; Runtime 3
         // now correctly rejects event writes for a non-existent aggregate.
         _ = try repository.importSession(StoredSession(id: "s-reasoning", projectID: project.id, title: "Reasoning 回填", mode: .acceptEdits))
-        let reasoningHost = NativeAgentHost(client: reasoningToolClient, eventStore: events, workspace: workspace, repository: repository)
+        let reasoningHost = NativeAgentHost(client: reasoningToolClient, eventStore: events, workspace: workspace, repository: repository, runtimeSupervisor: agentSupervisor)
         for try await _ in reasoningHost.run(AgentRunRequest(sessionID: "s-reasoning", prompt: "检查 reasoning 回填", mode: .acceptEdits, model: "deepseek-chat")) {}
         precondition(reasoningToolClient.recordedRequests.count >= 2)
         let secondReasoningRequest = reasoningToolClient.recordedRequests[1]
@@ -1693,7 +1695,7 @@ struct DeepSeekCodeChecks {
         let browserToolRegistry = ToolRegistry([browserTool])
         let browserToolRouter = ToolHostRouter(registry: browserToolRegistry)
         browserToolRouter.register(host: MemoryToolHost(output: "{\"ok\":true,\"url\":\"http://localhost:5173\",\"title\":\"Fixture\",\"domText\":\"Ready\",\"accessibilityTree\":\"status: Ready\",\"consoleErrors\":[],\"networkFailures\":[],\"snapshotVersion\":8}"), for: "browser.")
-        let browserAgent = NativeAgentHost(client: ScriptedChatClient(batches: [[.toolCall(id: "browser-1", name: "browser.snapshot", argumentsJSON: "{}"), .done], [.textDelta("浏览器证据已记录。"), .done]]), eventStore: events, repository: repository, toolRouter: browserToolRouter, toolRegistry: browserToolRegistry)
+        let browserAgent = NativeAgentHost(client: ScriptedChatClient(batches: [[.toolCall(id: "browser-1", name: "browser.snapshot", argumentsJSON: "{}"), .done], [.textDelta("浏览器证据已记录。"), .done]]), eventStore: events, repository: repository, runtimeSupervisor: agentSupervisor, toolRouter: browserToolRouter, toolRegistry: browserToolRegistry)
         for try await _ in browserAgent.run(AgentRunRequest(sessionID: "s-browser", prompt: "验证页面", mode: .plan, model: "deepseek-chat")) {}
         let browserAgentEvents = try repository.events(sessionID: "s-browser")
         precondition(browserAgentEvents.contains { $0.type == "browser_evidence_recorded" })
@@ -1702,7 +1704,7 @@ struct DeepSeekCodeChecks {
             [.toolCall(id: "read-crash", name: "read_file", argumentsJSON: "{\"path\":\"app.txt\"}"), .done]
         ])
         let injectedSession = try repository.createSession(projectID: project.id, title: "故障注入", mode: .plan)
-        let injectedHost = NativeAgentHost(client: injectedClient, eventStore: events, workspace: workspace, repository: repository, failureInjector: DeterministicFailureInjector(points: [.afterToolStarted]))
+        let injectedHost = NativeAgentHost(client: injectedClient, eventStore: events, workspace: workspace, repository: repository, runtimeSupervisor: agentSupervisor, failureInjector: DeterministicFailureInjector(points: [.afterToolStarted]))
         do {
             for try await _ in injectedHost.run(AgentRunRequest(sessionID: injectedSession.id, prompt: "读取并模拟崩溃", mode: .plan, model: "deepseek-chat")) {}
         } catch {
@@ -1738,7 +1740,7 @@ struct DeepSeekCodeChecks {
             [.toolCall(id: "patch-approval", name: "apply_patch", argumentsJSON: "{\"label\":\"approved patch\",\"changes\":[{\"path\":\"app.txt\",\"content\":\"one\\napproved\\n\"}]}"), .done],
             [.textDelta("批准后的补丁已验证。"), .done]
         ])
-        let approvalHost = NativeAgentHost(client: approvalClient, eventStore: events, workspace: workspace, repository: repository, projectTrusted: true, sandboxAvailable: true)
+        let approvalHost = NativeAgentHost(client: approvalClient, eventStore: events, workspace: workspace, repository: repository, runtimeSupervisor: agentSupervisor, projectTrusted: true, sandboxAvailable: true)
         var approvalEvents: [AgentEvent] = []
         for try await event in approvalHost.run(AgentRunRequest(sessionID: approvalSession.id, prompt: "更新 app.txt", mode: .manual, model: "deepseek-chat")) {
             approvalEvents.append(event)
@@ -1773,6 +1775,7 @@ struct DeepSeekCodeChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: webSearchRouter,
             toolRegistry: webSearchRegistry
         )
@@ -1798,6 +1801,7 @@ struct DeepSeekCodeChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: webSearchRouter,
             toolRegistry: webSearchRegistry,
             networkRuntime: runtime
@@ -1831,6 +1835,7 @@ struct DeepSeekCodeChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: webSearchRouter,
             toolRegistry: webSearchRegistry,
             networkRuntime: runtime

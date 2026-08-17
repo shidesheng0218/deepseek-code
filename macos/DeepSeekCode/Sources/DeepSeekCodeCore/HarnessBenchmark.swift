@@ -90,3 +90,52 @@ public struct HarnessBenchmarkRunner: Sendable {
         return HarnessBenchmarkReport(results: results.sorted { $0.fixtureID < $1.fixtureID })
     }
 }
+
+/// A release gate for benchmark evidence. It deliberately evaluates only the
+/// observed report: product marketing comparisons still require externally
+/// recorded Claude/Codex baselines, but an incomplete local fixture run can
+/// no longer be mistaken for a release-quality result.
+public struct BenchmarkReleaseRequirement: Codable, Equatable, Sendable {
+    public let minimumFixtures: Int
+    public let minimumPassRate: Double
+    public let requireEvidence: Bool
+
+    public init(minimumFixtures: Int, minimumPassRate: Double, requireEvidence: Bool = true) {
+        self.minimumFixtures = max(1, minimumFixtures)
+        self.minimumPassRate = min(1, max(0, minimumPassRate))
+        self.requireEvidence = requireEvidence
+    }
+}
+
+public struct BenchmarkReleaseGateResult: Codable, Equatable, Sendable {
+    public let passed: Bool
+    public let passRate: Double
+    public let failures: [String]
+
+    public init(passed: Bool, passRate: Double, failures: [String]) {
+        self.passed = passed
+        self.passRate = passRate
+        self.failures = failures
+    }
+}
+
+public enum BenchmarkReleaseGate {
+    public static func evaluate(
+        _ report: HarnessBenchmarkReport,
+        requirement: BenchmarkReleaseRequirement
+    ) -> BenchmarkReleaseGateResult {
+        let passRate = report.total == 0 ? 0 : Double(report.passed) / Double(report.total)
+        var failures: [String] = []
+        if report.total < requirement.minimumFixtures {
+            failures.append("fixture_count")
+        }
+        if passRate < requirement.minimumPassRate {
+            failures.append("pass_rate")
+        }
+        if requirement.requireEvidence,
+           report.results.contains(where: { $0.passed && $0.evidenceIDs.isEmpty }) {
+            failures.append("evidence_coverage")
+        }
+        return BenchmarkReleaseGateResult(passed: failures.isEmpty, passRate: passRate, failures: failures)
+    }
+}

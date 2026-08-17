@@ -113,12 +113,12 @@ public final class NativeAgentHost: @unchecked Sendable {
     private let networkRuntime: NetworkRuntime?
     private let hookManifest: HostCapabilityManifest?
     private let permissionLeaseStore: PermissionLeaseStore
-    /// NativeAgentHost is deliberately a provider/tool adapter. Durable
-    /// RunState and event writes are delegated to this Supervisor adapter so
-    /// the model loop never becomes a second repository writer.
+    /// NativeAgentHost is deliberately a provider/tool adapter. The daemon
+    /// injects its single SessionSupervisor; this type never manufactures a
+    /// second writer for a model turn.
     private let runtimeSupervisor: SessionSupervisor?
 
-    public init(client: any ChatStreaming, eventStore: EventStore, workspace: WorkspaceToolHost? = nil, repository: SessionRepository? = nil, projectTrusted: Bool = false, sandboxAvailable: Bool = false, toolRouter: ToolHostRouter? = nil, toolRegistry: ToolRegistry? = nil, hooks: [HookDefinition] = [], failureInjector: any FailureInjector = NoopFailureInjector(), defaultPricing: ProviderProfile? = nil, networkRuntime: NetworkRuntime? = nil, hookManifest: HostCapabilityManifest? = nil) {
+    public init(client: any ChatStreaming, eventStore: EventStore, workspace: WorkspaceToolHost? = nil, repository: SessionRepository? = nil, runtimeSupervisor: SessionSupervisor? = nil, projectTrusted: Bool = false, sandboxAvailable: Bool = false, toolRouter: ToolHostRouter? = nil, toolRegistry: ToolRegistry? = nil, hooks: [HookDefinition] = [], failureInjector: any FailureInjector = NoopFailureInjector(), defaultPricing: ProviderProfile? = nil, networkRuntime: NetworkRuntime? = nil, hookManifest: HostCapabilityManifest? = nil) {
         let resolvedRegistry = toolRegistry ?? AgentToolSchemas.registry
         let resolvedRouter: ToolHostRouter
         if let toolRouter {
@@ -158,9 +158,7 @@ public final class NativeAgentHost: @unchecked Sendable {
         self.networkRuntime = networkRuntime
         self.hookManifest = hookManifest
         self.permissionLeaseStore = PermissionLeaseStore(repository: repository)
-        self.runtimeSupervisor = repository.map {
-            SessionSupervisor(repository: $0, instanceID: "agent-host-runtime-adapter-\(UUID().uuidString)")
-        }
+        self.runtimeSupervisor = runtimeSupervisor
     }
 
     public func run(_ request: AgentRunRequest) -> AsyncThrowingStream<AgentEvent, Error> {

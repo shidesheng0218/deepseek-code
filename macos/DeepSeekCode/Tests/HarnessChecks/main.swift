@@ -45,6 +45,7 @@ struct DeepSeekCodeHarnessChecks {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let repository = try SessionRepository(directory: root.appendingPathComponent("Database", isDirectory: true))
+        let agentSupervisor = SessionSupervisor(repository: repository, instanceID: "harness-check-agent-supervisor")
         let project = try repository.createProject(name: "Harness", path: root.path)
         let session = try repository.createSession(projectID: project.id, title: "Public search", mode: .acceptEdits)
         let events = try EventStore(directory: root.appendingPathComponent("LegacyEvents", isDirectory: true))
@@ -63,6 +64,7 @@ struct DeepSeekCodeHarnessChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: router,
             toolRegistry: registry,
             networkRuntime: network
@@ -110,6 +112,7 @@ struct DeepSeekCodeHarnessChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: fetchRouter,
             toolRegistry: fetchRegistry,
             networkRuntime: network
@@ -140,6 +143,7 @@ struct DeepSeekCodeHarnessChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: failingRouter,
             toolRegistry: failingRegistry,
             networkRuntime: network
@@ -167,6 +171,7 @@ struct DeepSeekCodeHarnessChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: multiSearchRouter,
             toolRegistry: multiSearchRegistry,
             networkRuntime: network
@@ -207,6 +212,7 @@ struct DeepSeekCodeHarnessChecks {
             ]),
             eventStore: events,
             repository: repository,
+            runtimeSupervisor: agentSupervisor,
             toolRouter: leaseRouter,
             toolRegistry: leaseRegistry
         )

@@ -20,13 +20,17 @@ struct DeepSeekCodeDaemon {
                         .appendingPathComponent("Helper", isDirectory: true)
                 )
             )
+            let daemonHooks = (try? ExtensionStore(
+                directory: storageRoot.appendingPathComponent("Extensions", isDirectory: true)
+            ).listHooks()) ?? []
             let runner = NativeDaemonSessionRunner(
                 repository: repository,
                 eventStore: eventStore,
                 providerCatalog: providerCatalog,
                 secretStore: secretStore,
                 storageRoot: storageRoot,
-                terminalHost: terminalHost
+                terminalHost: terminalHost,
+                hooks: daemonHooks
             )
             let driver = DaemonSessionExecutionDriver(repository: repository, runner: runner)
             let workerDriver = ProcessChildAgentExecutionDriver(
@@ -46,6 +50,7 @@ struct DeepSeekCodeDaemon {
                 executionDriver: driver,
                 instanceID: "deepseekd-\(ProcessInfo.processInfo.processIdentifier)"
             )
+            runner.installRuntimeSupervisor(supervisor)
             // Safety-first recovery runs before accepting any new command.
             // Unknown writers are marked Needs Attention by the supervisor;
             // the daemon never auto-replays them.
@@ -57,6 +62,7 @@ struct DeepSeekCodeDaemon {
                 supervisor: supervisor,
                 workerRuntime: workerRuntime,
                 terminalHost: terminalHost,
+                runtimeProfile: runner.runtimeCapabilities,
                 instanceID: "deepseekd-\(ProcessInfo.processInfo.processIdentifier)"
             )
             let server = try DeepSeekDaemonServer(router: router, storageRoot: storageRoot)

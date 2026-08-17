@@ -10,6 +10,7 @@ public enum DeepSeekDaemonProtocol {
 
 public enum DeepSeekDaemonMethod: String, Codable, CaseIterable, Sendable {
     case handshake
+    case runtimeProfile = "runtime.profile"
     case sessionCreate = "session.create"
     case sessionList = "session.list"
     case sessionAttach = "session.attach"
@@ -427,12 +428,14 @@ public actor DeepSeekDaemonCommandRouter {
     private let startedAt: Date
     private let workerRuntime: (any ChildAgentRuntime)?
     private let terminalHost: (any PersistentTerminalHost)?
+    private let runtimeProfile: RuntimeProfile
 
     public init(
         repository: SessionRepository,
         supervisor: any DurableSessionSupervisor,
         workerRuntime: (any ChildAgentRuntime)? = nil,
         terminalHost: (any PersistentTerminalHost)? = nil,
+        runtimeProfile: RuntimeProfile = DaemonRuntimeProfile.conservative,
         instanceID: String = "deepseekd-\(UUID().uuidString)",
         startedAt: Date = Date()
     ) {
@@ -441,6 +444,7 @@ public actor DeepSeekDaemonCommandRouter {
         harness = LocalHarnessDaemon(repository: repository, supervisor: supervisor)
         self.workerRuntime = workerRuntime
         self.terminalHost = terminalHost
+        self.runtimeProfile = runtimeProfile
         self.instanceID = instanceID
         self.startedAt = startedAt
     }
@@ -458,6 +462,8 @@ public actor DeepSeekDaemonCommandRouter {
             switch request.method {
             case .handshake:
                 return try response(request.id, DeepSeekDaemonHandshake(instanceID: instanceID, startedAt: startedAt))
+            case .runtimeProfile:
+                return try response(request.id, runtimeProfile)
             case .sessionCreate:
                 let payload = try decode(DeepSeekDaemonCreateSessionPayload.self, from: request.payload)
                 let session = try await supervisor.createSession(

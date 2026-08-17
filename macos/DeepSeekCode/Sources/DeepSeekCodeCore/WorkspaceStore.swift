@@ -168,6 +168,10 @@ public final class WorkspaceStore {
     private let attachmentStore: AttachmentStore?
     private let repository: SessionRepository?
     private var connectedDaemonClient: DeepSeekDaemonClient?
+    /// Starts conservative and is replaced by the exact RuntimeProfile after
+    /// the local daemon handshake. Admission never assumes a foreground-only
+    /// capability such as Browser or SSH exists in deepseekd.
+    private var daemonRuntimeProfile: RuntimeProfile = DaemonRuntimeProfile.conservative
     private var controlPlane: LocalControlPlane?
     private var controlPlaneEventObserverID: UUID?
     private let networkRuntime: NetworkRuntime
@@ -1053,7 +1057,8 @@ public final class WorkspaceStore {
             parts: parts,
             route: route,
             hasEnabledHooks: hasEnabledHooks,
-            hasEnabledMCP: hasEnabledMCP
+            hasEnabledMCP: hasEnabledMCP,
+            profile: daemonRuntimeProfile
         ) else {
             statusMessage = daemonCapabilityMessage(
                 route: route,
@@ -1216,11 +1221,22 @@ public final class WorkspaceStore {
         if let connectedDaemonClient,
            let response = try? await connectedDaemonClient.send(DeepSeekDaemonRequest(method: .handshake)),
            response.ok {
+            await refreshDaemonRuntimeProfile(client: connectedDaemonClient)
             return connectedDaemonClient
         }
         let client = try await DeepSeekDaemonLauncher.connect(storageRoot: storageDirectory)
         connectedDaemonClient = client
+        await refreshDaemonRuntimeProfile(client: client)
         return client
+    }
+
+    private func refreshDaemonRuntimeProfile(client: DeepSeekDaemonClient) async {
+        guard let response = try? await client.send(DeepSeekDaemonRequest(method: .runtimeProfile)),
+              response.ok,
+              let profile = try? DeepSeekDaemonJSON.decoder.decode(RuntimeProfile.self, from: Data(response.output.utf8)) else {
+            return
+        }
+        daemonRuntimeProfile = profile
     }
 
     private func sendDaemon<T: Encodable>(

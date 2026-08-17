@@ -20,6 +20,15 @@ struct DeepSeekCodeDaemonChecks {
         let handshakePayload = try decode(DeepSeekDaemonHandshake.self, from: handshake.output)
         precondition(handshakePayload.protocolVersion == DeepSeekDaemonProtocol.version)
 
+        // Capability discovery is daemon-owned. Clients can only delegate a
+        // task after reading the exact assembled profile, never by assuming
+        // that a foreground-only host is present.
+        let profileResponse = await router.handle(DeepSeekDaemonRequest(method: .runtimeProfile))
+        precondition(profileResponse.ok)
+        let daemonProfile = try decode(RuntimeProfile.self, from: profileResponse.output)
+        precondition(daemonProfile.capabilities.contains(DaemonRuntimeProfile.webSearch))
+        precondition(!daemonProfile.capabilities.contains(DaemonRuntimeProfile.browser))
+
         let list = await router.handle(DeepSeekDaemonRequest(method: .sessionList))
         let summaries = try decode([DeepSeekDaemonSessionSummary].self, from: list.output)
         precondition(summaries.contains { $0.id == session.id && $0.title == "Daemon Session" })
@@ -202,8 +211,19 @@ struct DeepSeekCodeDaemonChecks {
             clientFactory: StaticDaemonClientFactory(events: [.textDelta("daemon agent response"), .done]),
             storageRoot: root
         )
+        let hookCapableRunner = NativeDaemonSessionRunner(
+            repository: repository,
+            eventStore: try EventStore(directory: root.appendingPathComponent("HookDaemonEvents", isDirectory: true)),
+            providerCatalog: providerCatalog,
+            secretStore: secrets,
+            clientFactory: StaticDaemonClientFactory(events: [.done]),
+            storageRoot: root,
+            hooks: [HookDefinition(id: "daemon-hook", lifecycle: .preToolUse, command: "true", trusted: true)]
+        )
+        precondition(hookCapableRunner.runtimeCapabilities.capabilities.contains(DaemonRuntimeProfile.hooks))
         let nativeDriver = DaemonSessionExecutionDriver(repository: repository, runner: nativeRunner)
         let nativeSupervisor = SessionSupervisor(repository: repository, executionDriver: nativeDriver, instanceID: "native-daemon-check")
+        nativeRunner.installRuntimeSupervisor(nativeSupervisor)
         _ = try await nativeSupervisor.admit(SessionInput(
             sessionID: nativeSession.id,
             idempotencyKey: "native-daemon-input",
@@ -243,6 +263,7 @@ struct DeepSeekCodeDaemonChecks {
         )
         let terminalDriver = DaemonSessionExecutionDriver(repository: repository, runner: terminalRunner)
         let terminalSupervisor = SessionSupervisor(repository: repository, executionDriver: terminalDriver, instanceID: "daemon-terminal-check")
+        terminalRunner.installRuntimeSupervisor(terminalSupervisor)
         _ = try await terminalSupervisor.admit(SessionInput(
             sessionID: terminalSession.id,
             idempotencyKey: "daemon-terminal-input",
