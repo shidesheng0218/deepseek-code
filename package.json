@@ -7,9 +7,7 @@
   "type": "module",
   "main": "dist/main/index.js",
   "scripts": {
-    "dev": "./scripts/run--fusion-desktop.sh",
-    "dev:": "./scripts/run--fusion-desktop.sh",
-    "dev:cli": "./scripts/run--fusion.sh",
+    "dev": "cd macos/DeepSeekCode && swift run DeepSeekCode",
     "dev:swift": "cd macos/DeepSeekCode && swift run DeepSeekCode",
     "build": "./scripts/build-macos-app.sh",
     "release:package": "./scripts/package-macos-release.sh",
