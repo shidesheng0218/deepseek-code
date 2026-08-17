@@ -65,6 +65,22 @@ flowchart LR
 - `src/`：历史 Electron/React 实现，仅保留作迁移与兼容参考；不再作为正式应用功能入口。
 - 每次发布均写入唯一 Build Stamp，并通过原子替换刷新 `/Applications/DeepSeek Code.app`。
 
+##  fusion layer
+
+为解决原生 Agent Loop 在多轮工具调用、Provider 兼容和交互成熟度上的短板，仓库已将  的 `dev` 分支固定为 `vendor/` Git submodule。新的融合路径是：** 提供 Session、Provider、Tool、Permission、MCP、LSP、CLI 与 Desktop 运行时；DeepSeek Code 提供本地 BYOK、安全策略、Evidence、迁移与 macOS 分发。**
+
+首次从源码运行融合 Runtime：
+
+```bash
+git submodule update --init --recursive
+cd vendor/ && bun install --ignore-scripts
+cd ../..
+export DEEPSEEK_API_KEY="…"
+./scripts/run--fusion.sh
+```
+
+`integrations//deepseek-local.json` 是没有密钥的 DeepSeek BYOK Profile；`deepseek-local-safety.ts` 会自动放行公开搜索、拒绝明显的私网/metadata Fetch，并保留 Fetch、编辑、Shell 与外部写入的审批。现有 SwiftUI App 仍是当前发布 UI；它会在后续阶段改为连接  本地 Control Plane，而不再维持第二套模型循环。
+
 ## 当前实现
 
 - 原生 SwiftUI 三栏工作区：Session、Conversation、Workspace 与 Inspector。
