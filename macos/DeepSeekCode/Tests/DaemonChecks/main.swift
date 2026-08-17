@@ -183,6 +183,32 @@ struct DeepSeekCodeDaemonChecks {
         precondition(executedParts == ["补充约束：保留对外 API", "通过 daemon 执行"])
         precondition(executionInputState == .consumed)
 
+        // -style prompt queues drain serially. A second user message
+        // admitted while a session is active must become the next turn without
+        // requiring the GUI to issue another `start` command.
+        let queuedSession = try repository.createSession(projectID: project.id, title: "Daemon queued execution", mode: .acceptEdits)
+        let queuedRunner = DaemonRunnerProbe()
+        let queuedDriver = DaemonSessionExecutionDriver(repository: repository, runner: queuedRunner)
+        let queuedSupervisor = SessionSupervisor(repository: repository, executionDriver: queuedDriver, instanceID: "daemon-queued-execution-check")
+        _ = try await queuedSupervisor.admit(SessionInput(
+            sessionID: queuedSession.id,
+            idempotencyKey: "queued-first",
+            delivery: .immediate,
+            parts: [.text("先完成第一条")]
+        ))
+        _ = try await queuedSupervisor.admit(SessionInput(
+            sessionID: queuedSession.id,
+            idempotencyKey: "queued-second",
+            delivery: .deferred,
+            parts: [.text("然后处理第二条")]
+        ))
+        try await queuedSupervisor.start(sessionID: queuedSession.id)
+        try await queuedRunner.waitForRunCount(2)
+        let queuedParts = await queuedRunner.allExecutedParts()
+        let queuedInputs = try repository.sessionInputs(sessionID: queuedSession.id)
+        precondition(queuedParts == [["先完成第一条"], ["然后处理第二条"]])
+        precondition(queuedInputs.allSatisfy { $0.state == .consumed })
+
         let providerCatalog = try ProviderCatalog(directory: root.appendingPathComponent("Providers", isDirectory: true))
         let profile = ProviderProfile(
             id: "daemon-fixture",
@@ -394,6 +420,15 @@ private actor DaemonRunnerProbe: DaemonSessionRunner {
 
     func startedSessionIDs() -> [String] { started }
     func executedParts() -> [String] { parts.first ?? [] }
+    func allExecutedParts() -> [[String]] { parts }
+
+    func waitForRunCount(_ count: Int, timeout: TimeInterval = 1) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while started.count < count {
+            guard Date() < deadline else { throw ChildAgentRuntimeError.timedOut }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
 }
 
 private struct DaemonWorkerProbe: ChildAgentExecutionDriver {

@@ -146,7 +146,7 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
                 commandID: "daemon-failed-status-\(runID)"
             )
         }
-        finish(sessionID: session.id, runID: runID)
+        await finish(sessionID: session.id, runID: runID)
     }
 
     private func executeApprovalResume(
@@ -174,16 +174,25 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
                 causationID: approvalID
             )
         }
-        finish(sessionID: session.id, runID: runID)
+        await finish(sessionID: session.id, runID: runID)
     }
 
-    private func finish(sessionID: String, runID: String) {
+    /// Mirrors 's serial prompt queue: once a turn reaches a durable
+    /// boundary, immediately claim and run the next accepted primary input.
+    /// The next `start` call remains idempotent, so an overlapping GUI/CLI
+    /// request cannot create a second concurrent model turn.
+    private func finish(sessionID: String, runID: String) async {
         guard activeRunIDs[sessionID] == runID else { return }
         activeRunIDs.removeValue(forKey: sessionID)
         tasks.removeValue(forKey: sessionID)
         // A stopped control can never be resumed; drop it so the next start
         // builds a fresh control instead of failing at the first boundary.
         controls.removeValue(forKey: sessionID)
+
+        // `start` promotes exactly one durable input boundary. If no prompt
+        // is queued it is a no-op; otherwise it creates the next bounded
+        // task before this finished turn releases its queue ownership.
+        try? await start(sessionID: sessionID)
     }
 
     private struct RunnableInputBatch: Sendable {
