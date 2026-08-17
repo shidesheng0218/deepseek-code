@@ -1,8 +1,48 @@
-# DeepSeek Code Desktop
+<div align="center">
 
-一个面向个人开发者的、本地优先的 DeepSeek 编码代理桌面应用。它采用 Session 驱动的工作流，目标是将对话、计划、权限审批、文件修改、Git Worktree、Diff 审查、终端与浏览器验证整合到一个轻量桌面工作台中。
+# DeepSeek Code
 
-> 这是一个非官方开源项目，与 DeepSeek 无隶属关系。
+**本地优先、原生 macOS 的编码 Agent 工作台。**
+
+将对话、计划、工具、证据、审批与交付状态收进同一条可恢复的 Session。
+
+[下载最新版](https://github.com/shidesheng0218/deepseek-code/releases/latest) · [快速开始](#下载使用) · [架构](#当前产品真源) · [安全与权限](#当前命令风险策略) · [开发](#本地开发)
+
+`macOS 14+` · `Apple Silicon` · `SwiftUI` · `BYOK` · `本地优先`
+
+</div>
+
+> [!NOTE]
+> 这是一个非官方开源项目，与 DeepSeek 无隶属关系。项目不提供产品云 Agent：模型凭据、项目文件、Session 和证据默认保留在用户的 Mac 上。
+
+## 为什么是 DeepSeek Code？
+
+它不是简单地把聊天框和终端并排放在一起，而是把一次任务作为可恢复、可审计的工作单元：模型回复、工具调用、权限决定、文件证据和验证结果都绑定到同一个 Session。
+
+| 你关心的事           | DeepSeek Code 的处理方式                                |
+| -------------------- | ------------------------------------------------------- |
+| “帮我修这个 Bug”     | 读项目 → 修改 → 运行验证 → 汇总变更与风险               |
+| “查官方文档”         | 公开只读搜索与抓取自动执行，并保存可追溯 Citation       |
+| “不要一直点审批”     | 项目内读取、已识别测试和公开联网低打断；外部交付仍受控  |
+| App 或 Provider 中断 | Session 事件持久化；状态未知的副作用绝不自动重放        |
+| “这次到底做了什么？” | 对话保持自然，工具、证据、风险和用量可在 Inspector 展开 |
+
+```mermaid
+flowchart LR
+    U["开发者"] --> GUI["SwiftUI App / CLI"]
+    GUI --> IPC["本地 IPC"]
+    IPC --> D["deepseekd"]
+    D --> S["SessionSupervisor\n唯一命令与状态所有者"]
+    S --> M["Provider + 模型路由"]
+    S --> P["Tool Execution Pipeline"]
+    P --> W["Workspace / Git"]
+    P --> T["Persistent Terminal"]
+    P --> R["Web Search / Fetch"]
+    P --> A["Read-only Workers"]
+    S --> E[("SQLite Event Log\n+ Evidence")]
+    E --> V["Projection + Verification Gate"]
+    V --> GUI
+```
 
 ## 下载使用
 
@@ -44,12 +84,85 @@
 - `DeepSeekCodeCore` 提供 Durable Session、Provider、Keychain、事件流、权限、Workspace、Git、Review、Skills、MCP、Hooks、Browser、Terminal 与 SSH 运行时。
 - Composer 已接入真实 DeepSeek/OpenAI-compatible SSE 与 Anthropic Messages，支持工具审批、Token/费用和延迟审计。
 
+## 一次任务如何完成
+
+```mermaid
+sequenceDiagram
+    participant You as 你
+    participant App as App / CLI
+    participant S as SessionSupervisor
+    participant P as Tool Pipeline
+    participant E as Event Log + Evidence
+
+    You->>App: “修复登录问题并验证”
+    App->>S: 提交 Session Command
+    S->>E: turn_started / step_started
+    S->>P: 读取项目、修改、测试
+    P->>E: 工具事件、脱敏结果、Evidence
+    alt 低风险且已授权
+        P-->>S: 自动执行
+    else 外部写入、登录或高风险操作
+        P-->>App: 请求一次审批
+        App->>S: Approval Resolution
+        S->>P: 精确续跑原调用
+    end
+    S->>E: verification_evaluated
+    S-->>App: 自然语言结果 + 可展开证据
+```
+
+模型不能只凭一句“完成了”把任务标记为交付完成。任务会沿可回放状态机推进：
+
+```text
+admitted → planning → executing → awaitingApproval → verifying
+        → repairing → handoffReady → delivering → delivered
+                                      ↘ needsRepair / needsAttention
+```
+
+### Runtime 3.0 的关键约束
+
+```mermaid
+flowchart TB
+    C["GUI / CLI / Control Plane"] --> CC["Command Client"]
+    CC --> SS["SessionSupervisor"]
+    SS --> TD["SessionExecutionDriver"]
+    TD --> TP["ToolExecutionPipeline"]
+    TP --> CH["Capability Hosts"]
+    TP --> WH["Worker Helper"]
+    SS --> EW["SessionEventCommitter"]
+    EW --> DB[("SQLite")]
+    DB --> PR["Read-only Projection"]
+    PR --> C
+
+    style SS fill:#1d4ed8,color:#fff,stroke:#1e3a8a
+    style TP fill:#0f766e,color:#fff,stroke:#134e4a
+    style DB fill:#7c3aed,color:#fff,stroke:#4c1d95
+```
+
+**关键规则**：UI、CLI、Control Plane、Tool Host 和 Worker 不直接写 Session 状态。所有可见状态都来自事件投影；所有工具必须经过同一条 Pipeline。
+
 ## 本地开发
 
 ```bash
 cd macos/DeepSeekCode
 swift run DeepSeekCode
 ```
+
+### 使用 CLI 与 daemon
+
+```bash
+# 终端 A：启动本地 Runtime
+cd macos/DeepSeekCode
+swift run deepseekd
+```
+
+```bash
+# 终端 B：连接同一个 Runtime
+cd macos/DeepSeekCode
+swift run deepseek ask "解释当前项目的构建入口"
+swift run deepseek run "修复登录问题并运行测试"
+```
+
+GUI 与 CLI 通过本地 IPC 连接同一个 Runtime，因此可看到同一组 Session、审批、Terminal 与 Evidence。
 
 生成可分发的 macOS `.app`：
 
@@ -108,13 +221,32 @@ shasum -a 256 -c SHA256SUMS.txt
 
 ## 当前命令风险策略
 
-| 风险 | 典型操作 | 默认行为 |
-|---|---|---|
-| L0 | 搜索、读取、Git 状态 | 自动允许 |
-| L1 | 补丁、测试、Lint、构建 | Accept Edits / Auto 允许 |
-| L2 | 安装依赖、联网、Commit、Push | 请求确认 |
-| L3 | 删除、权限变更、工作区外写入 | 阻止或强确认 |
-| L4 | `sudo`、磁盘擦除、强制推送、破坏性递归删除 | 直接阻止 |
+| 风险 | 典型操作                                      | 默认行为                     |
+| ---- | --------------------------------------------- | ---------------------------- |
+| L0   | 工作区读取、公开 Web Search / Fetch、Git 状态 | 自动允许                     |
+| L1   | 项目内补丁、已识别测试、Lint、构建            | Trusted Workspace 下自动执行 |
+| L2   | 安装依赖、Commit、Push、外部服务写入          | 请求确认                     |
+| L3   | 删除、权限变更、工作区外写入                  | 阻止或强确认                 |
+| L4   | `sudo`、磁盘擦除、强制推送、破坏性递归删除    | 直接阻止                     |
+
+### 低打断不等于越权
+
+```mermaid
+flowchart LR
+    I["工具请求"] --> V["Schema + 风险分析"]
+    V --> S["Sandbox / Capability 检查"]
+    S -->|"公开只读、项目内读取、已识别测试"| A["自动执行"]
+    S -->|"外部写入、登录、Push、SSH 写入"| Q["一次性审批"]
+    S -->|"私网、metadata、L4 操作"| B["阻止"]
+    A --> E["脱敏 Evidence"]
+    Q --> E
+```
+
+- 公开 HTTP/HTTPS Search 和 Fetch 默认自动，但仍记录 Citation、内容哈希和获取时间。
+- localhost、私网、链路本地、metadata 地址、DNS rebinding 和危险重定向永久阻止。
+- 网页内容是**不可信数据**，不能修改系统提示、权限或工具策略。
+- API Key、Cookie、密码和私钥不进入模型上下文、SQLite、Transcript 或普通日志。
+- `RuntimeProfile` 只声明 daemon 真正装配的能力；没有可靠 Host 的 Browser、MCP 或 SSH 不会被静默委派。
 
 ## 发布硬化中的工作
 
@@ -123,6 +255,53 @@ shasum -a 256 -c SHA256SUMS.txt
 - 完整 XCUITest、故障注入、签名、公证与自动更新回滚验证。
 - Windows/Linux、产品云、团队账号、手机远控和无人监管系统自动化不在 1.0 范围内。
 
+## 当前边界：已具备 vs. 正在硬化
+
+| 已具备                                                     | 正在硬化，尚不应宣传为完成                         |
+| ---------------------------------------------------------- | -------------------------------------------------- |
+| SwiftUI + CLI、daemon、SessionSupervisor、SQLite Event Log | Browser → Test → Review → PR → CI 的真实端到端验收 |
+| Tool Pipeline、审批续跑、Web Evidence、持久 Terminal 模型  | SSH 长连接与断线恢复的发布级验证                   |
+| Provider 路由、用量/费用记录、Worker Evidence 采纳         | 60 个真实任务、CI 修复与竞品同题基准               |
+| GitHub DMG 构建与可选签名/公证                             | 完整 XCUITest、故障注入与自动更新回滚              |
+
+`BenchmarkReleaseGate` 会检查 fixture 数量、通过率和 Evidence 覆盖率，避免不完整的本地运行被误判为发布级成绩；这**不等同于**已在同题基准上超过 Claude Code 或 Codex。
+
 ## 验证
 
 当前测试覆盖权限策略、使用量计费、Session 事件回放、SQLite 存储、DeepSeek/OpenAI-compatible SSE、工作区隔离、Agent 审批状态机、Git Worktree 和关键 UI 交互。
+
+建议在改动 Runtime 前至少运行：
+
+```bash
+cd macos/DeepSeekCode
+swift build --jobs 2
+swift run --jobs 2 DeepSeekCodeChecks
+swift run --jobs 2 DeepSeekCodeRuntimeV2Checks
+swift run --jobs 2 DeepSeekCodeHarnessChecks
+swift run --jobs 2 DeepSeekCodeDaemonChecks
+swift run --jobs 2 DeepSeekCodeWorkerChecks
+swift run --jobs 2 DeepSeekCodeCLIChecks
+```
+
+SSH loopback 检查需要设置 `DEEPSEEK_TOOLHOST_PATH`；未设置时会明确跳过，不会被计为通过。
+
+## 仓库结构
+
+```text
+.
+├── macos/DeepSeekCode/
+│   ├── Sources/DeepSeekCodeApp/      # SwiftUI App
+│   ├── Sources/DeepSeekCodeCore/     # Domain、Runtime、Provider、Pipeline
+│   ├── Sources/DeepSeekCodeDaemon/   # deepseekd
+│   ├── Sources/DeepSeekCodeCLI/      # deepseek CLI
+│   └── Tests/                        # Core、Runtime、Harness、Daemon、Worker、CLI
+├── scripts/                          # App、DMG 与 Release 验证脚本
+├── .github/workflows/macos.yml       # GitHub Release workflow
+└── src/                              # 历史 Electron / React 迁移参考（非正式运行时）
+```
+
+## 贡献与许可
+
+欢迎提交 Issue、复现任务和 Pull Request。涉及 Provider 密钥、Session 数据、GitHub Token、Cookie 或私钥的内容请先脱敏，切勿提交到仓库。
+
+本项目以 [MIT License](LICENSE) 发布。
