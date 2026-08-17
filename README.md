@@ -59,11 +59,12 @@ flowchart LR
 
 ## 当前产品真源
 
-正式产品是 **SwiftUI + DeepSeekCodeCore 的原生 macOS App**，面向 Apple Silicon、macOS 14+。
+正式的 Agent 执行底座已切换为 ** Runtime**；默认开发入口启动  Desktop，CLI/TUI 可通过 `npm run dev:cli` 使用。
 
-- `macos/DeepSeekCode`：唯一正式运行时、构建入口与发布产物来源。
-- `src/`：历史 Electron/React 实现，仅保留作迁移与兼容参考；不再作为正式应用功能入口。
-- 每次发布均写入唯一 Build Stamp，并通过原子替换刷新 `/Applications/DeepSeek Code.app`。
+- `vendor/`：固定版本的  Session、Provider、Tool、Permission、MCP、LSP、CLI 与 Desktop 上游。
+- `integrations/`：DeepSeek BYOK、Keychain 继承、网络安全策略与迁移配置。
+- `macos/DeepSeekCode`：SwiftUI 迁移客户端、旧 Session/Provider 数据恢复和发布兼容工具；不再作为默认 Agent Loop。
+- `src/`：更早的 Electron/React 实现，仅保留作迁移与兼容参考。
 
 ##  fusion layer
 
@@ -79,7 +80,9 @@ export DEEPSEEK_API_KEY="…"
 ./scripts/run--fusion.sh
 ```
 
-`integrations//deepseek-local.json` 是没有密钥的 DeepSeek BYOK Profile；`deepseek-local-safety.ts` 会自动放行公开搜索、拒绝明显的私网/metadata Fetch，并保留 Fetch、编辑、Shell 与外部写入的审批。现有 SwiftUI App 仍是当前发布 UI；它会在后续阶段改为连接  本地 Control Plane，而不再维持第二套模型循环。
+`integrations//deepseek-local.json` 是没有密钥的 DeepSeek BYOK Profile；启动器会优先读取旧 Swift 客户端同一条 Keychain 引用，或使用显式的 `DEEPSEEK_API_KEY`，并且不会把密钥写入 Profile、日志或终端输出。`deepseek-local-safety.ts` 会自动放行公开搜索、拒绝明显的私网/metadata Fetch，并保留 Fetch、编辑、Shell 与外部写入的审批。现有 SwiftUI App 仍是当前发布 UI；它会在后续阶段改为连接  本地 Control Plane，而不再维持第二套模型循环。
+
+开发机已安装  Desktop 但尚未下载本仓库所需 Electron 时，启动器会使用 `/Applications/.app` 作为临时 Desktop fallback，并继承相同的本地 Profile。发布构建不会依赖这个 fallback，而是使用 `vendor/` 的固定依赖。
 
 ## 当前实现
 
@@ -157,6 +160,25 @@ flowchart TB
 **关键规则**：UI、CLI、Control Plane、Tool Host 和 Worker 不直接写 Session 状态。所有可见状态都来自事件投影；所有工具必须经过同一条 Pipeline。
 
 ## 本地开发
+
+默认开发入口已切换为  Desktop 融合 Runtime：
+
+```bash
+export DEEPSEEK_API_KEY="…"
+npm run dev
+```
+
+若只需要  CLI/TUI，不启动桌面窗口：
+
+```bash
+npm run dev:cli
+```
+
+如需检查旧 SwiftUI 客户端或执行迁移回归，可显式运行：
+
+```bash
+npm run dev:swift
+```
 
 ```bash
 cd macos/DeepSeekCode
