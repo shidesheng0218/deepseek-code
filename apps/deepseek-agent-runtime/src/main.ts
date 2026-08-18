@@ -151,6 +151,7 @@ function sessionRoot(): string {
 class JsonlEventStore {
   private readonly sequences = new Map<string, number>()
   private readonly tails = new Map<string, Promise<void>>()
+  private readonly correlations = new Map<string, string>()
 
   async append(sessionID: string, type: string, payload: Record<string, unknown>): Promise<string> {
     const previous = this.tails.get(sessionID) ?? Promise.resolve()
@@ -162,7 +163,15 @@ class JsonlEventStore {
       if (sequence === undefined) {
         try {
           const existing = await readFile(file, "utf8")
-          sequence = existing.split("\n").filter(Boolean).length
+          const lines = existing.split("\n").filter(Boolean)
+          sequence = lines.length
+          const last = lines.at(-1)
+          if (last) {
+            try {
+              const previousEvent = JSON.parse(last) as { correlationID?: unknown }
+              if (typeof previousEvent.correlationID === "string") this.correlations.set(sessionID, previousEvent.correlationID)
+            } catch { /* A malformed historical line is ignored; the next event receives a fresh correlation. */ }
+          }
         } catch {
           sequence = 0
         }
@@ -170,7 +179,11 @@ class JsonlEventStore {
       sequence += 1
       this.sequences.set(sessionID, sequence)
       const eventID = crypto.randomUUID()
-      await appendFile(file, `${JSON.stringify({ eventID, sessionID, sequence, type, payload, createdAt: new Date().toISOString() })}\n`)
+      const correlationID = type === "turn_started" ? crypto.randomUUID() : this.correlations.get(sessionID) ?? sessionID
+      this.correlations.set(sessionID, correlationID)
+      const commandID = typeof payload.commandID === "string" ? payload.commandID : `command:${correlationID}`
+      const causationID = typeof payload.causationID === "string" ? payload.causationID : commandID
+      await appendFile(file, `${JSON.stringify({ schemaVersion: 1, eventID, commandID, causationID, correlationID, sessionID, sequence, type, payload, createdAt: new Date().toISOString() })}\n`)
       return eventID
     })
     this.tails.set(sessionID, next.then(() => undefined, () => undefined))
@@ -813,6 +826,7 @@ async function drain(sessionID: string): Promise<void> {
     while (queue.length > 0) {
       const request = queue.shift()!
       try {
+        await eventStore.append(sessionID, "input_claimed", { inputID: request.id })
         const result = await executeRun(request)
         respond({ id: request.id, type: "response", ok: true, sessionID, result })
         if (request.repair) await completeCIRepair(request.repair, result)
@@ -841,6 +855,7 @@ function enqueue(request: Request): Response {
   const queue = queues.get(sessionID) ?? []
   queue.push({ id: request.id, params: { ...params, sessionID, prompt: text } as AgentRunParams })
   queues.set(sessionID, queue)
+  void eventStore.append(sessionID, "input_enqueued", { inputID: request.id, prompt: redact(text), projectPath: params?.projectPath })
   void drain(sessionID)
   return { id: request.id, type: "response", ok: true, result: { queued: queue.length, sessionID } }
 }

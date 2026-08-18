@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -62,5 +62,9 @@ describe('Agent Sidecar session inbox', () => {
       { role: 'assistant', content: '第一轮完成' },
       { role: 'user', content: '第二轮问题' }
     ]);
+    const eventLines = (await readFile(join(root, 'sessions', 'queue-session.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(eventLines.length).toBeGreaterThan(0);
+    expect(eventLines.every((event) => event.schemaVersion === 1 && typeof event.eventID === 'string' && typeof event.commandID === 'string' && typeof event.correlationID === 'string' && typeof event.sequence === 'number')).toBe(true);
+    expect(eventLines.map((event) => event.type)).toEqual(expect.arrayContaining(['input_enqueued', 'input_claimed']));
   });
 });
