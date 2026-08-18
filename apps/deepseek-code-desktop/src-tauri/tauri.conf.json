@@ -5,5 +5,10 @@
   "identifier": "com.deepseekcode.desktop",
   "build": { "beforeDevCommand": "npm run dev:web", "beforeBuildCommand": "npm run build:web", "devUrl": "http://localhost:1420", "frontendDist": "../dist" },
   "app": { "windows": [{ "label": "main", "title": "DeepSeek Code", "width": 1360, "height": 880, "minWidth": 960, "minHeight": 640, "resizable": true }], "security": { "csp": null } },
-  "bundle": { "active": true, "targets": ["app", "dmg"], "externalBin": ["binaries/deepseek-agent-runtime"] }
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "externalBin": ["binaries/deepseek-agent-runtime"],
+    "resources": { "resources/browser/": "browser/" }
+  }
 }

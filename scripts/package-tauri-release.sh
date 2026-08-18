@@ -15,6 +15,7 @@ release_dir="$root/dist"
 release_dmg="$release_dir/DeepSeek-Code-${version}-arm64.dmg"
 
 npm --prefix "$desktop" run prepare:sidecar
+npm --prefix "$desktop" run prepare:browser
 npm --prefix "$desktop" run build:web
 (cd "$desktop" && ./node_modules/.bin/tauri build --config "{\"version\":\"$version\"}")
 test -f "$source_dmg"

@@ -1,9 +1,16 @@
 import { access } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import type { BrowserLauncher } from './browser-evidence';
 
-function candidatePaths(): string[] {
+export function browserExecutableCandidates(execPath = process.execPath): string[] {
+  const bundledResource = join(dirname(execPath), '..', 'Resources', 'browser', 'chrome-headless-shell');
+  const configuredRuntime = process.env.DEEPSEEK_BROWSER_RUNTIME_DIR
+    ? join(process.env.DEEPSEEK_BROWSER_RUNTIME_DIR, 'chrome-headless-shell')
+    : '';
   return [
     process.env.DEEPSEEK_BROWSER_EXECUTABLE ?? '',
+    configuredRuntime,
+    bundledResource,
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     '/Applications/Chromium.app/Contents/MacOS/Chromium'
   ].filter(Boolean);
@@ -11,7 +18,7 @@ function candidatePaths(): string[] {
 
 export async function localChromiumLauncher(): Promise<ReturnType<BrowserLauncher['launch']> extends Promise<infer T> ? T : never> {
   let executablePath: string | undefined;
-  for (const candidate of candidatePaths()) {
+  for (const candidate of browserExecutableCandidates()) {
     try { await access(candidate); executablePath = candidate; break; } catch { /* Try the next browser. */ }
   }
   if (!executablePath) throw new Error('Browser capability requires Google Chrome, Chromium, or DEEPSEEK_BROWSER_EXECUTABLE.');
