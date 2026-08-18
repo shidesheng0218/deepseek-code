@@ -18,6 +18,7 @@ import { getGitHubCIStatus } from "../../../src/core/github-ci"
 import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
 import { collectBrowserEvidence } from "../../../src/core/browser-evidence"
 import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
+import { classifyCIFailureLog } from "../../../src/core/ci-log-classifier"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 
@@ -58,6 +59,7 @@ type RuntimeEvent =
   | { type: "verification_passed"; kind: string; command: string }
   | { type: "delivery_evaluated"; state: string; reasons: string[] }
   | { type: "browser_evidence"; url: string; ok: boolean; screenshotPath?: string; consoleErrorCount: number; networkCount: number }
+  | { type: "ci_failure_classified"; runID: number; kind: string; summary: string }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -71,6 +73,7 @@ const toolSchemas = [
   { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
   { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore 或 Review Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review"] } }, required: ["type"] } } }
   , { type: "function", function: { name: "github_ci_status", description: "读取当前 Commit 对应的 GitHub Actions CI 状态", parameters: { type: "object", properties: {}, required: [] } } }
+  , { type: "function", function: { name: "github_ci_failure_log", description: "读取 GitHub Actions 失败日志并分类根因", parameters: { type: "object", properties: { runID: { type: "number" } }, required: ["runID"] } } }
   , { type: "function", function: { name: "browser_evidence", description: "使用本机 Chrome/Chromium 验收页面、采集 DOM、console、network 和截图", parameters: { type: "object", properties: { url: { type: "string" }, expectedText: { type: "string" } }, required: ["url"] } } }
 ]
 type ToolSchema = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }
@@ -276,6 +279,15 @@ async function githubCIStatus(sessionID: string, projectPath: string): Promise<u
   return { commit, ...result }
 }
 
+async function githubCIFailureLog(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const runID = typeof input.runID === "number" && Number.isInteger(input.runID) ? input.runID : undefined
+  if (!runID) throw new Error("github_ci_failure_log requires numeric runID")
+  const log = (await execFile("gh", ["run", "view", String(runID), "--log-failed"], { cwd: projectPath, maxBuffer: 1_000_000 })).stdout.slice(0, 200_000)
+  const classification = classifyCIFailureLog(log)
+  await emitSessionEvent(sessionID, { type: "ci_failure_classified", runID, kind: classification.kind, summary: classification.summary })
+  return { runID, ...classification, log }
+}
+
 async function browserEvidence(sessionID: string, input: Record<string, unknown>): Promise<unknown> {
   const url = typeof input.url === "string" ? input.url : ""
   const expectedText = typeof input.expectedText === "string" ? input.expectedText : undefined
@@ -360,6 +372,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       web_fetch: webTools.web_fetch,
       delegate_worker: (input) => delegateWorker(sessionID, projectPath, input),
       github_ci_status: () => githubCIStatus(sessionID, projectPath),
+      github_ci_failure_log: (input) => githubCIFailureLog(sessionID, projectPath, input),
       browser_evidence: (input) => browserEvidence(sessionID, input),
       ...mcp.handlers,
       ...lsp.handlers
@@ -421,7 +434,7 @@ async function executeApproval(request: Request): Promise<{ text: string; status
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...lsp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
