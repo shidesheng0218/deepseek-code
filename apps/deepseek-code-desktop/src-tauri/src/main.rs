@@ -22,6 +22,14 @@ struct RuntimeSettings {
     api_key: String,
 }
 
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct RestoredMessage { role: String, text: String }
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSummary { session_id: String, title: String, updated_at: u64 }
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRequest {
@@ -58,6 +66,68 @@ struct RuntimeProcess(Arc<Mutex<Option<CommandChild>>>);
 fn settings_path() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join("Library/Application Support/DeepSeekCode/settings.json")
+}
+
+fn sessions_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join("Library/Application Support/DeepSeekCode/sessions")
+}
+
+fn is_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty() && session_id.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+}
+
+fn parse_session_history(events: &str) -> Vec<RestoredMessage> {
+    let mut messages = Vec::new();
+    let mut assistant = String::new();
+    for line in events.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let payload = event.get("payload").and_then(serde_json::Value::as_object);
+        if event_type == "turn_started" {
+            if let Some(prompt) = payload.and_then(|value| value.get("prompt")).and_then(serde_json::Value::as_str) {
+                messages.push(RestoredMessage { role: "user".into(), text: prompt.into() });
+            }
+        }
+        if event_type == "assistant_text" {
+            if let Some(text) = payload.and_then(|value| value.get("text")).and_then(serde_json::Value::as_str) { assistant.push_str(text); }
+        }
+        if event_type == "turn_ended" && !assistant.is_empty() {
+            messages.push(RestoredMessage { role: "assistant".into(), text: std::mem::take(&mut assistant) });
+        }
+    }
+    messages
+}
+
+fn read_session_events(session_id: &str) -> Result<String, String> {
+    if !is_safe_session_id(session_id) { return Err("会话 ID 无效".into()); }
+    fs::read_to_string(sessions_path().join(format!("{session_id}.jsonl"))).map_err(|error| error.to_string())
+}
+
+fn session_title(events: &str, fallback: &str) -> String {
+    for line in events.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("turn_started") { continue; }
+        if let Some(prompt) = event.get("payload").and_then(|value| value.get("prompt")).and_then(serde_json::Value::as_str) {
+            let title: String = prompt.chars().take(56).collect();
+            return if prompt.chars().count() > 56 { format!("{title}…") } else { title };
+        }
+    }
+    fallback.into()
+}
+
+fn list_session_summaries() -> Vec<SessionSummary> {
+    let Ok(entries) = fs::read_dir(sessions_path()) else { return Vec::new(); };
+    let mut sessions = entries.filter_map(Result::ok).filter_map(|entry| {
+        let path = entry.path();
+        let session_id = path.file_stem()?.to_str()?.to_string();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") || !is_safe_session_id(&session_id) { return None; }
+        let events = fs::read_to_string(&path).ok()?;
+        let updated_at = entry.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        Some(SessionSummary { title: session_title(&events, &session_id), session_id, updated_at })
+    }).collect::<Vec<_>>();
+    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    sessions
 }
 
 fn keychain_service() -> &'static str { "com.deepseekcode.desktop.api-key" }
@@ -98,6 +168,14 @@ fn load_settings() -> Result<RuntimeSettings, String> {
     } else { RuntimeSettings::default() };
     settings.api_key = read_keychain();
     Ok(settings)
+}
+
+#[tauri::command]
+fn list_sessions() -> Vec<SessionSummary> { list_session_summaries() }
+
+#[tauri::command]
+fn load_session_history(session_id: String) -> Result<Vec<RestoredMessage>, String> {
+    Ok(parse_session_history(&read_session_events(&session_id)?))
 }
 
 #[tauri::command]
@@ -175,7 +253,27 @@ fn main() {
     tauri::Builder::default()
         .manage(RuntimeProcess(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![runtime_status, load_settings, save_settings, run_agent, resolve_approval, cancel_session])
+        .invoke_handler(tauri::generate_handler![runtime_status, load_settings, save_settings, list_sessions, load_session_history, run_agent, resolve_approval, cancel_session])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restores_committed_user_and_assistant_messages_from_session_events() {
+        let events = concat!(
+            "{\"type\":\"turn_started\",\"payload\":{\"prompt\":\"修复登录问题\"}}\n",
+            "{\"type\":\"assistant_text\",\"payload\":{\"text\":\"已定位\"}}\n",
+            "{\"type\":\"assistant_text\",\"payload\":{\"text\":\"并修复。\"}}\n",
+            "{\"type\":\"turn_ended\",\"payload\":{\"status\":\"completed\"}}\n"
+        );
+
+        assert_eq!(parse_session_history(events), vec![
+            RestoredMessage { role: "user".into(), text: "修复登录问题".into() },
+            RestoredMessage { role: "assistant".into(), text: "已定位并修复。".into() }
+        ]);
+    }
 }

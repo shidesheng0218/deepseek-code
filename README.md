@@ -81,6 +81,7 @@ flowchart LR
 ## 当前实现
 
 - Tauri 轻量工作区：Session、Conversation、Workspace 与 Runtime 状态。
+- Tauri 启动时恢复最近会话列表与已提交的用户/助手对话；工具中断不会伪装成完整回复。
 - SwiftUI 旧版仍保留完整的三栏工作区，作为能力迁移和旧数据验证参考。
 - 中文优先的 Session、计划、工具活动、Diff、Browser 和 Review 界面。
 - Plan / Manual / Accept Edits / Auto 四种权限模式。

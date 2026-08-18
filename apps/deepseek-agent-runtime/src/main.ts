@@ -48,7 +48,7 @@ type Request = {
   }
 }
 
-type Response = { id: string; type: "response"; ok: boolean; result?: unknown; error?: string }
+type Response = { id: string; type: "response"; ok: boolean; sessionID?: string; result?: unknown; error?: string }
 type RuntimeEventFrame = {
   id: string
   type: "event"
@@ -545,12 +545,12 @@ async function drain(sessionID: string): Promise<void> {
       const request = queue.shift()!
       try {
         const result = await executeRun(request)
-        respond({ id: request.id, type: "response", ok: true, result })
+        respond({ id: request.id, type: "response", ok: true, sessionID, result })
         if (request.repair) await completeCIRepair(request.repair, result)
         else if (result.status === "completed") completedParentTurn = true
       } catch (error) {
         const message = redact(error instanceof Error ? error.message : String(error))
-        respond({ id: request.id, type: "response", ok: false, error: message })
+        respond({ id: request.id, type: "response", ok: false, sessionID, error: message })
         if (request.repair) await failCIRepair(request.repair, message)
       }
     }
@@ -588,13 +588,13 @@ async function handle(request: Request): Promise<void> {
   if (request.method === "session.resolveApproval") {
     try {
       const result = await executeApproval(request)
-      respond({ id: request.id, type: "response", ok: true, result })
+      respond({ id: request.id, type: "response", ok: true, sessionID: request.params?.sessionID, result })
       if (result.status === "completed") {
         if (result.repairLineage) void completeCIRepair(result.repairLineage, result)
         else if (!activeSessions.has(request.params!.sessionID!) && (queues.get(request.params!.sessionID!)?.length ?? 0) === 0) void startDeferredCIRepairs(request.params!.sessionID!)
       }
     }
-    catch (error) { respond({ id: request.id, type: "response", ok: false, error: redact(error instanceof Error ? error.message : String(error)) }) }
+    catch (error) { respond({ id: request.id, type: "response", ok: false, sessionID: request.params?.sessionID, error: redact(error instanceof Error ? error.message : String(error)) }) }
     return
   }
   if (request.method === "session.cancel") {

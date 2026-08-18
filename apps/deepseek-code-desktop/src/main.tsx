@@ -6,11 +6,20 @@ import "./styles.css"
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
+type SessionSummary = { sessionId: string; title: string; updatedAt: number }
+type RestoredMessage = { role: "user" | "assistant"; text: string }
 type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string }; result?: { text?: string; status?: string }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
 type Approval = { id: string; tool: string; risk: string }
 
 const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", projectPath: "", apiKey: "", protocol: "openai-compatible" }
+
+function newSessionID(): string { return `session-${Date.now()}` }
+
+function initialSessionID(): string {
+  try { return localStorage.getItem("deepseek-code.active-session") || newSessionID() }
+  catch { return newSessionID() }
+}
 
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus>({ ready: false, version: "检查中" })
@@ -20,11 +29,42 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [approval, setApproval] = useState<Approval | null>(null)
   const [showSettings, setShowSettings] = useState(false)
-  const [sessionID] = useState(() => `session-${Date.now()}`)
+  const [sessionID, setSessionID] = useState(initialSessionID)
+  const [sessions, setSessions] = useState<SessionSummary[]>([])
+
+  async function refreshSessions() {
+    const summaries = await invoke<SessionSummary[]>("list_sessions")
+    setSessions(summaries)
+  }
+
+  async function openSession(nextSessionID: string) {
+    if (busy) return
+    const history = await invoke<RestoredMessage[]>("load_session_history", { sessionId: nextSessionID })
+    setSessionID(nextSessionID)
+    setMessages(history.map((message) => ({ role: message.role, text: message.text })))
+    setApproval(null)
+    try { localStorage.setItem("deepseek-code.active-session", nextSessionID) } catch { /* Local recovery remains optional in restricted webviews. */ }
+  }
+
+  function beginNewSession() {
+    const nextSessionID = newSessionID()
+    setSessionID(nextSessionID)
+    setMessages([])
+    setPrompt("")
+    setApproval(null)
+    try { localStorage.setItem("deepseek-code.active-session", nextSessionID) } catch { /* Local recovery remains optional in restricted webviews. */ }
+  }
 
   useEffect(() => {
-    void Promise.all([invoke<RuntimeStatus>("runtime_status"), invoke<Settings>("load_settings")])
-      .then(([status, saved]) => { setRuntime(status); setSettings({ ...defaults, ...saved, protocol: saved.protocol || defaults.protocol }) })
+    void Promise.all([invoke<RuntimeStatus>("runtime_status"), invoke<Settings>("load_settings"), invoke<SessionSummary[]>("list_sessions")])
+      .then(async ([status, saved, summaries]) => {
+        setRuntime(status)
+        setSettings({ ...defaults, ...saved, protocol: saved.protocol || defaults.protocol })
+        setSessions(summaries)
+        const stored = initialSessionID()
+        const restore = summaries.some((session) => session.sessionId === stored) ? stored : summaries[0]?.sessionId
+        if (restore) await openSession(restore)
+      })
       .catch((error: unknown) => setRuntime({ ready: false, version: "不可用", detail: String(error) }))
   }, [])
 
@@ -41,6 +81,7 @@ function App() {
         })
         if (!frame.ok) setMessages((current) => [...current, { role: "system", text: frame.error ?? "任务执行失败", kind: "error" }])
         setBusy(false)
+        void refreshSessions()
         return
       }
       const runtimeEvent = frame.event
@@ -82,10 +123,11 @@ function App() {
         setBusy(false)
       } else if (runtimeEvent.type === "completed" || runtimeEvent.type === "turn_ended") {
         setBusy(false)
+        if (runtimeEvent.type === "turn_ended") void refreshSessions()
       }
     })
     return () => { disposed = true; void unlisten.then((stop) => stop()) }
-  }, [])
+  }, [sessionID])
 
   const canRun = useMemo(() => runtime.ready && !busy && Boolean(prompt.trim()) && Boolean(settings.apiKey.trim()) && Boolean(settings.projectPath.trim()), [runtime.ready, busy, prompt, settings])
 
@@ -97,6 +139,7 @@ function App() {
     setPrompt("")
     setBusy(true)
     try {
+      try { localStorage.setItem("deepseek-code.active-session", sessionID) } catch { /* Session recovery remains optional in restricted webviews. */ }
       await invoke("save_settings", { settings })
       await invoke("run_agent", { request: { sessionId: sessionID, projectPath: settings.projectPath, prompt: text, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, protocol: settings.protocol, mode: "auto" } })
     } catch (error) {
@@ -125,8 +168,9 @@ function App() {
   return <main className="shell">
     <aside className="sidebar">
       <div className="brand"><span>◆</span><strong>DeepSeek Code</strong></div>
-      <button className="new-session" type="button" onClick={() => { setMessages([]); setPrompt(""); }}>＋ 新建任务</button>
+      <button className="new-session" type="button" onClick={beginNewSession}>＋ 新建任务</button>
       <nav><button className="active" type="button">会话</button><button type="button" onClick={() => setShowSettings(true)}>设置</button><button type="button">终端</button><button type="button">用量</button></nav>
+      <div className="session-list" aria-label="已保存会话">{sessions.slice(0, 8).map((session) => <button key={session.sessionId} className={session.sessionId === sessionID ? "active-session" : ""} type="button" onClick={() => void openSession(session.sessionId)} title={session.title}>{session.title}</button>)}</div>
       <div className="privacy">本地优先 · 凭据保存在 Keychain</div>
     </aside>
     <section className="workspace">
