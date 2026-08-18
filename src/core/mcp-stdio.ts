@@ -15,7 +15,7 @@ export interface MCPStdioConfig {
   maxOutputBytes?: number;
 }
 
-interface JSONRPCResponse { jsonrpc?: string; id?: number; result?: unknown; error?: { code?: number; message?: string; data?: unknown } }
+interface JSONRPCResponse { jsonrpc?: string; id?: number; method?: string; result?: unknown; error?: { code?: number; message?: string; data?: unknown } }
 
 export class MCPStdioClient {
   private process: ChildProcessWithoutNullStreams | undefined;
@@ -23,31 +23,65 @@ export class MCPStdioClient {
   private buffer = '';
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timeout: ReturnType<typeof setTimeout> }>();
   private tools: MCPToolDefinition[] = [];
+  private toolsDirty = true;
+  private initialized = false;
+  private startPromise: Promise<MCPToolDefinition[]> | undefined;
 
   constructor(private readonly config: MCPStdioConfig) {}
 
   async start(): Promise<MCPToolDefinition[]> {
-    if (this.process) return this.tools;
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.startInternal().finally(() => { this.startPromise = undefined; });
+    return this.startPromise;
+  }
+
+  private async startInternal(): Promise<MCPToolDefinition[]> {
+    if (this.process && this.initialized && !this.toolsDirty) return this.tools;
     if (!this.config.command.trim() || this.config.command.includes('\0')) throw new Error('Invalid MCP command');
     const env = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', ...(this.config.env ?? {}) };
-    this.process = spawn(this.config.command, this.config.args ?? [], { cwd: this.config.cwd, env, stdio: 'pipe' });
-    this.process.stdout.setEncoding('utf8');
-    this.process.stdout.on('data', (chunk: string) => this.consume(chunk));
-    this.process.stderr.resume();
-    this.process.once('exit', (code) => {
+    if (!this.process) this.spawnProcess(env);
+    try {
+      if (!this.initialized) {
+        await this.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'DeepSeek Code', version: '0.1.0' } });
+        this.notify('notifications/initialized', {});
+        this.initialized = true;
+      }
+      if (this.toolsDirty) {
+        const result = await this.request('tools/list', {}) as { tools?: MCPToolDefinition[] };
+        this.tools = (result.tools ?? []).filter((tool) => typeof tool?.name === 'string').slice(0, 128);
+        this.toolsDirty = false;
+      }
+    } catch (error) {
+      const process = this.process;
       this.process = undefined;
+      this.initialized = false;
+      this.toolsDirty = true;
       this.tools = [];
-      this.failAll(new Error(`MCP server exited (${code ?? 'signal'})`));
-    });
-    await this.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'DeepSeek Code', version: '0.1.0' } });
-    this.notify('notifications/initialized', {});
-    const result = await this.request('tools/list', {}) as { tools?: MCPToolDefinition[] };
-    this.tools = (result.tools ?? []).filter((tool) => typeof tool?.name === 'string').slice(0, 128);
+      if (process) process.kill('SIGTERM');
+      throw error;
+    }
     return this.tools;
   }
 
+  private spawnProcess(env: NodeJS.ProcessEnv): void {
+    const child = spawn(this.config.command, this.config.args ?? [], { cwd: this.config.cwd, env, stdio: 'pipe' });
+    this.process = child;
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => this.consume(chunk));
+    child.stderr.resume();
+    child.once('exit', (code) => {
+      if (this.process !== child) return;
+      this.process = undefined;
+      this.initialized = false;
+      this.toolsDirty = true;
+      this.tools = [];
+      this.failAll(new Error(`MCP server exited (${code ?? 'signal'})`));
+    });
+  }
+
   async callTool(name: string, argumentsValue: Record<string, unknown>): Promise<unknown> {
-    if (!this.process) await this.start();
+    await this.start();
+    if (this.toolsDirty) await this.start();
     if (!this.tools.some((tool) => tool.name === name)) throw new Error(`Unknown MCP tool: ${name}`);
     const result = await this.request('tools/call', { name, arguments: argumentsValue });
     const serialized = JSON.stringify(result);
@@ -59,6 +93,9 @@ export class MCPStdioClient {
     if (!this.process) return;
     const process = this.process;
     this.process = undefined;
+    this.initialized = false;
+    this.toolsDirty = true;
+    this.tools = [];
     this.failAll(new Error('MCP client closed'));
     process.kill('SIGTERM');
     await new Promise<void>((resolve) => process.once('exit', () => resolve()));
@@ -90,6 +127,11 @@ export class MCPStdioClient {
       if (!line.trim()) continue;
       let message: JSONRPCResponse;
       try { message = JSON.parse(line) as JSONRPCResponse; } catch { continue; }
+      if (message.method === 'notifications/tools/list_changed') {
+        this.toolsDirty = true;
+        this.tools = [];
+        continue;
+      }
       if (typeof message.id !== 'number') continue;
       const pending = this.pending.get(message.id);
       if (!pending) continue;
