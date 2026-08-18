@@ -960,12 +960,12 @@ async function handle(request: Request): Promise<void> {
   enqueue(request)
 }
 
-if (process.argv[2] === "--terminal-daemon") {
+if (process.argv.includes("--terminal-daemon")) {
   const socketIndex = process.argv.indexOf("--socket")
   const socketPath = socketIndex >= 0 ? process.argv[socketIndex + 1] : undefined
   if (!socketPath) process.exitCode = 2
   else void runRemoteTerminalDaemon(socketPath).catch((error) => { process.stderr.write(`${redact(error instanceof Error ? error.message : String(error))}\n`); process.exitCode = 1 })
-} else if (process.argv[2] === "--terminal-stdio") {
+} else if (process.argv.includes("--terminal-stdio")) {
   void runRemoteTerminalProxy().catch((error) => { process.stderr.write(`${redact(error instanceof Error ? error.message : String(error))}\n`); process.exitCode = 1 })
 } else if (process.argv[2] === "--worker-stdio") {
   let workerBuffer = ""
