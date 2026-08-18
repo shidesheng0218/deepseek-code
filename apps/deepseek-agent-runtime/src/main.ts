@@ -5,6 +5,7 @@ import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/provi
 import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
 import { createWebTools } from "../../../src/core/tools/web"
 import { loadProjectInstructions } from "../../../src/core/project-instructions"
+import { PersistentTerminal } from "../../../src/core/persistent-terminal"
 import type { AgentMode } from "../../../src/core/permissions"
 
 type Request = {
@@ -38,6 +39,7 @@ type RuntimeEvent =
   | { type: "turn_started"; prompt: string }
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
   | { type: "usage_recorded"; inputTokens?: number; outputTokens?: number }
+  | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -147,6 +149,25 @@ class JsonlEventStore {
 const eventStore = new JsonlEventStore()
 const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
+const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
+
+function terminalFor(sessionID: string, projectPath: string): PersistentTerminal {
+  const existing = terminals.get(sessionID)
+  if (existing && existing.projectPath === projectPath) return existing.terminal
+  if (existing) void existing.terminal.close()
+  const terminal = new PersistentTerminal({ cwd: projectPath })
+  terminals.set(sessionID, { projectPath, terminal })
+  return terminal
+}
+
+async function runPersistentCommand(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const command = typeof input.command === "string" ? input.command.trim() : ""
+  if (!command) throw new Error("run_command requires command")
+  const timeoutMs = typeof input.timeoutMs === "number" ? Math.min(Math.max(input.timeoutMs, 1_000), 600_000) : 120_000
+  const entry = await terminalFor(sessionID, projectPath).exec(command, timeoutMs)
+  await emitSessionEvent(sessionID, { type: "terminal_completed", ...entry })
+  return { ok: entry.exitCode === 0, sequence: entry.sequence, stdout: entry.stdout.slice(0, 50_000), stderr: entry.stderr.slice(0, 20_000), exitCode: entry.exitCode }
+}
 
 function respond(response: OutputFrame): void {
   process.stdout.write(`${JSON.stringify(response)}\n`)
@@ -210,7 +231,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       read_file: tools.read_file,
       apply_patch: tools.apply_patch,
       inspect_git: tools.inspect_git,
-      run_command: tools.run_command,
+      run_command: (input) => runPersistentCommand(sessionID, projectPath, input),
       web_search: webTools.web_search,
       web_fetch: webTools.web_fetch
     },
@@ -260,7 +281,7 @@ async function executeApproval(request: Request): Promise<{ text: string; status
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: tools.run_command, web_search: webTools.web_search, web_fetch: webTools.web_fetch },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
