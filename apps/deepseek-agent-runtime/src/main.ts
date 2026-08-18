@@ -15,6 +15,7 @@ import { LanguageServerClient } from "../../../src/core/lsp-client"
 import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
 import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from "../../../src/core/worker-runtime"
 import { getGitHubCIStatus } from "../../../src/core/github-ci"
+import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 
@@ -52,6 +53,8 @@ type RuntimeEvent =
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "ci_status"; commit: string; currentRunCount: number; staleRunCount: number }
+  | { type: "verification_passed"; kind: string; command: string }
+  | { type: "delivery_evaluated"; state: string; reasons: string[] }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -160,6 +163,11 @@ class JsonlEventStore {
     } catch { /* A missing event log means there is no recoverable approval. */ }
     return undefined
   }
+
+  async loadEvents(sessionID: string): Promise<Array<{ type: string; payload?: Record<string, unknown> }>> {
+    try { return (await readFile(join(sessionRoot(), `${sessionID}.jsonl`), "utf8")).split("\n").filter(Boolean).flatMap((line) => { try { return [JSON.parse(line) as { type: string; payload?: Record<string, unknown> }] } catch { return [] } }) }
+    catch { return [] }
+  }
 }
 
 const eventStore = new JsonlEventStore()
@@ -227,6 +235,7 @@ async function runPersistentCommand(sessionID: string, projectPath: string, inpu
   const timeoutMs = typeof input.timeoutMs === "number" ? Math.min(Math.max(input.timeoutMs, 1_000), 600_000) : 120_000
   const entry = await terminalFor(sessionID, projectPath).exec(command, timeoutMs)
   await emitSessionEvent(sessionID, { type: "terminal_completed", ...entry })
+  if (entry.exitCode === 0 && /\b(test|lint|build)\b/i.test(command)) await emitSessionEvent(sessionID, { type: "verification_passed", kind: "terminal", command })
   return { ok: entry.exitCode === 0, sequence: entry.sequence, stdout: entry.stdout.slice(0, 50_000), stderr: entry.stderr.slice(0, 20_000), exitCode: entry.exitCode }
 }
 
@@ -353,7 +362,9 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       reason: result.status === "waiting_approval" ? "awaiting_approval" : "completed",
       status: result.status
     })
-    return { text: redact(result.text), status: result.status, messages: result.messages }
+    const delivery = evaluateDeliveryGate(await eventStore.loadEvents(sessionID))
+    await emitSessionEvent(sessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
+    return { text: redact(result.text), status: result.status, messages: result.messages, delivery: delivery.state }
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error))
     await emitSessionEvent(sessionID, { type: "turn_ended", reason: "error", error: message })
@@ -390,7 +401,9 @@ async function executeApproval(request: Request): Promise<{ text: string; status
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
   await eventStore.flush(sessionID)
   await emitSessionEvent(sessionID, { type: "turn_ended", reason: "completed", status: result.status })
-  return { text: redact(result.text), status: result.status, messages: result.messages }
+  const delivery = evaluateDeliveryGate(await eventStore.loadEvents(sessionID))
+  await emitSessionEvent(sessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
+  return { text: redact(result.text), status: result.status, messages: result.messages, delivery: delivery.state }
 }
 
 async function drain(sessionID: string): Promise<void> {
