@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event"
 import { useEffect, useMemo, useState } from "react"
 import { createRoot } from "react-dom/client"
 import "./styles.css"
+import { canSubmitTask, submitActionLabel } from "./interaction-policy"
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
@@ -145,11 +146,11 @@ function App() {
     return () => { disposed = true; void unlisten.then((stop) => stop()) }
   }, [sessionID])
 
-  const canRun = useMemo(() => runtime.ready && !busy && Boolean(prompt.trim()) && Boolean(settings.apiKey.trim()) && Boolean(settings.projectPath.trim()), [runtime.ready, busy, prompt, settings])
+  const canRun = useMemo(() => canSubmitTask({ runtimeReady: runtime.ready, busy, text: prompt, apiKey: settings.apiKey, projectPath: settings.projectPath }), [runtime.ready, busy, prompt, settings.apiKey, settings.projectPath])
 
   async function submit() {
     const text = prompt.trim()
-    if (!text || busy) return
+    if (!text) return
     if (!settings.projectPath.trim() || !settings.apiKey.trim()) { setShowSettings(true); return }
     setMessages((current) => [...current, { role: "user", text }])
     setPrompt("")
@@ -198,7 +199,7 @@ function App() {
         {approval && <section className="approval"><strong>需要确认</strong><span>{approval.tool}（{approval.risk}）将执行受控操作。</span><div><button type="button" onClick={() => void resolveApproval("deny")}>取消</button><button className="allow" type="button" onClick={() => void resolveApproval("allow")}>允许一次</button></div></section>}
         {busy && <div className="typing"><i /><i /><i /> 正在工作</div>}
       </section>
-      <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行，事件会实时显示" : "回车发送 · Shift+Enter 换行"}</span>{busy ? <button type="button" onClick={() => void cancel()}>停止</button> : <button type="button" disabled={!canRun} onClick={() => void submit()}>开始任务</button>}</footer></section>
+      <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行；新消息会排队到安全边界" : "回车发送 · Shift+Enter 换行"}</span>{busy && <button type="button" onClick={() => void cancel()}>停止</button>}<button type="button" disabled={!canRun} onClick={() => void submit()}>{submitActionLabel(busy)}</button></footer></section>
       {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /></label><label>协议<select value={settings.protocol} onChange={(event) => setSettings({ ...settings, protocol: event.target.value as Settings["protocol"] })}><option value="openai-compatible">OpenAI-compatible / DeepSeek</option><option value="anthropic-messages">Anthropic Messages</option></select></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>模型<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
     </section>
   </main>
