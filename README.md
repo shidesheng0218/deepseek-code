@@ -158,6 +158,19 @@ npm run dev
 
 `npm run dev:swift` 仍可启动旧 SwiftUI 版本，便于验证旧数据迁移；它不是默认产品入口。
 
+### Tauri Sidecar CLI（共享同一个会话日志）
+
+仓库提供一个轻量 CLI，不复制 Agent Loop，只连接当前 Bundled Sidecar：
+
+```bash
+node bin/deepseek.mjs doctor
+DEEPSEEK_API_KEY=sk-... DEEPSEEK_PROJECT="$PWD" node bin/deepseek.mjs ask "解释这个登录流程"
+node bin/deepseek.mjs session list
+node bin/deepseek.mjs session attach <session-id>
+```
+
+它通过 `DEEPSEEK_RUNTIME_BINARY` 指向打包后的 Sidecar，默认读取仓库中的 `apps/deepseek-agent-runtime/dist/deepseek-agent-runtime`；会话仍使用与桌面 App 相同的 JSONL Event Log。可用环境变量包括 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_PROJECT`、`DEEPSEEK_PROTOCOL` 和 `DEEPSEEK_SESSION_ROOT`。
+
 ### Swift 兼容工具（非 Tauri 下载版入口）
 
 ```bash

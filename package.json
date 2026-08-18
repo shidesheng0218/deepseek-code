@@ -6,6 +6,7 @@
   "license": "MIT",
   "type": "module",
   "main": "dist/main/index.js",
+  "bin": { "deepseek": "bin/deepseek.mjs" },
   "scripts": {
     "dev": "npm run dev:tauri",
     "dev:swift": "cd macos/DeepSeekCode && swift run DeepSeekCode",
