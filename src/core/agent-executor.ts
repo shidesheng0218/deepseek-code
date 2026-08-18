@@ -1,6 +1,7 @@
 import { AgentRuntime } from './agent-runtime';
 import type { AgentMode } from './permissions';
 import type { ModelEvent } from './providers/openai-compatible';
+import { ToolExecutionPipeline, type ToolDefinition, type ToolPipelineEvent } from './tool-execution-pipeline';
 
 export interface AgentMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -36,27 +37,18 @@ export interface AgentExecutorOptions {
   instructions?: string;
   model: { stream: (messages: AgentMessage[]) => AsyncIterable<ExecutorEvent> };
   tools: Record<string, (input: Record<string, unknown>) => Promise<unknown>>;
+  toolDefinitions?: Record<string, ToolDefinition>;
   maxTurns?: number;
   onEvent?: (event: AgentExecutorEvent) => void;
 }
 
-export type AgentExecutorEvent =
-  | { type: 'tool_requested'; id: string; tool: string; risk: string }
-  | { type: 'tool_started'; id: string; tool: string }
-  | { type: 'tool_completed'; id: string; tool: string; ok: boolean; output?: string; error?: string }
-  | { type: 'approval_required'; id: string; tool: string; risk: string }
+export type AgentExecutorEvent = ToolPipelineEvent
   | { type: 'assistant_text'; text: string }
   | { type: 'completed'; text: string }
   | { type: 'failed'; error: string };
 
-function isMutatingTool(name: string): boolean {
-  return name === 'apply_patch' || name === 'git_action' || name === 'run_command';
-}
-
-function serializeToolResult(result: unknown): string {
-  if (typeof result === 'string') return result;
-  if (result && typeof result === 'object' && 'content' in result && typeof result.content === 'string') return result.content;
-  return JSON.stringify(result);
+function defaultToolDefinitions(tools: Record<string, (input: Record<string, unknown>) => Promise<unknown>>): Record<string, ToolDefinition> {
+  return Object.fromEntries(Object.keys(tools).map((name) => [name, { name, mutates: name === 'apply_patch' || name === 'git_action' || name === 'run_command' }]));
 }
 
 export class AgentExecutor {
@@ -73,7 +65,7 @@ export class AgentExecutor {
       ...history,
       { role: 'user', content: prompt }
     ];
-    return this.executeConversation(runtime, messages);
+    return this.executeConversation(runtime, messages, this.createPipeline(runtime));
   }
 
   async resume(sessionId: string, history: AgentMessage[], approved: ApprovedToolCall): Promise<AgentRunResult> {
@@ -82,24 +74,23 @@ export class AgentExecutor {
       ...(this.options.instructions ? [{ role: 'system' as const, content: this.options.instructions }] : []),
       ...history
     ];
-    const emit = (event: AgentExecutorEvent): void => this.options.onEvent?.(event);
-    const tool = this.options.tools[approved.tool];
-    if (!tool) throw new Error(`Tool not found: ${approved.tool}`);
-    emit({ type: 'tool_started', id: approved.id, tool: approved.tool });
-    try {
-      const output = serializeToolResult(await tool(approved.arguments));
-      messages.push({ role: 'tool', content: output, toolCallId: approved.id });
-      emit({ type: 'tool_completed', id: approved.id, tool: approved.tool, ok: true, output });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const content = JSON.stringify({ ok: false, code: 'TOOL_ERROR', message });
-      messages.push({ role: 'tool', content, toolCallId: approved.id });
-      emit({ type: 'tool_completed', id: approved.id, tool: approved.tool, ok: false, error: message });
-    }
-    return this.executeConversation(runtime, messages);
+    const pipeline = this.createPipeline(runtime);
+    const outcome = await pipeline.executeApproved(approved);
+    if (outcome.state !== 'completed') throw new Error('Approved tool execution unexpectedly requested approval');
+    messages.push({ role: 'tool', content: outcome.content, toolCallId: approved.id });
+    return this.executeConversation(runtime, messages, pipeline);
   }
 
-  private async executeConversation(runtime: AgentRuntime, messages: AgentMessage[]): Promise<AgentRunResult> {
+  private createPipeline(runtime: AgentRuntime): ToolExecutionPipeline {
+    return new ToolExecutionPipeline({
+      runtime,
+      tools: this.options.tools,
+      definitions: { ...defaultToolDefinitions(this.options.tools), ...this.options.toolDefinitions },
+      onEvent: (event) => this.options.onEvent?.(event)
+    });
+  }
+
+  private async executeConversation(runtime: AgentRuntime, messages: AgentMessage[], pipeline: ToolExecutionPipeline): Promise<AgentRunResult> {
     let text = '';
     const emit = (event: AgentExecutorEvent): void => this.options.onEvent?.(event);
 
@@ -113,36 +104,12 @@ export class AgentExecutor {
             continue;
           }
           invokedTool = true;
-          const command = typeof event.arguments.command === 'string' ? event.arguments.command : undefined;
-          const decision = runtime.requestTool({ id: event.id, tool: event.name, ...(command === undefined ? {} : { command }), mutates: isMutatingTool(event.name) });
-          emit({ type: 'tool_requested', id: event.id, tool: event.name, risk: decision.risk });
-          if (decision.decision !== 'allow') {
-            const code = decision.decision === 'ask' ? 'APPROVAL_REQUIRED' : 'POLICY_BLOCKED';
-            messages.push({ role: 'tool', content: JSON.stringify({ ok: false, code }), toolCallId: event.id });
-            if (decision.decision === 'ask') {
-              emit({ type: 'approval_required', id: event.id, tool: event.name, risk: decision.risk });
-              return { text, runtime, messages, status: runtime.state.status, pendingApproval: { id: event.id, tool: event.name, arguments: event.arguments, risk: decision.risk } };
-            }
-            continue;
+          const outcome = await pipeline.execute({ id: event.id, tool: event.name, arguments: event.arguments });
+          if (outcome.state === 'awaitingApproval') {
+            messages.push({ role: 'tool', content: JSON.stringify({ ok: false, code: 'APPROVAL_REQUIRED' }), toolCallId: event.id });
+            return { text, runtime, messages, status: runtime.state.status, pendingApproval: outcome.pending };
           }
-          const tool = this.options.tools[event.name];
-          if (!tool) {
-            const content = JSON.stringify({ ok: false, code: 'TOOL_NOT_FOUND', tool: event.name });
-            messages.push({ role: 'tool', content, toolCallId: event.id });
-            emit({ type: 'tool_completed', id: event.id, tool: event.name, ok: false, output: content });
-            continue;
-          }
-          emit({ type: 'tool_started', id: event.id, tool: event.name });
-          try {
-            const output = serializeToolResult(await tool(event.arguments));
-            messages.push({ role: 'tool', content: output, toolCallId: event.id });
-            emit({ type: 'tool_completed', id: event.id, tool: event.name, ok: true, output });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            const content = JSON.stringify({ ok: false, code: 'TOOL_ERROR', message });
-            messages.push({ role: 'tool', content, toolCallId: event.id });
-            emit({ type: 'tool_completed', id: event.id, tool: event.name, ok: false, error: message });
-          }
+          messages.push({ role: 'tool', content: outcome.content, toolCallId: event.id });
         }
         if (!invokedTool) {
           runtime.complete();

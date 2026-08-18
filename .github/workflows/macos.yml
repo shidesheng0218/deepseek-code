@@ -63,7 +63,9 @@ jobs:
         run: npx playwright install chromium
 
       - name: Run Agent Runtime and desktop integration tests
-        run: npx vitest run tests
+        run: |
+          npx vitest run tests
+          npm run test:sidecar
 
       - name: Run Swift migration checks
         run: npm test

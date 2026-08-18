@@ -3,6 +3,7 @@ import { dirname, join } from "node:path"
 import { execFile as execFileCallback, spawn } from "node:child_process"
 import { promisify } from "node:util"
 import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
+import type { ToolDefinition } from "../../../src/core/tool-execution-pipeline"
 import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/providers/openai-compatible"
 import { AnthropicMessagesClient } from "../../../src/core/providers/anthropic-messages"
 import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
@@ -95,6 +96,27 @@ const toolSchemas = [
 ]
 type ToolSchema = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }
 type MCPBinding = { schemas: ToolSchema[]; handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> }
+
+function toolTimeoutMs(name: string): number {
+  if (name === "run_command") return 600_000
+  if (name === "browser_evidence") return 45_000
+  if (name === "web_fetch" || name === "web_search" || name === "github_ci_failure_log" || name === "github_ci_status") return 60_000
+  if (name.startsWith("mcp__")) return 60_000
+  return 120_000
+}
+
+function pipelineDefinitions(schemas: ToolSchema[]): Record<string, ToolDefinition> {
+  return Object.fromEntries(schemas.map((schema) => {
+    const required = Array.isArray(schema.function.parameters.required) ? schema.function.parameters.required.filter((value): value is string => typeof value === "string") : undefined
+    const name = schema.function.name
+    return [name, {
+      name,
+      mutates: name === "apply_patch" || name === "run_command",
+      timeoutMs: toolTimeoutMs(name),
+      ...(required?.length ? { inputSchema: { required } } : {})
+    }]
+  }))
+}
 
 const agentInstructions = `你是 DeepSeek Code，一个本地优先的编码助手。先理解用户目标和当前项目，再决定是否调用工具；不要编造未读取、未执行或未验证的结果。
 工作区读取、搜索、公开 Web 研究和已识别的测试可以主动使用。需要写入、依赖安装、提交、推送或其他高影响操作时，遵守工具权限结果，不要绕过审批。
@@ -450,6 +472,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model, messages, schemas) },
+    toolDefinitions: pipelineDefinitions(schemas),
     tools: {
       list_directory: tools.list_directory,
       search_workspace: tools.search_workspace,
@@ -524,6 +547,7 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
+    toolDefinitions: pipelineDefinitions(schemas),
     tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })

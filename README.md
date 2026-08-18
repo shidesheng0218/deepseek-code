@@ -33,7 +33,7 @@ flowchart LR
     GUI --> IPC["Rust IPC Bridge"]
     IPC --> S["Bundled Agent Sidecar"]
     S --> M["OpenAI-compatible /\nAnthropic Messages"]
-    S --> P["AgentExecutor + Permission Gate"]
+    S --> P["AgentExecutor +\nToolExecutionPipeline"]
     P --> W["Workspace / Git"]
     P --> T["Persistent Terminal"]
     P --> R["Web Search / Fetch"]
@@ -93,7 +93,7 @@ flowchart LR
 - Git Worktree 服务：创建受管理的 `deepseek/<task>` 分支与独立工作树。
 - Provider 设置页：Base URL + API Key 开箱配置，并可显式选择 OpenAI-compatible / Anthropic Messages。
 - API Key 由 macOS Keychain 保存；工具事件、CI 日志和子会话提示在写入模型上下文前进行脱敏。
-- Agent IPC 执行闭环：模型流 → 工具调用 → 风险/审批 → 文件、Git、命令工具 → 脱敏事件回传。
+- Agent IPC 执行闭环：模型流 → `ToolExecutionPipeline` 参数校验、风险/审批、超时与 `indeterminate` → 文件、Git、命令工具 → 脱敏事件回传。
 - 文件工具支持原子 Patch、乐观哈希、检查点恢复，以及目录/符号链接工作区隔离。
 - 真实本地项目选择与 Composer 任务发送入口。
 - Browser Evidence 使用随 DMG 分发的 Chromium Headless Shell 与 Playwright Core；用户无需安装浏览器开发依赖。

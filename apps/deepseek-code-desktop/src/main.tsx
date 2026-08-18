@@ -96,6 +96,8 @@ function App() {
         setMessages((current) => [...current, { role: "tool", text: `${runtimeEvent.type === "tool_started" ? "执行" : "准备"} ${runtimeEvent.tool ?? "工具"}…`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "tool_completed") {
         setMessages((current) => [...current, { role: "tool", text: `${runtimeEvent.tool ?? "工具"} 已完成`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "tool_indeterminate") {
+        setMessages((current) => [...current, { role: "system", text: `${runtimeEvent.tool ?? "工具"} 已启动但结果未知；不会自动重试。请检查实际状态后再继续。`, kind: "error" }])
       } else if (runtimeEvent.type === "terminal_completed") {
         setMessages((current) => [...current, { role: "tool", text: `终端 #${runtimeEvent.sequence ?? ""}：${runtimeEvent.command ?? "命令"}（退出码 ${runtimeEvent.exitCode ?? "?"}）`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "worker_completed") {
