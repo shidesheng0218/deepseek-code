@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client"
 import "./styles.css"
-import { canSubmitTask, submitActionLabel } from "./interaction-policy"
+import { canSubmitTask, shouldRenderFrame, submitActionLabel } from "./interaction-policy"
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
@@ -32,6 +32,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false)
   const [sessionID, setSessionID] = useState(initialSessionID)
   const [sessions, setSessions] = useState<SessionSummary[]>([])
+  const seenFrameIDs = useRef(new Set<string>())
 
   async function refreshSessions() {
     const summaries = await invoke<SessionSummary[]>("list_sessions")
@@ -75,6 +76,7 @@ function App() {
       if (disposed) return
       const frame = event.payload
       if (frame.sessionID && frame.sessionID !== sessionID) return
+      if (!shouldRenderFrame(frame.id, seenFrameIDs.current)) return
       if (frame.type === "response") {
         if (frame.result?.text) setMessages((current) => {
           const last = current[current.length - 1]

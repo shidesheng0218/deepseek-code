@@ -152,7 +152,7 @@ class JsonlEventStore {
   private readonly sequences = new Map<string, number>()
   private readonly tails = new Map<string, Promise<void>>()
 
-  async append(sessionID: string, type: string, payload: Record<string, unknown>): Promise<void> {
+  async append(sessionID: string, type: string, payload: Record<string, unknown>): Promise<string> {
     const previous = this.tails.get(sessionID) ?? Promise.resolve()
     const next = previous.then(async () => {
       const directory = sessionRoot()
@@ -169,10 +169,12 @@ class JsonlEventStore {
       }
       sequence += 1
       this.sequences.set(sessionID, sequence)
-      await appendFile(file, `${JSON.stringify({ eventID: crypto.randomUUID(), sessionID, sequence, type, payload, createdAt: new Date().toISOString() })}\n`)
+      const eventID = crypto.randomUUID()
+      await appendFile(file, `${JSON.stringify({ eventID, sessionID, sequence, type, payload, createdAt: new Date().toISOString() })}\n`)
+      return eventID
     })
-    this.tails.set(sessionID, next.catch(() => undefined))
-    await next
+    this.tails.set(sessionID, next.then(() => undefined, () => undefined))
+    return next
   }
 
   async flush(sessionID: string): Promise<void> {
@@ -644,8 +646,8 @@ function respond(response: OutputFrame): void {
 
 async function emitSessionEvent(sessionID: string, event: RuntimeEvent): Promise<void> {
   const redacted = redactPayload(event)
-  await eventStore.append(sessionID, event.type, redacted)
-  respond({ id: `${sessionID}:${Date.now()}:${Math.random()}`, type: "event", ok: true, sessionID, event: redacted as RuntimeEvent })
+  const eventID = await eventStore.append(sessionID, event.type, redacted)
+  respond({ id: eventID, type: "event", ok: true, sessionID, event: redacted as RuntimeEvent })
 }
 
 async function emitAgentEvent(sessionID: string, event: AgentExecutorEvent): Promise<void> {

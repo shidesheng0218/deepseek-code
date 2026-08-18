@@ -11,3 +11,10 @@ export function canSubmitTask(state: SubmitState): boolean {
 }
 
 export function submitActionLabel(busy: boolean): string { return busy ? '追加消息' : '开始任务'; }
+
+export function shouldRenderFrame(frameID: string, seen: Set<string>): boolean {
+  if (!frameID) return true;
+  if (seen.has(frameID)) return false;
+  seen.add(frameID);
+  return true;
+}
