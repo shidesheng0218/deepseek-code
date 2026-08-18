@@ -37,4 +37,17 @@ describe('MCP Streamable HTTP client', () => {
     await client.start();
     await expect(client.start()).resolves.toEqual([{ name: 'new', inputSchema: { type: 'object' } }]);
   });
+
+  test('resolves a bearer token at request time and classifies authentication failures', async () => {
+    let authorization = '';
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      authorization = new Headers(init?.headers).get('authorization') ?? '';
+      const request = JSON.parse(String(init?.body)) as { id?: number; method: string };
+      if (request.method === 'initialize') return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }), { headers: { 'content-type': 'application/json' } });
+      return new Response('unauthorized', { status: 401 });
+    });
+    const client = new MCPStreamableHTTPClient({ url: 'https://mcp.example.test/mcp', fetchImpl, tokenProvider: async () => 'oauth-token' });
+    await expect(client.start()).rejects.toThrow('authentication failed');
+    expect(authorization).toBe('Bearer oauth-token');
+  });
 });

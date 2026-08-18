@@ -6,6 +6,7 @@ export interface MCPHTTPConfig {
   timeoutMs?: number;
   maxOutputBytes?: number;
   fetchImpl?: typeof fetch;
+  tokenProvider?: () => Promise<string | undefined>;
 }
 
 interface JSONRPCMessage { jsonrpc?: string; id?: number; method?: string; result?: unknown; error?: { message?: string } }
@@ -104,12 +105,14 @@ export class MCPStreamableHTTPClient {
     const timer = setTimeout(() => controller.abort(), timeoutFor(this.config));
     try {
       const fetchImpl = this.config.fetchImpl ?? fetch;
+      const token = await this.config.tokenProvider?.();
       const response = await fetchImpl(this.config.url, {
         method: 'POST',
-        headers: { accept: 'application/json, text/event-stream', 'content-type': 'application/json', ...(this.config.headers ?? {}) },
+        headers: { accept: 'application/json, text/event-stream', 'content-type': 'application/json', ...(this.config.headers ?? {}), ...(token ? { authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify(payload),
         signal: controller.signal
       });
+      if (response.status === 401 || response.status === 403) throw new Error(`MCP HTTP authentication failed with status ${response.status}`);
       if (!response.ok) throw new Error(`MCP HTTP request failed with status ${response.status}`);
       const body = await response.text();
       if (!body.trim() && allowEmpty) return { messages: [] };

@@ -1,8 +1,10 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { execFile as execFileCallback, spawn } from "node:child_process"
+import { createConnection, createServer, type Socket } from "node:net"
 import { promisify } from "node:util"
 import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
+import { tmpdir } from "node:os"
 import type { ToolDefinition } from "../../../src/core/tool-execution-pipeline"
 import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/providers/openai-compatible"
 import { AnthropicMessagesClient } from "../../../src/core/providers/anthropic-messages"
@@ -282,7 +284,7 @@ async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPB
     let client = mcpClients.get(key)
     try {
       if (!client) {
-        if (config.url) client = new MCPStreamableHTTPClient({ url: config.url, ...(config.headers ? { headers: config.headers } : {}) })
+        if (config.url) client = new MCPStreamableHTTPClient({ url: config.url, ...(config.headers ? { headers: config.headers } : {}), ...(config.authEnv ? { tokenProvider: async () => process.env[config.authEnv!] } : {}) })
         else if (config.command) client = new MCPStdioClient({ command: config.command, args: config.args, cwd: config.cwd, ...(config.env ? { env: config.env } : {}) })
         else throw new Error(`MCP server ${config.name} has no supported transport`)
         mcpClients.set(key, client)
@@ -582,12 +584,24 @@ type RemoteTerminalRequest = {
   afterSequence?: number
 }
 
-async function runRemoteTerminalHelper(): Promise<void> {
-  const terminals = new Map<string, { sessionID: string; cwd: string; terminal: PersistentTerminal }>()
-  const root = process.env.DEEPSEEK_REMOTE_WORKSPACE_ROOT ? resolve(process.env.DEEPSEEK_REMOTE_WORKSPACE_ROOT) : undefined
+type RemoteTerminalInput = {
+  setEncoding(encoding: BufferEncoding): void
+  on(event: "data", listener: (chunk: string) => void): unknown
+  on(event: "end", listener: () => void): unknown
+  on(event: "close", listener: () => void): unknown
+}
+type RemoteTerminalOutput = { write(data: string): boolean }
+
+function remoteTerminalSocketPath(): string {
+  const value = process.env.DEEPSEEK_REMOTE_TERMINAL_SOCKET?.trim() || join(tmpdir(), "deepseek-code-terminal.sock")
+  if (value.includes("\0")) throw new Error("Invalid remote terminal socket path")
+  return value
+}
+
+async function serveRemoteTerminalStream(input: RemoteTerminalInput, output: RemoteTerminalOutput, terminals: Map<string, { sessionID: string; cwd: string; terminal: PersistentTerminal }>, root?: string, onClosed?: () => void): Promise<void> {
   let tail: Promise<void> = Promise.resolve()
   const respondRemote = (request: RemoteTerminalRequest, payload: Record<string, unknown>): void => {
-    process.stdout.write(`${JSON.stringify({ protocolVersion: 1, requestID: request.requestID, ...payload })}\n`)
+    output.write(`${JSON.stringify({ protocolVersion: 1, requestID: request.requestID, ...payload })}\n`)
   }
   const safeCwd = (requested?: string): string => {
     const candidate = resolve(requested && isAbsolute(requested) ? requested : root ?? process.cwd())
@@ -637,8 +651,8 @@ async function runRemoteTerminalHelper(): Promise<void> {
     }
   }
   let buffer = ""
-  process.stdin.setEncoding("utf8")
-  process.stdin.on("data", (chunk: string) => {
+  input.setEncoding("utf8")
+  input.on("data", (chunk: string) => {
     buffer += chunk
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
@@ -649,9 +663,57 @@ async function runRemoteTerminalHelper(): Promise<void> {
       tail = tail.then(() => handle(request)).catch(() => undefined)
     }
   })
-  await new Promise<void>((resolveDone) => process.stdin.once("end", () => resolveDone()))
+  await new Promise<void>((resolveDone) => {
+    input.on("end", () => resolveDone())
+    input.on("close", () => resolveDone())
+  })
   await tail
+  onClosed?.()
+}
+
+async function runRemoteTerminalDaemon(socketPath: string): Promise<void> {
+  const terminals = new Map<string, { sessionID: string; cwd: string; terminal: PersistentTerminal }>()
+  const root = process.env.DEEPSEEK_REMOTE_WORKSPACE_ROOT ? resolve(process.env.DEEPSEEK_REMOTE_WORKSPACE_ROOT) : undefined
+  let clients = 0
+  try { await import("node:fs/promises").then(({ unlink }) => unlink(socketPath).catch(() => undefined)) } catch { /* A stale socket is harmless if it does not exist. */ }
+  const server = createServer((socket) => {
+    clients += 1
+    void serveRemoteTerminalStream(socket, socket, terminals, root, () => {
+      clients -= 1
+      if (clients === 0 && terminals.size === 0) server.close()
+    })
+  })
+  await new Promise<void>((resolveListen, reject) => { server.once("error", reject); server.listen(socketPath, resolveListen) })
+  try { await import("node:fs/promises").then(({ chmod }) => chmod(socketPath, 0o600)) } catch { /* Permissions are best effort on hosts without Unix socket chmod support. */ }
+  await new Promise<void>((resolveClosed) => server.once("close", () => resolveClosed()))
   await Promise.all([...terminals.values()].map((value) => value.terminal.close().catch(() => undefined)))
+}
+
+function connectRemoteTerminalSocket(socketPath: string): Promise<Socket> {
+  return new Promise((resolveSocket, reject) => {
+    const socket = createConnection(socketPath)
+    const rejectOnce = (error: Error): void => { socket.destroy(); reject(error) }
+    socket.once("connect", () => resolveSocket(socket))
+    socket.once("error", rejectOnce)
+  })
+}
+
+async function runRemoteTerminalProxy(): Promise<void> {
+  const socketPath = remoteTerminalSocketPath()
+  let socket: Socket | undefined
+  try { socket = await connectRemoteTerminalSocket(socketPath) } catch {
+    const daemonArguments = process.argv[1] && !process.argv[1].startsWith("-") ? [process.argv[1], "--terminal-daemon", "--socket", socketPath] : ["--terminal-daemon", "--socket", socketPath]
+    const daemon = spawn(process.execPath, daemonArguments, { detached: true, stdio: "ignore", env: process.env })
+    daemon.unref()
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25))
+      try { socket = await connectRemoteTerminalSocket(socketPath); break } catch { /* Wait for the detached daemon to bind. */ }
+    }
+  }
+  if (!socket) throw new Error("Remote terminal daemon did not start")
+  process.stdin.pipe(socket)
+  socket.pipe(process.stdout)
+  await new Promise<void>((resolveProxy) => socket!.once("close", () => resolveProxy()))
 }
 
 function respond(response: OutputFrame): void {
@@ -898,8 +960,13 @@ async function handle(request: Request): Promise<void> {
   enqueue(request)
 }
 
-if (process.argv[2] === "--terminal-stdio") {
-  void runRemoteTerminalHelper()
+if (process.argv[2] === "--terminal-daemon") {
+  const socketIndex = process.argv.indexOf("--socket")
+  const socketPath = socketIndex >= 0 ? process.argv[socketIndex + 1] : undefined
+  if (!socketPath) process.exitCode = 2
+  else void runRemoteTerminalDaemon(socketPath).catch((error) => { process.stderr.write(`${redact(error instanceof Error ? error.message : String(error))}\n`); process.exitCode = 1 })
+} else if (process.argv[2] === "--terminal-stdio") {
+  void runRemoteTerminalProxy().catch((error) => { process.stderr.write(`${redact(error instanceof Error ? error.message : String(error))}\n`); process.exitCode = 1 })
 } else if (process.argv[2] === "--worker-stdio") {
   let workerBuffer = ""
   process.stdin.setEncoding("utf8")

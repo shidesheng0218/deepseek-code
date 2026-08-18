@@ -19,4 +19,11 @@ describe('MCP configuration', () => {
     const configs = await loadMCPServerConfigs(root, root);
     expect(configs).toEqual([{ name: 'docs', args: [], cwd: await realpath(root), url: 'https://mcp.example.test/mcp', headers: { 'x-project': 'fixture' }, transport: 'streamable-http' }]);
   });
+
+  test('loads only an environment token reference, never a literal authorization secret', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'deepseek-mcp-auth-'));
+    await writeFile(join(root, '.mcp.json'), JSON.stringify({ mcpServers: { docs: { url: 'https://mcp.example.test/mcp', authEnv: 'DEEPSEEK_MCP_DOCS_TOKEN', headers: { Authorization: 'Bearer secret-should-not-load', 'x-project': 'fixture' } } } }));
+    const configs = await loadMCPServerConfigs(root, root);
+    expect(configs).toEqual([{ name: 'docs', args: [], cwd: await realpath(root), url: 'https://mcp.example.test/mcp', transport: 'streamable-http', authEnv: 'DEEPSEEK_MCP_DOCS_TOKEN', headers: { 'x-project': 'fixture' } }]);
+  });
 });
