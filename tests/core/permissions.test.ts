@@ -18,4 +18,9 @@ describe('permission policy', () => {
     expect(classifyToolRequest({ tool: 'run_command', command: 'sudo rm -rf /' }).risk).toBe('L4');
     expect(decidePermission({ mode: 'auto', risk: 'L4', mutates: true, tool: 'run_command' })).toBe('block');
   });
+
+  test('treats dynamic MCP tools as approval-required by default', () => {
+    expect(classifyToolRequest({ tool: 'mcp__fixture__write_file' }).risk).toBe('L2');
+    expect(decidePermission({ mode: 'auto', risk: 'L2', mutates: true, tool: 'mcp__fixture__write_file' })).toBe('ask');
+  });
 });

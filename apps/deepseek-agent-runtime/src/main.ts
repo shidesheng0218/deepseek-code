@@ -6,6 +6,8 @@ import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
 import { createWebTools } from "../../../src/core/tools/web"
 import { loadProjectInstructions } from "../../../src/core/project-instructions"
 import { PersistentTerminal } from "../../../src/core/persistent-terminal"
+import { loadMCPServerConfigs } from "../../../src/core/mcp-config"
+import { MCPStdioClient, type MCPToolDefinition } from "../../../src/core/mcp-stdio"
 import type { AgentMode } from "../../../src/core/permissions"
 
 type Request = {
@@ -52,6 +54,8 @@ const toolSchemas = [
   { type: "function", function: { name: "web_search", description: "搜索公开网页资料，最多返回 8 条来源", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } }
 ]
+type ToolSchema = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }
+type MCPBinding = { schemas: ToolSchema[]; handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> }
 
 const agentInstructions = `你是 DeepSeek Code，一个本地优先的编码助手。先理解用户目标和当前项目，再决定是否调用工具；不要编造未读取、未执行或未验证的结果。
 工作区读取、搜索、公开 Web 研究和已识别的测试可以主动使用。需要写入、依赖安装、提交、推送或其他高影响操作时，遵守工具权限结果，不要绕过审批。
@@ -150,6 +154,29 @@ const eventStore = new JsonlEventStore()
 const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
+const mcpClients = new Map<string, MCPStdioClient>()
+
+async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPBinding> {
+  const schemas: ToolSchema[] = []
+  const handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> = {}
+  const configs = await loadMCPServerConfigs(projectPath).catch(() => [])
+  for (const config of configs) {
+    const key = `${projectPath}:${config.name}`
+    let client = mcpClients.get(key)
+    try {
+      if (!client) { client = new MCPStdioClient(config); mcpClients.set(key, client) }
+      const discovered = await client.start()
+      for (const tool of discovered) {
+        const name = `mcp__${config.name}__${tool.name}`
+        schemas.push({ type: "function", function: { name, description: tool.description ?? `MCP ${config.name} 工具 ${tool.name}`, parameters: tool.inputSchema } })
+        handlers[name] = (input) => client!.callTool(tool.name, input)
+      }
+    } catch (error) {
+      await eventStore.append(sessionID, "mcp_server_failed", { server: config.name, error: redact(error instanceof Error ? error.message : String(error)) })
+    }
+  }
+  return { schemas, handlers }
+}
 
 function terminalFor(sessionID: string, projectPath: string): PersistentTerminal {
   const existing = terminals.get(sessionID)
@@ -194,9 +221,9 @@ function redactPayload(event: AgentExecutorEvent | RuntimeEvent): Record<string,
   return redactUnknown(event) as Record<string, unknown>
 }
 
-function streamModel(sessionID: string, client: OpenAICompatibleClient, model: string, messages: AgentMessage[]): AsyncIterable<Extract<ModelEvent, { type: "text_delta" | "tool_call" }>> {
+function streamModel(sessionID: string, client: OpenAICompatibleClient, model: string, messages: AgentMessage[], schemas: ToolSchema[]): AsyncIterable<Extract<ModelEvent, { type: "text_delta" | "tool_call" }>> {
   return (async function* () {
-    for await (const event of client.stream({ model, messages, feature: "main_agent", tools: toolSchemas })) {
+    for await (const event of client.stream({ model, messages, feature: "main_agent", tools: schemas })) {
       if (event.type === "text_delta" || event.type === "tool_call") yield event
       if (event.type === "usage") {
         await emitSessionEvent(sessionID, {
@@ -218,13 +245,15 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
   const client = new OpenAICompatibleClient({ baseUrl: params.baseURL, apiKey: params.apiKey })
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
+  const mcp = await mcpBindings(sessionID, projectPath)
+  const schemas = [...toolSchemas, ...mcp.schemas]
   const history = await eventStore.loadConversation(sessionID)
   const instructions = await instructionsFor(projectPath)
   await emitSessionEvent(sessionID, { type: "turn_started", prompt })
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
-    model: { stream: (messages) => streamModel(sessionID, client, params.model, messages) },
+    model: { stream: (messages) => streamModel(sessionID, client, params.model, messages, schemas) },
     tools: {
       list_directory: tools.list_directory,
       search_workspace: tools.search_workspace,
@@ -233,7 +262,8 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       inspect_git: tools.inspect_git,
       run_command: (input) => runPersistentCommand(sessionID, projectPath, input),
       web_search: webTools.web_search,
-      web_fetch: webTools.web_fetch
+      web_fetch: webTools.web_fetch,
+      ...mcp.handlers
     },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
@@ -276,12 +306,14 @@ async function executeApproval(request: Request): Promise<{ text: string; status
   const client = new OpenAICompatibleClient({ baseUrl: params.baseURL, apiKey: params.apiKey })
   const tools = createWorkspaceAgentTools({ root: params.projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
+  const mcp = await mcpBindings(sessionID, params.projectPath)
+  const schemas = [...toolSchemas, ...mcp.schemas]
   const instructions = await instructionsFor(params.projectPath)
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
-    model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch },
+    model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, ...mcp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
