@@ -3,7 +3,7 @@ import { createServer, type Server } from 'node:http';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { while (cleanups.length) await cleanups.pop()?.(); });
@@ -15,8 +15,7 @@ describe('Agent Sidecar session inbox', () => {
     const project = join(root, 'project');
     await mkdir(project, { recursive: true });
     const requests: Array<Record<string, unknown>> = [];
-    let server: Server;
-    server = createServer((request, response) => {
+    const server: Server = createServer((request, response) => {
       let body = '';
       request.on('data', (chunk) => { body += chunk; });
       request.on('end', () => {
