@@ -7,7 +7,11 @@ import { createWebTools } from "../../../src/core/tools/web"
 import { loadProjectInstructions } from "../../../src/core/project-instructions"
 import { PersistentTerminal } from "../../../src/core/persistent-terminal"
 import { loadMCPServerConfigs } from "../../../src/core/mcp-config"
-import { MCPStdioClient, type MCPToolDefinition } from "../../../src/core/mcp-stdio"
+import { MCPStdioClient } from "../../../src/core/mcp-stdio"
+import { loadLanguageServerConfigs } from "../../../src/core/lsp-config"
+import { LanguageServerClient } from "../../../src/core/lsp-client"
+import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
+import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 
 type Request = {
@@ -155,6 +159,7 @@ const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
 const mcpClients = new Map<string, MCPStdioClient>()
+const lspClients = new Map<string, LanguageServerClient>()
 
 async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPBinding> {
   const schemas: ToolSchema[] = []
@@ -176,6 +181,26 @@ async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPB
     }
   }
   return { schemas, handlers }
+}
+
+async function lspBindings(sessionID: string, projectPath: string): Promise<MCPBinding> {
+  const configs = await loadLanguageServerConfigs(projectPath)
+  if (!configs.length) return { schemas: [], handlers: {} }
+  const schemas: ToolSchema[] = [{ type: "function", function: { name: "lsp_diagnostics", description: "使用项目配置的语言服务器读取文件诊断", parameters: { type: "object", properties: { path: { type: "string" }, languageId: { type: "string" } }, required: ["path", "languageId"] } } }]
+  const handler = async (input: Record<string, unknown>): Promise<unknown> => {
+    const path = typeof input.path === "string" ? input.path : ""
+    const languageId = typeof input.languageId === "string" ? input.languageId : ""
+    const config = configs.find((candidate) => candidate.languages.includes(languageId))
+    if (!path || !config) throw new Error(`No configured language server for ${languageId || "this language"}`)
+    const filePath = await resolveWorkspacePath(projectPath, path)
+    const key = `${projectPath}:${config.command}:${config.languages.join(",")}`
+    let client = lspClients.get(key)
+    if (!client) { client = new LanguageServerClient(config); lspClients.set(key, client) }
+    const diagnostics = await client.diagnostics(pathToFileURL(filePath).toString(), await readFile(filePath, "utf8"), languageId)
+    await eventStore.append(sessionID, "lsp_diagnostics", redactUnknown({ path, languageId, diagnostics }) as Record<string, unknown>)
+    return { ok: true, path, languageId, diagnostics }
+  }
+  return { schemas, handlers: { lsp_diagnostics: handler } }
 }
 
 function terminalFor(sessionID: string, projectPath: string): PersistentTerminal {
@@ -246,7 +271,8 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const mcp = await mcpBindings(sessionID, projectPath)
-  const schemas = [...toolSchemas, ...mcp.schemas]
+  const lsp = await lspBindings(sessionID, projectPath)
+  const schemas = [...toolSchemas, ...mcp.schemas, ...lsp.schemas]
   const history = await eventStore.loadConversation(sessionID)
   const instructions = await instructionsFor(projectPath)
   await emitSessionEvent(sessionID, { type: "turn_started", prompt })
@@ -263,7 +289,8 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       run_command: (input) => runPersistentCommand(sessionID, projectPath, input),
       web_search: webTools.web_search,
       web_fetch: webTools.web_fetch,
-      ...mcp.handlers
+      ...mcp.handlers,
+      ...lsp.handlers
     },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
@@ -307,13 +334,14 @@ async function executeApproval(request: Request): Promise<{ text: string; status
   const tools = createWorkspaceAgentTools({ root: params.projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const mcp = await mcpBindings(sessionID, params.projectPath)
-  const schemas = [...toolSchemas, ...mcp.schemas]
+  const lsp = await lspBindings(sessionID, params.projectPath)
+  const schemas = [...toolSchemas, ...mcp.schemas, ...lsp.schemas]
   const instructions = await instructionsFor(params.projectPath)
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, ...mcp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, ...mcp.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
