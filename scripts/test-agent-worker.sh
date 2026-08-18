@@ -21,7 +21,7 @@ const provider = http.createServer((request, response) => {
   let body = ""; request.on("data", (chunk) => { body += chunk }); request.on("end", () => {
     call += 1; response.writeHead(200, { "content-type": "text/event-stream" })
     const payload = call === 1
-      ? { choices: [{ delta: { tool_calls: [{ index: 0, id: "worker-1", function: { name: "delegate_worker", arguments: JSON.stringify({ type: "explore" }) } }] } }] }
+      ? { choices: [{ delta: { tool_calls: [{ index: 0, id: "worker-1", function: { name: "delegate_worker", arguments: JSON.stringify({ type: "research", query: "worker fixture" }) } }] } }] }
       : { choices: [{ delta: { content: "已采纳 Worker 的工作区证据" } }] }
     response.write(`data: ${JSON.stringify(payload)}\n\n`); response.end("data: [DONE]\n\n")
   })

@@ -97,6 +97,7 @@ flowchart LR
 - 文件工具支持原子 Patch、乐观哈希、检查点恢复，以及目录/符号链接工作区隔离。
 - 真实本地项目选择与 Composer 任务发送入口。
 - Browser Evidence 使用随 DMG 分发的 Chromium Headless Shell 与 Playwright Core；用户无需安装浏览器开发依赖。
+- 独立只读 Worker 支持 Explore、Review（Git Diff）、Research（项目内证据）与 CI（工作流/构建配置）；Worker 结果必须回传主 Session，不能直接修改项目。
 - GitHub Actions 失败日志会分类并创建独立 CI 修复会话；修复结果回流到父会话，且当前 Commit 未重新通过 CI 前 Delivery Gate 会保持 `needsRepair`。
 - 旧版 `DeepSeekCodeCore` 仍是 Swift 迁移参考与兼容验证工具，不是 Tauri 用户下载版的运行时。
 

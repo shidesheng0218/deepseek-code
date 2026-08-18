@@ -89,7 +89,7 @@ const toolSchemas = [
   { type: "function", function: { name: "run_command", description: "在工作区目录运行命令", parameters: { type: "object", properties: { command: { type: "string" }, timeoutMs: { type: "number" } }, required: ["command"] } } },
   { type: "function", function: { name: "web_search", description: "搜索公开网页资料，最多返回 8 条来源", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
-  { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore 或 Review Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review"] } }, required: ["type"] } } }
+  { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore、Review、Research 或 CI Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review", "research", "ci"] }, query: { type: "string" } }, required: ["type"] } } }
   , { type: "function", function: { name: "github_ci_status", description: "读取当前 Commit 对应的 GitHub Actions CI 状态", parameters: { type: "object", properties: {}, required: [] } } }
   , { type: "function", function: { name: "github_ci_failure_log", description: "读取 GitHub Actions 失败日志并分类根因", parameters: { type: "object", properties: { runID: { type: "number" } }, required: ["runID"] } } }
   , { type: "function", function: { name: "browser_evidence", description: "使用本机 Chrome/Chromium 验收页面、采集 DOM、console、network 和截图", parameters: { type: "object", properties: { url: { type: "string" }, expectedText: { type: "string" } }, required: ["url"] } } }
@@ -301,7 +301,8 @@ async function runPersistentCommand(sessionID: string, projectPath: string, inpu
 
 async function delegateWorker(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
   const type = input.type
-  if (type !== "explore" && type !== "review") throw new Error("delegate_worker requires type explore or review")
+  if (type !== "explore" && type !== "review" && type !== "research" && type !== "ci") throw new Error("delegate_worker requires type explore, review, research or ci")
+  const query = typeof input.query === "string" ? input.query.slice(0, 2_000) : undefined
   const workerID = `worker-${crypto.randomUUID()}`
   const result = await new Promise<WorkerResultEnvelope>((resolve, reject) => {
     const child = spawn(process.execPath, ["--worker-stdio"], { stdio: ["pipe", "pipe", "pipe"] })
@@ -318,7 +319,7 @@ async function delegateWorker(sessionID: string, projectPath: string, input: Rec
       if (code !== 0) return reject(new Error(errorOutput || `Worker exited with ${code}`))
       try { resolve(JSON.parse(output) as WorkerResultEnvelope) } catch { reject(new Error("Worker returned invalid JSON")) }
     })
-    child.stdin.end(`${JSON.stringify({ workerID, type, projectPath })}\n`)
+    child.stdin.end(`${JSON.stringify({ workerID, type, projectPath, ...(query ? { query } : {}) })}\n`)
   })
   await emitSessionEvent(sessionID, { type: "worker_completed", workerID: result.workerID, workerType: result.type, state: result.state, summary: result.summary, evidenceCount: result.evidence.length })
   return result
@@ -643,7 +644,7 @@ if (process.argv[2] === "--worker-stdio") {
     for (const line of lines) {
       if (!line.trim()) continue
       try {
-        const contract = JSON.parse(line) as { workerID: string; type: WorkerType; projectPath: string }
+        const contract = JSON.parse(line) as { workerID: string; type: WorkerType; projectPath: string; query?: string }
         void runReadOnlyWorker(contract).then((result) => { process.stdout.write(`${JSON.stringify(result)}\n`); process.exit(0) })
       } catch {
         process.stderr.write("invalid worker contract\n")
