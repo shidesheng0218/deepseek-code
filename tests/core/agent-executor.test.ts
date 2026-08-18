@@ -71,4 +71,33 @@ describe('agent executor', () => {
     expect(result.text).toContain('已读取 README');
     expect(requests).toContainEqual({ role: 'tool', content: 'content:README.md', toolCallId: 'read-1' });
   });
+
+  test('marks a completed answer as completed instead of leaving the session in planning', async () => {
+    const executor = new AgentExecutor({
+      mode: 'accept_edits',
+      model: { stream: async function* () { yield { type: 'text_delta', text: '完成' } as const; } },
+      tools: {}
+    });
+
+    const result = await executor.run('s1', '回答问题');
+
+    expect(result.status).toBe('completed');
+  });
+
+  test('includes committed conversation history in the next model request', async () => {
+    let received: Array<{ role: string; content: string }> = [];
+    const executor = new AgentExecutor({
+      mode: 'accept_edits',
+      model: { stream: async function* (messages) { received = [...messages]; yield { type: 'text_delta', text: '下一轮回答' } as const; } },
+      tools: {}
+    });
+
+    await executor.run('s1', '第二个问题', [{ role: 'user', content: '第一个问题' }, { role: 'assistant', content: '第一个回答' }]);
+
+    expect(received).toEqual([
+      { role: 'user', content: '第一个问题' },
+      { role: 'assistant', content: '第一个回答' },
+      { role: 'user', content: '第二个问题' }
+    ]);
+  });
 });

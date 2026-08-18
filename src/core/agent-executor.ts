@@ -51,9 +51,9 @@ export class AgentExecutor {
     this.maxTurns = options.maxTurns ?? 8;
   }
 
-  async run(sessionId: string, prompt: string): Promise<{ text: string; runtime: AgentRuntime; messages: AgentMessage[]; status: AgentRuntime['state']['status'] }> {
+  async run(sessionId: string, prompt: string, history: AgentMessage[] = []): Promise<{ text: string; runtime: AgentRuntime; messages: AgentMessage[]; status: AgentRuntime['state']['status'] }> {
     const runtime = new AgentRuntime({ sessionId, mode: this.options.mode });
-    const messages: AgentMessage[] = [{ role: 'user', content: prompt }];
+    const messages: AgentMessage[] = [...history, { role: 'user', content: prompt }];
     let text = '';
     const emit = (event: AgentExecutorEvent): void => this.options.onEvent?.(event);
 
@@ -99,7 +99,9 @@ export class AgentExecutor {
           }
         }
         if (!invokedTool) {
+          runtime.complete();
           emit({ type: 'completed', text });
+          if (text) messages.push({ role: 'assistant', content: text });
           return { text, runtime, messages, status: runtime.state.status };
         }
       }

@@ -8,7 +8,7 @@ export interface RuntimeToolRequest {
 }
 
 export interface RuntimeState {
-  status: 'planning' | 'running' | 'waiting_approval';
+  status: 'planning' | 'running' | 'waiting_approval' | 'completed';
 }
 
 export type RuntimeEvent =
@@ -46,5 +46,9 @@ export class AgentRuntime {
     this.events.push({ type: 'approval_resolved', id: approvalId, decision });
     this.pendingApprovalId = undefined;
     this.state.status = decision === 'allow' ? 'running' : 'planning';
+  }
+
+  complete(): void {
+    this.state.status = 'completed';
   }
 }

@@ -12,6 +12,21 @@
         "sidecar": true,
         "args": ["health"]
       }]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [{
+        "name": "binaries/deepseek-agent-runtime",
+        "sidecar": true,
+        "args": ["--stdio"]
+      }]
+    },
+    {
+      "identifier": "shell:allow-stdin-write",
+      "allow": [{
+        "name": "binaries/deepseek-agent-runtime",
+        "sidecar": true
+      }]
     }
   ]
 }
