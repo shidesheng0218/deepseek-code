@@ -5,12 +5,12 @@ import { createRoot } from "react-dom/client"
 import "./styles.css"
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
-type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string }
-type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number }; result?: { text?: string; status?: string }; error?: string }
+type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
+type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string }; result?: { text?: string; status?: string }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
 type Approval = { id: string; tool: string; risk: string }
 
-const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", projectPath: "", apiKey: "" }
+const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", projectPath: "", apiKey: "", protocol: "openai-compatible" }
 
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus>({ ready: false, version: "检查中" })
@@ -24,7 +24,7 @@ function App() {
 
   useEffect(() => {
     void Promise.all([invoke<RuntimeStatus>("runtime_status"), invoke<Settings>("load_settings")])
-      .then(([status, saved]) => { setRuntime(status); setSettings({ ...defaults, ...saved }) })
+      .then(([status, saved]) => { setRuntime(status); setSettings({ ...defaults, ...saved, protocol: saved.protocol || defaults.protocol }) })
       .catch((error: unknown) => setRuntime({ ready: false, version: "不可用", detail: String(error) }))
   }, [])
 
@@ -33,6 +33,7 @@ function App() {
     const unlisten = listen<RuntimeFrame>("runtime-event", (event) => {
       if (disposed) return
       const frame = event.payload
+      if (frame.sessionID && frame.sessionID !== sessionID) return
       if (frame.type === "response") {
         if (frame.result?.text) setMessages((current) => {
           const last = current[current.length - 1]
@@ -60,6 +61,14 @@ function App() {
         setMessages((current) => [...current, { role: "tool", text: `${runtimeEvent.workerType ?? "Worker"} 已完成：${runtimeEvent.summary ?? ""}（${runtimeEvent.evidenceCount ?? 0} 条 Evidence）`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "ci_status") {
         setMessages((current) => [...current, { role: "tool", text: `GitHub Actions：当前 Commit ${runtimeEvent.currentRunCount ?? 0} 个 Run，忽略 ${runtimeEvent.staleRunCount ?? 0} 个旧 Commit Run`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "ci_repair_session_created") {
+        setMessages((current) => [...current, { role: "tool", text: `CI 修复会话已创建：Run #${runtimeEvent.runID ?? "?"} · ${runtimeEvent.summary ?? "等待主任务安全结束后启动"}`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "ci_repair_session_started") {
+        setMessages((current) => [...current, { role: "tool", text: `CI 修复会话已启动：Run #${runtimeEvent.runID ?? "?"} · Commit ${(runtimeEvent.commit ?? "").slice(0, 12)}`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "ci_repair_session_completed") {
+        setMessages((current) => [...current, { role: "tool", text: `CI 修复会话结束：${runtimeEvent.status ?? "completed"}${runtimeEvent.delivery ? ` · ${runtimeEvent.delivery}` : ""}${runtimeEvent.summary ? ` · ${runtimeEvent.summary}` : ""}`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "ci_repair_session_failed") {
+        setMessages((current) => [...current, { role: "system", text: `CI 修复会话失败：${runtimeEvent.error ?? "未知错误"}`, kind: "error" }])
       } else if (runtimeEvent.type === "delivery_evaluated") {
         const label: Record<string, string> = { delivered: "已交付", handoffReady: "待交接", needsRepair: "需要修复", needsAttention: "需要关注" }
         setMessages((current) => [...current, { role: "tool", text: `交付门禁：${label[runtimeEvent.state ?? ""] ?? runtimeEvent.state}${runtimeEvent.reasons?.length ? ` · ${runtimeEvent.reasons.join(" ")}` : ""}`, kind: runtimeEvent.type }])
@@ -89,7 +98,7 @@ function App() {
     setBusy(true)
     try {
       await invoke("save_settings", { settings })
-      await invoke("run_agent", { request: { sessionId: sessionID, projectPath: settings.projectPath, prompt: text, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, mode: "auto" } })
+      await invoke("run_agent", { request: { sessionId: sessionID, projectPath: settings.projectPath, prompt: text, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, protocol: settings.protocol, mode: "auto" } })
     } catch (error) {
       setBusy(false)
       setMessages((current) => [...current, { role: "system", text: String(error), kind: "error" }])
@@ -100,7 +109,7 @@ function App() {
     if (!approval) return
     setBusy(true)
     try {
-      await invoke("resolve_approval", { request: { sessionId: sessionID, projectPath: settings.projectPath, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, mode: "auto", approvalId: approval.id, decision } })
+      await invoke("resolve_approval", { request: { sessionId: sessionID, projectPath: settings.projectPath, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, protocol: settings.protocol, mode: "auto", approvalId: approval.id, decision } })
       setApproval(null)
     } catch (error) {
       setBusy(false)
@@ -130,7 +139,7 @@ function App() {
         {busy && <div className="typing"><i /><i /><i /> 正在工作</div>}
       </section>
       <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行，事件会实时显示" : "回车发送 · Shift+Enter 换行"}</span>{busy ? <button type="button" onClick={() => void cancel()}>停止</button> : <button type="button" disabled={!canRun} onClick={() => void submit()}>开始任务</button>}</footer></section>
-      {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>模型<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
+      {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /></label><label>协议<select value={settings.protocol} onChange={(event) => setSettings({ ...settings, protocol: event.target.value as Settings["protocol"] })}><option value="openai-compatible">OpenAI-compatible / DeepSeek</option><option value="anthropic-messages">Anthropic Messages</option></select></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>模型<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
     </section>
   </main>
 }

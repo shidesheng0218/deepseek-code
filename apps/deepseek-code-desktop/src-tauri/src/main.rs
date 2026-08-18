@@ -17,6 +17,7 @@ struct RuntimeSettings {
     base_url: String,
     model: String,
     project_path: String,
+    protocol: String,
     #[serde(skip_serializing)]
     api_key: String,
 }
@@ -30,6 +31,7 @@ struct AgentRequest {
     base_url: String,
     api_key: String,
     model: String,
+    protocol: String,
     mode: String,
 }
 
@@ -41,6 +43,7 @@ struct ApprovalRequest {
     base_url: String,
     api_key: String,
     model: String,
+    protocol: String,
     mode: String,
     approval_id: String,
     decision: String,

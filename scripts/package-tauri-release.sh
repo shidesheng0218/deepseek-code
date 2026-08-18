@@ -26,7 +26,7 @@ shasum -a 256 "$release_dmg" > "$release_dir/SHA256SUMS.txt"
 node - "$release_dir/release-metadata.json" "$version" "$(basename "$release_dmg")" <<'NODE'
 const fs = require("fs")
 const [output, version, artifact] = process.argv.slice(2)
-fs.writeFileSync(output, `${JSON.stringify({ product: "DeepSeek Code", version, artifact, runtime: "tauri-sidecar", signing: "adhoc" }, null, 2)}\n`)
+fs.writeFileSync(output, `${JSON.stringify({ product: "DeepSeek Code", version, artifact, runtime: "tauri-sidecar", browserRuntime: "bundled-chromium-playwright-core", signing: "adhoc" }, null, 2)}\n`)
 NODE
 
 echo "Tauri release artifact: $release_dmg"

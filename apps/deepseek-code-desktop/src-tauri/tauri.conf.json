@@ -9,6 +9,9 @@
     "active": true,
     "targets": ["app", "dmg"],
     "externalBin": ["binaries/deepseek-agent-runtime"],
-    "resources": { "resources/browser/": "browser/" }
+    "resources": {
+      "resources/browser/": "browser/",
+      "resources/playwright-core/": "playwright-core/"
+    }
   }
 }

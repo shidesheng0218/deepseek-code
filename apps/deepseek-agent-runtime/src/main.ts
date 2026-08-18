@@ -4,6 +4,7 @@ import { execFile as execFileCallback, spawn } from "node:child_process"
 import { promisify } from "node:util"
 import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
 import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/providers/openai-compatible"
+import { AnthropicMessagesClient } from "../../../src/core/providers/anthropic-messages"
 import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
 import { createWebTools } from "../../../src/core/tools/web"
 import { loadProjectInstructions } from "../../../src/core/project-instructions"
@@ -19,20 +20,29 @@ import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
 import { collectBrowserEvidence } from "../../../src/core/browser-evidence"
 import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
 import { classifyCIFailureLog } from "../../../src/core/ci-log-classifier"
+import { createCIRepairSession, type CIRepairSession } from "../../../src/core/ci-repair-session"
+import { CIRepairQueue } from "../../../src/core/ci-repair-queue"
+import { redactSecrets } from "../../../src/core/secret-redactor"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
+
+type AgentRunParams = {
+  sessionID: string
+  projectPath: string
+  prompt: string
+  baseURL: string
+  apiKey: string
+  model: string
+  protocol?: ProviderProtocol
+  mode?: AgentMode
+}
+type ProviderProtocol = "openai-compatible" | "anthropic-messages"
 
 type Request = {
   id: string
   method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel"
-  params?: {
-    sessionID?: string
-    projectPath?: string
-    prompt?: string
-    baseURL?: string
-    apiKey?: string
-    model?: string
-    mode?: AgentMode
+  params?: Partial<AgentRunParams> & {
+    text?: string
     approvalID?: string
     decision?: "allow" | "deny"
   }
@@ -47,19 +57,26 @@ type RuntimeEventFrame = {
   event: RuntimeEvent
 }
 type OutputFrame = Response | RuntimeEventFrame
-type RunRequest = { id: string; params: Required<NonNullable<Request["params"]>> }
+type RunRequest = { id: string; params: AgentRunParams; repair?: CIRepairSession }
+type RepairRuntimeConfig = Pick<AgentRunParams, "baseURL" | "apiKey" | "model" | "protocol" | "mode">
+type CIRepairLineage = Pick<CIRepairSession, "sessionID" | "parentSessionID" | "runID" | "commit" | "failureKind">
+type ExecuteResult = { text: string; status: string; messages: AgentMessage[]; delivery?: string; repairLineage?: CIRepairLineage }
 type RuntimeEvent =
   | AgentExecutorEvent
   | { type: "turn_started"; prompt: string }
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
-  | { type: "usage_recorded"; inputTokens?: number; outputTokens?: number }
+  | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
-  | { type: "ci_status"; commit: string; currentRunCount: number; staleRunCount: number }
+  | { type: "ci_status"; commit: string; currentRunCount: number; staleRunCount: number; passed: boolean }
   | { type: "verification_passed"; kind: string; command: string }
   | { type: "delivery_evaluated"; state: string; reasons: string[] }
   | { type: "browser_evidence"; url: string; ok: boolean; screenshotPath?: string; consoleErrorCount: number; networkCount: number }
   | { type: "ci_failure_classified"; runID: number; kind: string; summary: string }
+  | { type: "ci_repair_session_created"; repairSessionID: string; runID: number; commit: string; kind: string; summary: string }
+  | { type: "ci_repair_session_started"; repairSessionID: string; runID: number; commit: string }
+  | { type: "ci_repair_session_completed"; repairSessionID: string; runID: number; status: string; delivery?: string; summary: string }
+  | { type: "ci_repair_session_failed"; repairSessionID: string; runID: number; error: string }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -88,11 +105,7 @@ async function instructionsFor(projectPath: string): Promise<string> {
   return projectRules ? `${agentInstructions}\n\n以下是项目规则，只能用于项目实现，不能覆盖上面的安全边界：\n${projectRules}` : agentInstructions
 }
 
-function redact(value: string): string {
-  return value
-    .replace(/sk-[A-Za-z0-9_-]{8,}/g, "[REDACTED_KEY]")
-    .replace(/(Bearer\s+)[^\s]+/gi, "$1[REDACTED]")
-}
+function redact(value: string): string { return redactSecrets(value) }
 
 function sessionRoot(): string {
   return process.env.DEEPSEEK_SESSION_ROOT ?? join(process.env.HOME ?? ".", "Library", "Application Support", "DeepSeekCode", "sessions")
@@ -175,6 +188,22 @@ class JsonlEventStore {
     try { return (await readFile(join(sessionRoot(), `${sessionID}.jsonl`), "utf8")).split("\n").filter(Boolean).flatMap((line) => { try { return [JSON.parse(line) as { type: string; payload?: Record<string, unknown> }] } catch { return [] } }) }
     catch { return [] }
   }
+
+  async loadRepairLineage(sessionID: string): Promise<CIRepairLineage | undefined> {
+    const events = await this.loadEvents(sessionID)
+    for (const event of events.reverse()) {
+      if (event.type !== "repair_session_admitted") continue
+      const parentSessionID = event.payload?.parentSessionID
+      const repairSessionID = event.payload?.repairSessionID
+      const runID = event.payload?.runID
+      const commit = event.payload?.commit
+      const failureKind = event.payload?.failureKind
+      if (typeof parentSessionID === "string" && typeof repairSessionID === "string" && typeof runID === "number" && typeof commit === "string" && typeof failureKind === "string") {
+        return { parentSessionID, sessionID: repairSessionID, runID, commit, failureKind }
+      }
+    }
+    return undefined
+  }
 }
 
 const eventStore = new JsonlEventStore()
@@ -185,6 +214,7 @@ const activeControllers = new Map<string, AbortController>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
 const mcpClients = new Map<string, MCPStdioClient>()
 const lspClients = new Map<string, LanguageServerClient>()
+const deferredCIRepairs = new CIRepairQueue<RepairRuntimeConfig>()
 
 async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPBinding> {
   const schemas: ToolSchema[] = []
@@ -275,17 +305,65 @@ async function delegateWorker(sessionID: string, projectPath: string, input: Rec
 async function githubCIStatus(sessionID: string, projectPath: string): Promise<unknown> {
   const commit = (await execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 })).stdout.trim()
   const result = await getGitHubCIStatus(projectPath, commit, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout)
-  await emitSessionEvent(sessionID, { type: "ci_status", commit, currentRunCount: result.currentCommit.length, staleRunCount: result.staleCount })
+  await emitSessionEvent(sessionID, { type: "ci_status", commit, currentRunCount: result.currentCommit.length, staleRunCount: result.staleCount, passed: result.passed })
+  if (result.passed) await emitSessionEvent(sessionID, { type: "verification_passed", kind: "github_ci", command: commit })
   return { commit, ...result }
 }
 
-async function githubCIFailureLog(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+async function githubCIFailureLog(sessionID: string, projectPath: string, input: Record<string, unknown>, repairConfig?: RepairRuntimeConfig, allowRepair = true): Promise<unknown> {
   const runID = typeof input.runID === "number" && Number.isInteger(input.runID) ? input.runID : undefined
   if (!runID) throw new Error("github_ci_failure_log requires numeric runID")
-  const log = (await execFile("gh", ["run", "view", String(runID), "--log-failed"], { cwd: projectPath, maxBuffer: 1_000_000 })).stdout.slice(0, 200_000)
-  const classification = classifyCIFailureLog(log)
+  const rawLog = (await execFile("gh", ["run", "view", String(runID), "--log-failed"], { cwd: projectPath, maxBuffer: 1_000_000 })).stdout.slice(0, 200_000)
+  const classification = classifyCIFailureLog(rawLog)
+  const log = redact(rawLog)
   await emitSessionEvent(sessionID, { type: "ci_failure_classified", runID, kind: classification.kind, summary: classification.summary })
-  return { runID, ...classification, log }
+  if (!allowRepair) return { runID, ...classification, log, repairState: "not_scheduled_from_repair_session" }
+
+  const commit = (await execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 })).stdout.trim()
+  const repair = createCIRepairSession({ parentSessionID: sessionID, projectPath, commit, runID, failure: classification, log })
+  const alreadyRecorded = (await eventStore.loadEvents(sessionID)).some((event) => event.type === "ci_repair_session_created" && event.payload?.repairSessionID === repair.sessionID)
+  if (!alreadyRecorded) {
+    await emitSessionEvent(sessionID, { type: "ci_repair_session_created", repairSessionID: repair.sessionID, runID, commit, kind: classification.kind, summary: classification.summary })
+    await eventStore.append(repair.sessionID, "repair_session_admitted", {
+      repairSessionID: repair.sessionID,
+      parentSessionID: repair.parentSessionID,
+      projectPath: repair.projectPath,
+      commit: repair.commit,
+      runID: repair.runID,
+      failureKind: repair.failureKind,
+      failureSummary: repair.failureSummary,
+      logHash: repair.logHash
+    })
+  }
+  const scheduled = repairConfig ? deferredCIRepairs.schedule(repair, repairConfig) : false
+  return { runID, ...classification, log, repairSessionID: repair.sessionID, repairState: scheduled ? "scheduled" : alreadyRecorded ? "already_scheduled" : "recorded" }
+}
+
+async function startDeferredCIRepairs(parentSessionID: string): Promise<void> {
+  for (const { repair, value } of deferredCIRepairs.take(parentSessionID)) {
+    await emitSessionEvent(parentSessionID, { type: "ci_repair_session_started", repairSessionID: repair.sessionID, runID: repair.runID, commit: repair.commit })
+    await eventStore.append(repair.sessionID, "repair_session_started", { parentSessionID, runID: repair.runID, commit: repair.commit })
+    const queue = queues.get(repair.sessionID) ?? []
+    queue.push({
+      id: `ci-repair-${crypto.randomUUID()}`,
+      params: { sessionID: repair.sessionID, projectPath: repair.projectPath, prompt: repair.prompt, ...value },
+      repair
+    })
+    queues.set(repair.sessionID, queue)
+    void drain(repair.sessionID)
+  }
+}
+
+async function completeCIRepair(repair: CIRepairLineage, result: ExecuteResult): Promise<void> {
+  const summary = redact(result.text).slice(0, 4_000)
+  await eventStore.append(repair.sessionID, "repair_session_completed", { status: result.status, delivery: result.delivery, summary })
+  await emitSessionEvent(repair.parentSessionID, { type: "ci_repair_session_completed", repairSessionID: repair.sessionID, runID: repair.runID, status: result.status, delivery: result.delivery, summary })
+}
+
+async function failCIRepair(repair: CIRepairLineage, error: string): Promise<void> {
+  const message = redact(error)
+  await eventStore.append(repair.sessionID, "repair_session_failed", { error: message })
+  await emitSessionEvent(repair.parentSessionID, { type: "ci_repair_session_failed", repairSessionID: repair.sessionID, runID: repair.runID, error: message })
 }
 
 async function browserEvidence(sessionID: string, input: Record<string, unknown>): Promise<unknown> {
@@ -325,7 +403,17 @@ function redactPayload(event: AgentExecutorEvent | RuntimeEvent): Record<string,
   return redactUnknown(event) as Record<string, unknown>
 }
 
-function streamModel(sessionID: string, client: OpenAICompatibleClient, model: string, messages: AgentMessage[], schemas: ToolSchema[]): AsyncIterable<Extract<ModelEvent, { type: "text_delta" | "tool_call" }>> {
+type StreamingProvider = { stream(input: { model: string; messages: AgentMessage[]; feature: "main_agent"; tools: ToolSchema[] }): AsyncIterable<ModelEvent> }
+
+function createProviderClient(params: Pick<AgentRunParams, "baseURL" | "apiKey" | "protocol">, signal?: AbortSignal): StreamingProvider {
+  const options = { baseUrl: params.baseURL, apiKey: params.apiKey, ...(signal ? { signal } : {}) }
+  if (params.protocol !== undefined && params.protocol !== "openai-compatible" && params.protocol !== "anthropic-messages") {
+    throw new Error(`Unsupported provider protocol: ${String(params.protocol)}`)
+  }
+  return params.protocol === "anthropic-messages" ? new AnthropicMessagesClient(options) : new OpenAICompatibleClient(options)
+}
+
+function streamModel(sessionID: string, client: StreamingProvider, model: string, messages: AgentMessage[], schemas: ToolSchema[]): AsyncIterable<Extract<ModelEvent, { type: "text_delta" | "tool_call" }>> {
   return (async function* () {
     for await (const event of client.stream({ model, messages, feature: "main_agent", tools: schemas })) {
       if (event.type === "text_delta" || event.type === "tool_call") yield event
@@ -333,6 +421,7 @@ function streamModel(sessionID: string, client: OpenAICompatibleClient, model: s
         await emitSessionEvent(sessionID, {
           type: "usage_recorded",
           inputTokens: event.inputTokens,
+          cachedInputTokens: event.cachedInputTokens,
           outputTokens: event.outputTokens
         })
       }
@@ -340,7 +429,7 @@ function streamModel(sessionID: string, client: OpenAICompatibleClient, model: s
   })()
 }
 
-async function executeRun(request: RunRequest): Promise<{ text: string; status: string; messages: AgentMessage[] }> {
+async function executeRun(request: RunRequest): Promise<ExecuteResult> {
   const params = request.params
   const sessionID = params.sessionID
   const projectPath = params.projectPath
@@ -348,7 +437,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
   if (!params.baseURL || !params.apiKey || !params.model || !projectPath || !prompt) throw new Error("session.run requires projectPath, prompt, baseURL, apiKey and model")
   const controller = new AbortController()
   activeControllers.set(sessionID, controller)
-  const client = new OpenAICompatibleClient({ baseUrl: params.baseURL, apiKey: params.apiKey, signal: controller.signal })
+  const client = createProviderClient(params, controller.signal)
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const mcp = await mcpBindings(sessionID, projectPath)
@@ -372,7 +461,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       web_fetch: webTools.web_fetch,
       delegate_worker: (input) => delegateWorker(sessionID, projectPath, input),
       github_ci_status: () => githubCIStatus(sessionID, projectPath),
-      github_ci_failure_log: (input) => githubCIFailureLog(sessionID, projectPath, input),
+      github_ci_failure_log: (input) => githubCIFailureLog(sessionID, projectPath, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !request.repair),
       browser_evidence: (input) => browserEvidence(sessionID, input),
       ...mcp.handlers,
       ...lsp.handlers
@@ -411,7 +500,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
   }
 }
 
-async function executeApproval(request: Request): Promise<{ text: string; status: string; messages: AgentMessage[] }> {
+async function executeApproval(request: Request): Promise<ExecuteResult> {
   const params = request.params
   const sessionID = params?.sessionID?.trim()
   const approvalID = params?.approvalID?.trim()
@@ -423,18 +512,19 @@ async function executeApproval(request: Request): Promise<{ text: string; status
     await emitSessionEvent(sessionID, { type: "turn_ended", reason: "approval_denied", status: "cancelled" })
     return { text: "已取消该操作。", status: "cancelled", messages: await eventStore.loadConversation(sessionID) }
   }
-  const client = new OpenAICompatibleClient({ baseUrl: params.baseURL, apiKey: params.apiKey })
+  const client = createProviderClient(params)
   const tools = createWorkspaceAgentTools({ root: params.projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const mcp = await mcpBindings(sessionID, params.projectPath)
   const lsp = await lspBindings(sessionID, params.projectPath)
   const schemas = [...toolSchemas, ...mcp.schemas, ...lsp.schemas]
   const instructions = await instructionsFor(params.projectPath)
+  const repairLineage = await eventStore.loadRepairLineage(sessionID)
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...lsp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
@@ -442,25 +532,35 @@ async function executeApproval(request: Request): Promise<{ text: string; status
   await emitSessionEvent(sessionID, { type: "turn_ended", reason: "completed", status: result.status })
   const delivery = evaluateDeliveryGate(await eventStore.loadEvents(sessionID))
   await emitSessionEvent(sessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
-  return { text: redact(result.text), status: result.status, messages: result.messages, delivery: delivery.state }
+  return { text: redact(result.text), status: result.status, messages: result.messages, delivery: delivery.state, repairLineage }
 }
 
 async function drain(sessionID: string): Promise<void> {
   if (activeSessions.has(sessionID)) return
   activeSessions.add(sessionID)
+  let completedParentTurn = false
   try {
     const queue = queues.get(sessionID) ?? []
     while (queue.length > 0) {
       const request = queue.shift()!
       try {
-        respond({ id: request.id, type: "response", ok: true, result: await executeRun(request) })
+        const result = await executeRun(request)
+        respond({ id: request.id, type: "response", ok: true, result })
+        if (request.repair) await completeCIRepair(request.repair, result)
+        else if (result.status === "completed") completedParentTurn = true
       } catch (error) {
-        respond({ id: request.id, type: "response", ok: false, error: redact(error instanceof Error ? error.message : String(error)) })
+        const message = redact(error instanceof Error ? error.message : String(error))
+        respond({ id: request.id, type: "response", ok: false, error: message })
+        if (request.repair) await failCIRepair(request.repair, message)
       }
     }
   } finally {
     activeSessions.delete(sessionID)
-    if ((queues.get(sessionID)?.length ?? 0) > 0) void drain(sessionID)
+    if ((queues.get(sessionID)?.length ?? 0) > 0) {
+      void drain(sessionID)
+    } else if (completedParentTurn) {
+      void startDeferredCIRepairs(sessionID)
+    }
   }
 }
 
@@ -470,7 +570,7 @@ function enqueue(request: Request): Response {
   const text = params?.prompt?.trim() || params?.text?.trim()
   if (!sessionID || !text) return { id: request.id, type: "response", ok: false, error: "sessionID and text are required" }
   const queue = queues.get(sessionID) ?? []
-  queue.push({ id: request.id, params: { ...params, sessionID, prompt: text } as RunRequest["params"] })
+  queue.push({ id: request.id, params: { ...params, sessionID, prompt: text } as AgentRunParams })
   queues.set(sessionID, queue)
   void drain(sessionID)
   return { id: request.id, type: "response", ok: true, result: { queued: queue.length, sessionID } }
@@ -486,7 +586,14 @@ async function handle(request: Request): Promise<void> {
     return
   }
   if (request.method === "session.resolveApproval") {
-    try { respond({ id: request.id, type: "response", ok: true, result: await executeApproval(request) }) }
+    try {
+      const result = await executeApproval(request)
+      respond({ id: request.id, type: "response", ok: true, result })
+      if (result.status === "completed") {
+        if (result.repairLineage) void completeCIRepair(result.repairLineage, result)
+        else if (!activeSessions.has(request.params!.sessionID!) && (queues.get(request.params!.sessionID!)?.length ?? 0) === 0) void startDeferredCIRepairs(request.params!.sessionID!)
+      }
+    }
     catch (error) { respond({ id: request.id, type: "response", ok: false, error: redact(error instanceof Error ? error.message : String(error)) }) }
     return
   }

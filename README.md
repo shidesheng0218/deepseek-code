@@ -29,18 +29,17 @@
 
 ```mermaid
 flowchart LR
-    U["开发者"] --> GUI["Tauri App / CLI"]
-    GUI --> IPC["本地 IPC"]
-    IPC --> D["deepseekd"]
-    D --> S["SessionSupervisor\n唯一命令与状态所有者"]
-    S --> M["Provider + 模型路由"]
-    S --> P["Tool Execution Pipeline"]
+    U["开发者"] --> GUI["DeepSeek Code.app\nTauri 2"]
+    GUI --> IPC["Rust IPC Bridge"]
+    IPC --> S["Bundled Agent Sidecar"]
+    S --> M["OpenAI-compatible /\nAnthropic Messages"]
+    S --> P["AgentExecutor + Permission Gate"]
     P --> W["Workspace / Git"]
     P --> T["Persistent Terminal"]
     P --> R["Web Search / Fetch"]
-    P --> A["Read-only Workers"]
-    S --> E[("SQLite Event Log\n+ Evidence")]
-    E --> V["Projection + Verification Gate"]
+    P --> A["Read-only Explore / Review Workers"]
+    S --> E[("JSONL Session Event Log\n+ Browser / CI Evidence")]
+    E --> V["Delivery Gate"]
     V --> GUI
 ```
 
@@ -53,7 +52,7 @@ flowchart LR
 3. 打开 DMG，把 **DeepSeek Code.app** 拖到 **Applications**，然后双击启动。
 4. 首次启动如果 macOS 提示无法验证开发者，右键 App 选择“打开”，确认一次即可；这只适用于未配置 Apple Developer ID 的社区构建。
 
-启动后只需配置 **Base URL、API Key 和项目目录**。开发工具链和发布流程由项目维护者处理，用户不需要配置证书、公证或 GitHub Actions。
+启动后默认只需配置 **Base URL、API Key 和项目目录**。DeepSeek 与其他 OpenAI-compatible 服务直接可用；使用 Anthropic 时，在设置里将协议切换为 **Anthropic Messages**。开发工具链和发布流程由项目维护者处理，用户不需要配置证书、公证或 GitHub Actions。
 
 当前 Release 是 Apple Silicon（arm64）版本，要求 macOS 14 或更高版本。
 
@@ -86,74 +85,60 @@ flowchart LR
 - 中文优先的 Session、计划、工具活动、Diff、Browser 和 Review 界面。
 - Plan / Manual / Accept Edits / Auto 四种权限模式。
 - 细粒度命令风险分类和审批决策。
-- SQLite Session 事件存储，可用于事件回放和恢复。
-- OpenAI-compatible / DeepSeek-compatible 流式 Chat Completions 客户端。
-- 按功能分层的 Token、缓存 Token、延迟与费用账本。
+- Sidecar 的 JSONL Session Event Log：持久化对话、工具、审批、Browser 与 CI 证据；未完成工具会被 Delivery Gate 标记为需要关注。
+- OpenAI-compatible / DeepSeek-compatible Chat Completions，以及 Anthropic Messages 的流式文本、工具调用和 Token 用量解析。
+- 每次模型流记录输入、缓存输入和输出 Token；价格与路由策略仍在发布硬化范围内。
 - 工作区路径隔离、符号链接逃逸防护和行范围读取。
 - Git Worktree 服务：创建受管理的 `deepseek/<task>` 分支与独立工作树。
-- Provider 设置页：Base URL + API Key 开箱配置；模型、协议和能力测试位于高级设置。
-- API Key 通过 Keychain/本地受保护 Secret Store 保存，SQLite 仅保留引用。
+- Provider 设置页：Base URL + API Key 开箱配置，并可显式选择 OpenAI-compatible / Anthropic Messages。
+- API Key 由 macOS Keychain 保存；工具事件、CI 日志和子会话提示在写入模型上下文前进行脱敏。
 - Agent IPC 执行闭环：模型流 → 工具调用 → 风险/审批 → 文件、Git、命令工具 → 脱敏事件回传。
 - 文件工具支持原子 Patch、乐观哈希、检查点恢复，以及目录/符号链接工作区隔离。
 - 真实本地项目选择与 Composer 任务发送入口。
-- 旧版 `DeepSeekCodeCore` 提供 Durable Session、Provider、Keychain、事件流、权限、Workspace、Git、Review、Skills、MCP、Hooks、Browser、Terminal 与 SSH 运行时；这些能力按测试逐项迁移到 Agent Sidecar。
-- Composer 已接入真实 DeepSeek/OpenAI-compatible SSE 与 Anthropic Messages，支持工具审批、Token/费用和延迟审计。
+- Browser Evidence 使用随 DMG 分发的 Chromium Headless Shell 与 Playwright Core；用户无需安装浏览器开发依赖。
+- GitHub Actions 失败日志会分类并创建独立 CI 修复会话；修复结果回流到父会话，且当前 Commit 未重新通过 CI 前 Delivery Gate 会保持 `needsRepair`。
+- 旧版 `DeepSeekCodeCore` 仍是 Swift 迁移参考与兼容验证工具，不是 Tauri 用户下载版的运行时。
 
 ## 一次任务如何完成
 
 ```mermaid
 sequenceDiagram
     participant You as 你
-    participant App as App / CLI
-    participant S as SessionSupervisor
-    participant P as Tool Pipeline
-    participant E as Event Log + Evidence
+    participant App as Tauri App
+    participant S as Agent Sidecar
+    participant P as AgentExecutor + Permissions
+    participant E as JSONL Event Log + Evidence
 
     You->>App: “修复登录问题并验证”
-    App->>S: 提交 Session Command
-    S->>E: turn_started / step_started
+    App->>S: session.run IPC
+    S->>E: turn_started
     S->>P: 读取项目、修改、测试
     P->>E: 工具事件、脱敏结果、Evidence
     alt 低风险且已授权
         P-->>S: 自动执行
     else 外部写入、登录或高风险操作
         P-->>App: 请求一次审批
-        App->>S: Approval Resolution
+        App->>S: session.resolveApproval
         S->>P: 精确续跑原调用
     end
-    S->>E: verification_evaluated
+    S->>E: delivery_evaluated
     S-->>App: 自然语言结果 + 可展开证据
 ```
 
-模型不能只凭一句“完成了”把任务标记为交付完成。任务会沿可回放状态机推进：
+模型不能只凭一句“完成了”把任务标记为交付完成。Sidecar 根据工具、审批、CI 与验证事件决定：
 
 ```text
-admitted → planning → executing → awaitingApproval → verifying
-        → repairing → handoffReady → delivering → delivered
-                                      ↘ needsRepair / needsAttention
+running → waiting_approval → completed
+                       ↘ cancelled / error
+
+Delivery Gate → delivered / handoffReady / needsRepair / needsAttention
 ```
 
-### Runtime 3.0 的关键约束
+### 当前运行时边界
 
-```mermaid
-flowchart TB
-    C["GUI / CLI / Control Plane"] --> CC["Command Client"]
-    CC --> SS["SessionSupervisor"]
-    SS --> TD["SessionExecutionDriver"]
-    TD --> TP["ToolExecutionPipeline"]
-    TP --> CH["Capability Hosts"]
-    TP --> WH["Worker Helper"]
-    SS --> EW["SessionEventCommitter"]
-    EW --> DB[("SQLite")]
-    DB --> PR["Read-only Projection"]
-    PR --> C
+Tauri 版目前只有一个用户运行时：**Rust IPC Bridge → Bundled Agent Sidecar**。Sidecar 串行消费同一 Session 的输入，写入 JSONL 事件，并通过同一进程协议把流式回答、审批、工具、Worker、Browser 与 CI 事件回传给界面。
 
-    style SS fill:#1d4ed8,color:#fff,stroke:#1e3a8a
-    style TP fill:#0f766e,color:#fff,stroke:#134e4a
-    style DB fill:#7c3aed,color:#fff,stroke:#4c1d95
-```
-
-**关键规则**：UI、CLI、Control Plane、Tool Host 和 Worker 不直接写 Session 状态。所有可见状态都来自事件投影；所有工具必须经过同一条 Pipeline。
+`macos/DeepSeekCode` 中的 `deepseekd`、CLI、SQLite Projection 与 Runtime 3.0 架构仍保留为迁移参考和兼容测试；它们不能被描述为当前 Tauri 下载版的第二个真源。
 
 ## 本地开发
 
@@ -165,7 +150,7 @@ npm run dev
 
 `npm run dev:swift` 仍可启动旧 SwiftUI 版本，便于验证旧数据迁移；它不是默认产品入口。
 
-### 使用 CLI 与 daemon
+### Swift 兼容工具（非 Tauri 下载版入口）
 
 ```bash
 # 终端 A：启动本地 Runtime
@@ -180,7 +165,7 @@ swift run deepseek ask "解释当前项目的构建入口"
 swift run deepseek run "修复登录问题并运行测试"
 ```
 
-GUI 与 CLI 通过本地 IPC 连接同一个 Runtime，因此可看到同一组 Session、审批、Terminal 与 Evidence。
+该 CLI 与 daemon 仅用于旧 Swift Runtime 的兼容/迁移验证，不与 Tauri 下载版共享会话。
 
 生成新的 Tauri macOS `.app` 和 DMG：
 
@@ -270,7 +255,7 @@ flowchart LR
 - localhost、私网、链路本地、metadata 地址、DNS rebinding 和危险重定向永久阻止。
 - 网页内容是**不可信数据**，不能修改系统提示、权限或工具策略。
 - API Key、Cookie、密码和私钥不进入模型上下文、SQLite、Transcript 或普通日志。
-- `RuntimeProfile` 只声明 daemon 真正装配的能力；没有可靠 Host 的 Browser、MCP 或 SSH 不会被静默委派。
+- Sidecar 当前仅装配有真实 Host 的能力；MCP、LSP、Browser、Terminal、Web 与 Worker 都会显式报告不可用或执行失败，不伪造成功。
 
 ## 发布硬化中的工作
 
@@ -283,10 +268,10 @@ flowchart LR
 
 | 已具备                                                     | 正在硬化，尚不应宣传为完成                         |
 | ---------------------------------------------------------- | -------------------------------------------------- |
-| Tauri App + Agent Sidecar、CLI、SQLite Event Log | Browser → Test → Review → PR → CI 的真实端到端验收 |
-| Tool Pipeline、审批续跑、Web Evidence、持久 Terminal 模型  | SSH 长连接与断线恢复的发布级验证                   |
-| Provider 路由、用量/费用记录、Worker Evidence 采纳         | 60 个真实任务、CI 修复与竞品同题基准               |
-| GitHub DMG 构建与可选签名/公证                             | 完整 XCUITest、故障注入与自动更新回滚              |
+| Tauri App + Bundled Agent Sidecar、JSONL Event Log、审批续跑 | Browser → Test → Review → PR → CI 的真实端到端验收 |
+| OpenAI-compatible / Anthropic Messages、Web、MCP stdio、LSP、Terminal、Browser Evidence | SSH 长连接与断线恢复的发布级验证                   |
+| Explore / Review Worker、CI 失败分类与 CI Repair Session 回流 | 60 个真实任务与竞品同题基准                         |
+| GitHub DMG 构建、Chromium + Playwright Core 随包分发        | 签名、公证、完整 XCUITest、自动更新回滚            |
 
 `BenchmarkReleaseGate` 会检查 fixture 数量、通过率和 Evidence 覆盖率，避免不完整的本地运行被误判为发布级成绩；这**不等同于**已在同题基准上超过 Claude Code 或 Codex。
 

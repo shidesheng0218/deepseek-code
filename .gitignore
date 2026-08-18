@@ -3,6 +3,7 @@ apps/deepseek-code-desktop/dist/
 apps/deepseek-code-desktop/src-tauri/target/
 apps/deepseek-code-desktop/src-tauri/binaries/deepseek-agent-runtime-*
 apps/deepseek-code-desktop/src-tauri/resources/browser/
+apps/deepseek-code-desktop/src-tauri/resources/playwright-core/
 apps/deepseek-code-desktop/src-tauri/gen/
 apps/deepseek-agent-runtime/dist/
 apps/deepseek-code-desktop/*.tsbuildinfo

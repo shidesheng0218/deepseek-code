@@ -28,6 +28,19 @@ assert.strictEqual(metadata.product, "DeepSeek Code")
 assert.strictEqual(metadata.version, version)
 assert.strictEqual(metadata.artifact, artifact)
 assert.strictEqual(metadata.runtime, "tauri-sidecar")
+assert.strictEqual(metadata.browserRuntime, "bundled-chromium-playwright-core")
 NODE
+
+mount_dir="$(mktemp -d /tmp/deepseek-code-release.XXXXXX)"
+cleanup() {
+  hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
+  rmdir "$mount_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
+hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$artifact" >/dev/null
+app="$mount_dir/DeepSeek Code.app"
+test -x "$app/Contents/MacOS/deepseek-agent-runtime"
+test -x "$app/Contents/Resources/browser/chrome-headless-shell"
+test -f "$app/Contents/Resources/playwright-core/index.js"
 
 echo "Tauri release verification passed"
