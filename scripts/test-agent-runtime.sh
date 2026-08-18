@@ -87,7 +87,8 @@ provider.listen(0, "127.0.0.1", () => {
         assert.strictEqual(final.ok, true)
         assert.strictEqual(first.result.text, "第一轮 Provider 回复")
         assert.strictEqual(final.result.text, "第二轮 Provider 回复")
-        assert.deepStrictEqual(providerRequests[1].messages.map((message) => ({ role: message.role, content: message.content })), [
+        assert.strictEqual(providerRequests[1].messages[0].role, "system")
+        assert.deepStrictEqual(providerRequests[1].messages.slice(1).map((message) => ({ role: message.role, content: message.content })), [
           { role: "user", content: "第一轮问题" },
           { role: "assistant", content: "第一轮 Provider 回复" },
           { role: "user", content: "第二轮问题" }

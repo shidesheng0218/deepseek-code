@@ -124,4 +124,22 @@ describe('agent executor', () => {
     expect(calls).toContainEqual({ role: 'tool', toolCallId: 'patch-1', content: JSON.stringify({ changedFiles: ['README.md'] }) });
     expect(events).toEqual(['tool_started', 'tool_completed', 'assistant_text', 'completed']);
   });
+
+  test('adds stable agent instructions before conversation history', async () => {
+    let received: Array<{ role: string; content: string }> = [];
+    const executor = new AgentExecutor({
+      mode: 'auto',
+      instructions: '你是一个严谨的本地编码助手。',
+      model: { stream: async function* (messages) { received = messages.map((message) => ({ role: message.role, content: message.content })); yield { type: 'text_delta', text: '好的' } as const; } },
+      tools: {}
+    });
+
+    await executor.run('s1', '继续', [{ role: 'user', content: '之前的问题' }]);
+
+    expect(received).toEqual([
+      { role: 'system', content: '你是一个严谨的本地编码助手。' },
+      { role: 'user', content: '之前的问题' },
+      { role: 'user', content: '继续' }
+    ]);
+  });
 });

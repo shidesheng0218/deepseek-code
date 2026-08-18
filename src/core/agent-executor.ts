@@ -3,7 +3,7 @@ import type { AgentMode } from './permissions';
 import type { ModelEvent } from './providers/openai-compatible';
 
 export interface AgentMessage {
-  role: 'user' | 'assistant' | 'tool';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   toolCallId?: string;
 }
@@ -33,6 +33,7 @@ type ExecutorEvent = Extract<ModelEvent, { type: 'text_delta' }> | ToolCallEvent
 
 export interface AgentExecutorOptions {
   mode: AgentMode;
+  instructions?: string;
   model: { stream: (messages: AgentMessage[]) => AsyncIterable<ExecutorEvent> };
   tools: Record<string, (input: Record<string, unknown>) => Promise<unknown>>;
   maxTurns?: number;
@@ -67,13 +68,20 @@ export class AgentExecutor {
 
   async run(sessionId: string, prompt: string, history: AgentMessage[] = []): Promise<AgentRunResult> {
     const runtime = new AgentRuntime({ sessionId, mode: this.options.mode });
-    const messages: AgentMessage[] = [...history, { role: 'user', content: prompt }];
+    const messages: AgentMessage[] = [
+      ...(this.options.instructions ? [{ role: 'system' as const, content: this.options.instructions }] : []),
+      ...history,
+      { role: 'user', content: prompt }
+    ];
     return this.executeConversation(runtime, messages);
   }
 
   async resume(sessionId: string, history: AgentMessage[], approved: ApprovedToolCall): Promise<AgentRunResult> {
     const runtime = new AgentRuntime({ sessionId, mode: this.options.mode });
-    const messages = [...history];
+    const messages: AgentMessage[] = [
+      ...(this.options.instructions ? [{ role: 'system' as const, content: this.options.instructions }] : []),
+      ...history
+    ];
     const emit = (event: AgentExecutorEvent): void => this.options.onEvent?.(event);
     const tool = this.options.tools[approved.tool];
     if (!tool) throw new Error(`Tool not found: ${approved.tool}`);
