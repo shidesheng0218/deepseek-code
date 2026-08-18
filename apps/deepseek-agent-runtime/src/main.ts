@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { spawn } from "node:child_process"
+import { execFile as execFileCallback, spawn } from "node:child_process"
+import { promisify } from "node:util"
 import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
 import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/providers/openai-compatible"
 import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
@@ -13,6 +14,7 @@ import { loadLanguageServerConfigs } from "../../../src/core/lsp-config"
 import { LanguageServerClient } from "../../../src/core/lsp-client"
 import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
 import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from "../../../src/core/worker-runtime"
+import { getGitHubCIStatus } from "../../../src/core/github-ci"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 
@@ -49,6 +51,7 @@ type RuntimeEvent =
   | { type: "usage_recorded"; inputTokens?: number; outputTokens?: number }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
+  | { type: "ci_status"; commit: string; currentRunCount: number; staleRunCount: number }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -61,6 +64,7 @@ const toolSchemas = [
   { type: "function", function: { name: "web_search", description: "搜索公开网页资料，最多返回 8 条来源", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
   { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore 或 Review Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review"] } }, required: ["type"] } } }
+  , { type: "function", function: { name: "github_ci_status", description: "读取当前 Commit 对应的 GitHub Actions CI 状态", parameters: { type: "object", properties: {}, required: [] } } }
 ]
 type ToolSchema = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }
 type MCPBinding = { schemas: ToolSchema[]; handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> }
@@ -159,6 +163,7 @@ class JsonlEventStore {
 }
 
 const eventStore = new JsonlEventStore()
+const execFile = promisify(execFileCallback)
 const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
@@ -250,6 +255,13 @@ async function delegateWorker(sessionID: string, projectPath: string, input: Rec
   return result
 }
 
+async function githubCIStatus(sessionID: string, projectPath: string): Promise<unknown> {
+  const commit = (await execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 })).stdout.trim()
+  const result = await getGitHubCIStatus(projectPath, commit, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout)
+  await emitSessionEvent(sessionID, { type: "ci_status", commit, currentRunCount: result.currentCommit.length, staleRunCount: result.staleCount })
+  return { commit, ...result }
+}
+
 function respond(response: OutputFrame): void {
   process.stdout.write(`${JSON.stringify(response)}\n`)
 }
@@ -319,6 +331,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       web_search: webTools.web_search,
       web_fetch: webTools.web_fetch,
       delegate_worker: (input) => delegateWorker(sessionID, projectPath, input),
+      github_ci_status: () => githubCIStatus(sessionID, projectPath),
       ...mcp.handlers,
       ...lsp.handlers
     },
@@ -371,7 +384,7 @@ async function executeApproval(request: Request): Promise<{ text: string; status
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), ...mcp.handlers, ...lsp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), ...mcp.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
