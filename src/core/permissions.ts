@@ -11,6 +11,7 @@ export interface PermissionRequest {
 
 export function classifyToolRequest(request: { tool: string; command?: string }): { risk: RiskLevel } {
   if (request.tool.startsWith('mcp__')) return { risk: 'L2' };
+  if (request.tool === 'browser_evidence') return { risk: 'L2' };
   if (request.tool !== 'run_command') {
     if (request.tool === 'apply_patch') return { risk: 'L1' };
     if (request.tool === 'git_action') return { risk: 'L2' };

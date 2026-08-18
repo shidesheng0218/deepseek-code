@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises"
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { execFile as execFileCallback, spawn } from "node:child_process"
 import { promisify } from "node:util"
@@ -16,6 +16,8 @@ import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
 import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from "../../../src/core/worker-runtime"
 import { getGitHubCIStatus } from "../../../src/core/github-ci"
 import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
+import { collectBrowserEvidence } from "../../../src/core/browser-evidence"
+import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 
@@ -55,6 +57,7 @@ type RuntimeEvent =
   | { type: "ci_status"; commit: string; currentRunCount: number; staleRunCount: number }
   | { type: "verification_passed"; kind: string; command: string }
   | { type: "delivery_evaluated"; state: string; reasons: string[] }
+  | { type: "browser_evidence"; url: string; ok: boolean; screenshotPath?: string; consoleErrorCount: number; networkCount: number }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -68,6 +71,7 @@ const toolSchemas = [
   { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
   { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore 或 Review Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review"] } }, required: ["type"] } } }
   , { type: "function", function: { name: "github_ci_status", description: "读取当前 Commit 对应的 GitHub Actions CI 状态", parameters: { type: "object", properties: {}, required: [] } } }
+  , { type: "function", function: { name: "browser_evidence", description: "使用本机 Chrome/Chromium 验收页面、采集 DOM、console、network 和截图", parameters: { type: "object", properties: { url: { type: "string" }, expectedText: { type: "string" } }, required: ["url"] } } }
 ]
 type ToolSchema = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }
 type MCPBinding = { schemas: ToolSchema[]; handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> }
@@ -272,6 +276,18 @@ async function githubCIStatus(sessionID: string, projectPath: string): Promise<u
   return { commit, ...result }
 }
 
+async function browserEvidence(sessionID: string, input: Record<string, unknown>): Promise<unknown> {
+  const url = typeof input.url === "string" ? input.url : ""
+  const expectedText = typeof input.expectedText === "string" ? input.expectedText : undefined
+  if (!url) throw new Error("browser_evidence requires url")
+  const evidence = await collectBrowserEvidence({ url, ...(expectedText && { expectedText }) }, { launch: localChromiumLauncher })
+  const screenshotPath = evidence.screenshot.length ? join(sessionRoot(), "browser", `${sessionID}-${crypto.randomUUID()}.png`) : undefined
+  if (screenshotPath) { await mkdir(dirname(screenshotPath), { recursive: true }); await writeFile(screenshotPath, evidence.screenshot) }
+  await emitSessionEvent(sessionID, { type: "browser_evidence", url, ok: evidence.ok, ...(screenshotPath && { screenshotPath }), consoleErrorCount: evidence.console.filter((value) => value === "error").length, networkCount: evidence.network.length })
+  if (evidence.ok) await emitSessionEvent(sessionID, { type: "verification_passed", kind: "browser", command: url })
+  return { ...evidence, screenshot: undefined, screenshotPath }
+}
+
 function respond(response: OutputFrame): void {
   process.stdout.write(`${JSON.stringify(response)}\n`)
 }
@@ -344,6 +360,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       web_fetch: webTools.web_fetch,
       delegate_worker: (input) => delegateWorker(sessionID, projectPath, input),
       github_ci_status: () => githubCIStatus(sessionID, projectPath),
+      browser_evidence: (input) => browserEvidence(sessionID, input),
       ...mcp.handlers,
       ...lsp.handlers
     },
@@ -404,7 +421,7 @@ async function executeApproval(request: Request): Promise<{ text: string; status
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), ...mcp.handlers, ...lsp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
