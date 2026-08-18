@@ -184,7 +184,12 @@ export async function* parseAnthropicMessagesSse(chunks: Iterable<string> | Asyn
         cachedInputTokens = payload.message?.usage?.cache_read_input_tokens ?? 0;
       } else if (payload.type === 'content_block_start' && typeof payload.index === 'number' && payload.content_block?.type === 'tool_use') {
         const initialInput = payload.content_block.input;
-        tools.set(payload.index, { id: payload.content_block.id, name: payload.content_block.name, ...(initialInput && Object.keys(initialInput).length ? { initialInput: JSON.stringify(initialInput) } : {}), partialInput: '' });
+        tools.set(payload.index, {
+          ...(typeof payload.content_block.id === 'string' ? { id: payload.content_block.id } : {}),
+          ...(typeof payload.content_block.name === 'string' ? { name: payload.content_block.name } : {}),
+          ...(initialInput && Object.keys(initialInput).length ? { initialInput: JSON.stringify(initialInput) } : {}),
+          partialInput: ''
+        });
       } else if (payload.type === 'content_block_delta') {
         if (payload.delta?.type === 'text_delta' && payload.delta.text) yield { type: 'text_delta', text: payload.delta.text };
         if (typeof payload.index === 'number' && payload.delta?.type === 'input_json_delta') {

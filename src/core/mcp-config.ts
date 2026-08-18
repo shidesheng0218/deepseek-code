@@ -3,10 +3,13 @@ import { dirname, relative, resolve } from 'node:path';
 
 export interface MCPServerConfig {
   name: string;
-  command: string;
+  command?: string;
   args: string[];
   env?: Record<string, string>;
   cwd: string;
+  url?: string;
+  headers?: Record<string, string>;
+  transport?: 'streamable-http';
 }
 
 export async function loadMCPServerConfigs(workspacePath: string, projectRoot = workspacePath): Promise<MCPServerConfig[]> {
@@ -25,12 +28,18 @@ export async function loadMCPServerConfigs(workspacePath: string, projectRoot = 
       for (const [name, value] of Object.entries(raw.mcpServers ?? {})) {
         if (!value || typeof value !== 'object') continue;
         const server = value as Record<string, unknown>;
-        if (typeof server.command !== 'string' || !server.command.trim()) continue;
         const args = Array.isArray(server.args) ? server.args.filter((arg): arg is string => typeof arg === 'string') : [];
         let env: Record<string, string> | undefined;
         if (server.env && typeof server.env === 'object') {
           env = Object.fromEntries(Object.entries(server.env as Record<string, unknown>).filter(([, item]) => typeof item === 'string').map(([key, item]) => [key, item as string]));
         }
+        if (typeof server.url === 'string' && /^https?:\/\//.test(server.url)) {
+          const headers = server.headers && typeof server.headers === 'object' ? Object.fromEntries(Object.entries(server.headers as Record<string, unknown>).filter(([, item]) => typeof item === 'string').map(([key, item]) => [key, item as string])) : undefined;
+          const config: MCPServerConfig = { name, args, cwd: directory, url: server.url, transport: 'streamable-http', ...(headers && Object.keys(headers).length ? { headers } : {}) };
+          merged.set(name, config);
+          continue;
+        }
+        if (typeof server.command !== 'string' || !server.command.trim()) continue;
         const config: MCPServerConfig = { name, command: server.command, args, cwd: directory };
         if (env) config.env = env;
         merged.set(name, config);

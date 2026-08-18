@@ -60,7 +60,7 @@ describe('ToolExecutionPipeline', () => {
 
     const result = await pipeline.execute({ id: 'ssh-1', tool: 'remote_tool', arguments: {} });
 
-    expect(result.content).toContain('connection lost');
+    expect(result).toMatchObject({ state: 'completed', content: expect.stringContaining('connection lost') });
     expect(events).toEqual(['tool_requested', 'tool_started', 'tool_indeterminate']);
   });
 });

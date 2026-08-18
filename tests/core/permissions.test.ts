@@ -24,6 +24,11 @@ describe('permission policy', () => {
     expect(decidePermission({ mode: 'auto', risk: 'L2', mutates: true, tool: 'mcp__fixture__write_file' })).toBe('ask');
   });
 
+  test('allows read-only MCP resources and prompts without an approval interruption', () => {
+    expect(classifyToolRequest({ tool: 'mcp__docs__resource_read' }).risk).toBe('L0');
+    expect(decidePermission({ mode: 'auto', risk: 'L0', mutates: false, tool: 'mcp__docs__resource_read' })).toBe('allow');
+  });
+
   test('treats configured SSH execution as approval-required by default', () => {
     expect(classifyToolRequest({ tool: 'ssh_execute' }).risk).toBe('L2');
     expect(decidePermission({ mode: 'auto', risk: 'L2', mutates: true, tool: 'ssh_execute' })).toBe('ask');

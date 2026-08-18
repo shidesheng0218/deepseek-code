@@ -37,4 +37,16 @@ describe('delivery gate', () => {
       { type: 'verification_passed', payload: { kind: 'test' } }
     ]).state).toBe('delivered');
   });
+
+  test('does not mark CI repair delivered until the original PR update is acknowledged', () => {
+    expect(evaluateDeliveryGate([
+      { type: 'verification_passed', payload: { kind: 'github_ci' } },
+      { type: 'ci_repair_pr_update_ready', payload: { number: 7 } }
+    ]).state).toBe('needsAttention');
+    expect(evaluateDeliveryGate([
+      { type: 'verification_passed', payload: { kind: 'github_ci' } },
+      { type: 'ci_repair_pr_update_ready', payload: { number: 7 } },
+      { type: 'github_pr_updated', payload: { number: 7 } }
+    ]).state).toBe('delivered');
+  });
 });

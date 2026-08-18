@@ -1,5 +1,5 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
-import { dirname, join } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { execFile as execFileCallback, spawn } from "node:child_process"
 import { promisify } from "node:util"
 import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
@@ -12,13 +12,16 @@ import { loadProjectInstructions } from "../../../src/core/project-instructions"
 import { PersistentTerminal } from "../../../src/core/persistent-terminal"
 import { loadMCPServerConfigs } from "../../../src/core/mcp-config"
 import { MCPStdioClient } from "../../../src/core/mcp-stdio"
+import { MCPStreamableHTTPClient } from "../../../src/core/mcp-http"
 import { loadLanguageServerConfigs } from "../../../src/core/lsp-config"
 import { LanguageServerClient } from "../../../src/core/lsp-client"
 import { loadSSHProjectConfig } from "../../../src/core/ssh-config"
 import { createSystemSSHFingerprintProbe, createSystemSSHProcessRunner, SSHRemoteToolHost, type SSHRemoteToolInvocation } from "../../../src/core/ssh-tool-host"
+import { createSystemSSHInteractiveRunner, SSHRemotePersistentTerminal, type SSHRemoteTerminalEntry } from "../../../src/core/ssh-persistent-terminal"
 import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
 import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from "../../../src/core/worker-runtime"
 import { getGitHubCIStatus } from "../../../src/core/github-ci"
+import { buildCIRepairComment, findGitHubPullRequestForCommit, updateGitHubPullRequest } from "../../../src/core/github-pr"
 import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
 import { collectBrowserEvidence } from "../../../src/core/browser-evidence"
 import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
@@ -62,7 +65,7 @@ type RuntimeEventFrame = {
 type OutputFrame = Response | RuntimeEventFrame
 type RunRequest = { id: string; params: AgentRunParams; repair?: CIRepairSession }
 type RepairRuntimeConfig = Pick<AgentRunParams, "baseURL" | "apiKey" | "model" | "protocol" | "mode">
-type CIRepairLineage = Pick<CIRepairSession, "sessionID" | "parentSessionID" | "runID" | "commit" | "failureKind">
+type CIRepairLineage = Pick<CIRepairSession, "sessionID" | "parentSessionID" | "runID" | "commit" | "failureKind" | "pullRequest">
 type ExecuteResult = { text: string; status: string; messages: AgentMessage[]; delivery?: string; repairLineage?: CIRepairLineage }
 type RuntimeEvent =
   | AgentExecutorEvent
@@ -80,7 +83,12 @@ type RuntimeEvent =
   | { type: "ci_repair_session_started"; repairSessionID: string; runID: number; commit: string }
   | { type: "ci_repair_session_completed"; repairSessionID: string; runID: number; status: string; delivery?: string; summary: string }
   | { type: "ci_repair_session_failed"; repairSessionID: string; runID: number; error: string }
+  | { type: "ci_repair_pr_update_ready"; repairSessionID: string; number: number; body: string }
   | { type: "ssh_completed"; hostID: string; remoteTool: string; ok: boolean; indeterminate: boolean }
+  | { type: "ssh_terminal_opened"; hostID: string; terminalID: string; attached: boolean }
+  | { type: "ssh_terminal_completed"; hostID: string; terminalID?: unknown; sequence: number; state: string; exitCode: number }
+  | { type: "ssh_terminal_closed"; hostID: string }
+  | { type: "github_pr_updated"; number: number }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -92,16 +100,20 @@ const toolSchemas = [
   { type: "function", function: { name: "run_command", description: "在工作区目录运行命令", parameters: { type: "object", properties: { command: { type: "string" }, timeoutMs: { type: "number" } }, required: ["command"] } } },
   { type: "function", function: { name: "web_search", description: "搜索公开网页资料，最多返回 8 条来源", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
-  { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore、Review、Research 或 CI Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review", "research", "ci"] }, query: { type: "string" } }, required: ["type"] } } }
-  , { type: "function", function: { name: "github_ci_status", description: "读取当前 Commit 对应的 GitHub Actions CI 状态", parameters: { type: "object", properties: {}, required: [] } } }
-  , { type: "function", function: { name: "github_ci_failure_log", description: "读取 GitHub Actions 失败日志并分类根因", parameters: { type: "object", properties: { runID: { type: "number" } }, required: ["runID"] } } }
-  , { type: "function", function: { name: "browser_evidence", description: "使用本机 Chrome/Chromium 验收页面、采集 DOM、console、network 和截图", parameters: { type: "object", properties: { url: { type: "string" }, expectedText: { type: "string" } }, required: ["url"] } } }
+  { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore、Review、Research 或 CI Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review", "research", "ci"] }, query: { type: "string" } }, required: ["type"] } } },
+  { type: "function", function: { name: "github_ci_status", description: "读取当前 Commit 对应的 GitHub Actions CI 状态", parameters: { type: "object", properties: {}, required: [] } } },
+  { type: "function", function: { name: "github_ci_failure_log", description: "读取 GitHub Actions 失败日志并分类根因", parameters: { type: "object", properties: { runID: { type: "number" } }, required: ["runID"] } } },
+  { type: "function", function: { name: "github_pr_context", description: "读取当前 Commit 关联的 GitHub Pull Request 元数据", parameters: { type: "object", properties: {}, required: [] } } },
+  { type: "function", function: { name: "github_pr_comment", description: "向明确指定的原始 Pull Request 发布修复摘要；这是外部写入，始终需要审批", parameters: { type: "object", properties: { number: { type: "number" }, body: { type: "string" } }, required: ["number", "body"] } } },
+  { type: "function", function: { name: "browser_evidence", description: "使用本机 Chrome/Chromium 验收页面、采集 DOM、console、network 和截图", parameters: { type: "object", properties: { url: { type: "string" }, expectedText: { type: "string" } }, required: ["url"] } } }
 ]
 type ToolSchema = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }
 type MCPBinding = { schemas: ToolSchema[]; handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> }
 
 function toolTimeoutMs(name: string): number {
   if (name === "run_command") return 600_000
+  if (name === "ssh_terminal_exec") return 600_000
+  if (name === "ssh_terminal_open" || name === "ssh_terminal_attach" || name === "ssh_terminal_read" || name === "ssh_terminal_close") return 60_000
   if (name === "browser_evidence") return 45_000
   if (name === "web_fetch" || name === "web_search" || name === "github_ci_failure_log" || name === "github_ci_status") return 60_000
   if (name.startsWith("mcp__")) return 60_000
@@ -114,7 +126,7 @@ function pipelineDefinitions(schemas: ToolSchema[]): Record<string, ToolDefiniti
     const name = schema.function.name
     return [name, {
       name,
-      mutates: name === "apply_patch" || name === "run_command" || name === "ssh_execute",
+      mutates: name === "apply_patch" || name === "run_command" || name === "ssh_execute" || name === "ssh_terminal_open" || name === "ssh_terminal_exec" || name === "ssh_terminal_attach" || name === "ssh_terminal_close" || name === "github_pr_comment",
       timeoutMs: toolTimeoutMs(name),
       ...(required?.length ? { inputSchema: { required } } : {})
     }]
@@ -223,8 +235,10 @@ class JsonlEventStore {
       const runID = event.payload?.runID
       const commit = event.payload?.commit
       const failureKind = event.payload?.failureKind
+      const pullRequestValue = event.payload?.pullRequest
+      const pullRequest = pullRequestValue && typeof pullRequestValue === "object" && !Array.isArray(pullRequestValue) ? pullRequestValue as CIRepairSession["pullRequest"] : undefined
       if (typeof parentSessionID === "string" && typeof repairSessionID === "string" && typeof runID === "number" && typeof commit === "string" && typeof failureKind === "string") {
-        return { parentSessionID, sessionID: repairSessionID, runID, commit, failureKind }
+        return { parentSessionID, sessionID: repairSessionID, runID, commit, failureKind, ...(pullRequest ? { pullRequest } : {}) }
       }
     }
     return undefined
@@ -237,7 +251,9 @@ const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
 const activeControllers = new Map<string, AbortController>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
-const mcpClients = new Map<string, MCPStdioClient>()
+const sshTerminals = new Map<string, SSHRemotePersistentTerminal>()
+type MCPClient = MCPStdioClient | MCPStreamableHTTPClient
+const mcpClients = new Map<string, MCPClient>()
 const lspClients = new Map<string, LanguageServerClient>()
 const deferredCIRepairs = new CIRepairQueue<RepairRuntimeConfig>()
 
@@ -249,12 +265,43 @@ async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPB
     const key = `${projectPath}:${config.name}`
     let client = mcpClients.get(key)
     try {
-      if (!client) { client = new MCPStdioClient(config); mcpClients.set(key, client) }
+      if (!client) {
+        if (config.url) client = new MCPStreamableHTTPClient({ url: config.url, ...(config.headers ? { headers: config.headers } : {}) })
+        else if (config.command) client = new MCPStdioClient({ command: config.command, args: config.args, cwd: config.cwd, ...(config.env ? { env: config.env } : {}) })
+        else throw new Error(`MCP server ${config.name} has no supported transport`)
+        mcpClients.set(key, client)
+      }
       const discovered = await client.start()
       for (const tool of discovered) {
         const name = `mcp__${config.name}__${tool.name}`
         schemas.push({ type: "function", function: { name, description: tool.description ?? `MCP ${config.name} 工具 ${tool.name}`, parameters: tool.inputSchema } })
         handlers[name] = (input) => client!.callTool(tool.name, input)
+      }
+      const resourcePrefix = `mcp__${config.name}`
+      try {
+        const resources = await client.listResources()
+        schemas.push({ type: "function", function: { name: `${resourcePrefix}__resources_list`, description: `列出 MCP ${config.name} Resources`, parameters: { type: "object", properties: {}, required: [] } } })
+        schemas.push({ type: "function", function: { name: `${resourcePrefix}__resource_read`, description: `读取 MCP ${config.name} Resource`, parameters: { type: "object", properties: { uri: { type: "string" } }, required: ["uri"] } } })
+        handlers[`${resourcePrefix}__resources_list`] = async () => ({ resources })
+        handlers[`${resourcePrefix}__resource_read`] = async (input) => {
+          if (typeof input.uri !== "string" || !input.uri.trim()) throw new Error("MCP resource_read requires uri")
+          return client!.readResource(input.uri)
+        }
+      } catch (error) {
+        await eventStore.append(sessionID, "mcp_resources_unavailable", { server: config.name, error: redact(error instanceof Error ? error.message : String(error)) })
+      }
+      try {
+        const prompts = await client.listPrompts()
+        schemas.push({ type: "function", function: { name: `${resourcePrefix}__prompts_list`, description: `列出 MCP ${config.name} Prompts`, parameters: { type: "object", properties: {}, required: [] } } })
+        schemas.push({ type: "function", function: { name: `${resourcePrefix}__prompt_get`, description: `获取 MCP ${config.name} Prompt`, parameters: { type: "object", properties: { name: { type: "string" }, arguments: { type: "object" } }, required: ["name"] } } })
+        handlers[`${resourcePrefix}__prompts_list`] = async () => ({ prompts })
+        handlers[`${resourcePrefix}__prompt_get`] = async (input) => {
+          if (typeof input.name !== "string" || !input.name.trim()) throw new Error("MCP prompt_get requires name")
+          const argumentsValue = input.arguments && typeof input.arguments === "object" && !Array.isArray(input.arguments) ? input.arguments as Record<string, unknown> : {}
+          return client!.getPrompt(input.name, argumentsValue)
+        }
+      } catch (error) {
+        await eventStore.append(sessionID, "mcp_prompts_unavailable", { server: config.name, error: redact(error instanceof Error ? error.message : String(error)) })
       }
     } catch (error) {
       await eventStore.append(sessionID, "mcp_server_failed", { server: config.name, error: redact(error instanceof Error ? error.message : String(error)) })
@@ -274,6 +321,7 @@ async function sshBindings(sessionID: string, projectPath: string): Promise<MCPB
   const hosts = new Map(config.hosts.map((host) => [host.id, host]))
   const runner = createSystemSSHProcessRunner()
   const probe = createSystemSSHFingerprintProbe()
+  const interactiveRunner = createSystemSSHInteractiveRunner()
   const remoteTools = new Set<SSHRemoteToolInvocation["tool"]>(["read_file", "list_directory", "search_workspace", "inspect_git", "apply_patch", "run_command"])
   const handler = async (input: Record<string, unknown>): Promise<unknown> => {
     const hostID = typeof input.hostID === "string" ? input.hostID : ""
@@ -285,9 +333,58 @@ async function sshBindings(sessionID: string, projectPath: string): Promise<MCPB
     await emitSessionEvent(sessionID, { type: "ssh_completed", hostID, remoteTool, ok: result.ok, indeterminate: result.indeterminate })
     return result
   }
+  const hostIDs = config.hosts.map((host) => host.id)
+  const terminalFor = (hostID: string): SSHRemotePersistentTerminal => {
+    const host = hosts.get(hostID)
+    if (!host) throw new Error(`Unknown SSH host: ${hostID}`)
+    const key = `${sessionID}:${hostID}`
+    const existing = sshTerminals.get(key)
+    if (existing) return existing
+    const terminal = new SSHRemotePersistentTerminal(host, interactiveRunner, probe)
+    sshTerminals.set(key, terminal)
+    return terminal
+  }
+  const terminalInput = (input: Record<string, unknown>): { hostID: string; terminal: SSHRemotePersistentTerminal } => {
+    const hostID = typeof input.hostID === "string" ? input.hostID : ""
+    if (!hostID) throw new Error("SSH terminal requires hostID")
+    return { hostID, terminal: terminalFor(hostID) }
+  }
+  const terminalOpen = async (input: Record<string, unknown>): Promise<unknown> => {
+    const { hostID, terminal } = terminalInput(input)
+    const terminalID = typeof input.terminalID === "string" && input.terminalID ? input.terminalID : undefined
+    const id = await terminal.open(sessionID, terminalID)
+    await emitSessionEvent(sessionID, { type: "ssh_terminal_opened", hostID, terminalID: id, attached: Boolean(terminalID) })
+    return { ok: true, hostID, terminalID: id }
+  }
+  const terminalExec = async (input: Record<string, unknown>): Promise<unknown> => {
+    const { hostID, terminal } = terminalInput(input)
+    if (typeof input.terminalID === "string" && input.terminalID) await terminal.open(sessionID, input.terminalID)
+    const command = typeof input.command === "string" ? input.command : ""
+    const result = await terminal.exec(command, typeof input.timeoutMs === "number" ? input.timeoutMs : undefined)
+    await emitSessionEvent(sessionID, { type: "ssh_terminal_completed", hostID, terminalID: input.terminalID, sequence: result.sequence, state: result.state, exitCode: result.exitCode })
+    return { ok: result.state === "completed" && result.exitCode === 0, output: JSON.stringify(result), indeterminate: result.state === "indeterminate", ...result }
+  }
+  const terminalRead = async (input: Record<string, unknown>): Promise<unknown> => {
+    const { hostID, terminal } = terminalInput(input)
+    const entries = await terminal.read(typeof input.afterSequence === "number" ? input.afterSequence : 0)
+    return { ok: true, hostID, entries: entries as SSHRemoteTerminalEntry[] }
+  }
+  const terminalClose = async (input: Record<string, unknown>): Promise<unknown> => {
+    const { hostID, terminal } = terminalInput(input)
+    await terminal.close()
+    sshTerminals.delete(`${sessionID}:${hostID}`)
+    await emitSessionEvent(sessionID, { type: "ssh_terminal_closed", hostID })
+    return { ok: true, hostID }
+  }
   return {
-    schemas: [{ type: "function", function: { name: "ssh_execute", description: "通过已配置且 Host Key 指纹锁定的远程 Tool Host 执行结构化工具", parameters: { type: "object", properties: { hostID: { type: "string", enum: config.hosts.map((host) => host.id) }, tool: { type: "string", enum: [...remoteTools] }, arguments: { type: "object" } }, required: ["hostID", "tool", "arguments"] } } }],
-    handlers: { ssh_execute: handler }
+    schemas: [
+      { type: "function", function: { name: "ssh_execute", description: "通过已配置且 Host Key 指纹锁定的远程 Tool Host 执行结构化工具", parameters: { type: "object", properties: { hostID: { type: "string", enum: hostIDs }, tool: { type: "string", enum: [...remoteTools] }, arguments: { type: "object" } }, required: ["hostID", "tool", "arguments"] } } },
+      { type: "function", function: { name: "ssh_terminal_open", description: "打开或恢复一个持久化 SSH 终端", parameters: { type: "object", properties: { hostID: { type: "string", enum: hostIDs }, terminalID: { type: "string" } }, required: ["hostID"] } } },
+      { type: "function", function: { name: "ssh_terminal_exec", description: "在已打开的持久化 SSH 终端中执行命令；断线时返回 indeterminate，不自动重放", parameters: { type: "object", properties: { hostID: { type: "string", enum: hostIDs }, terminalID: { type: "string" }, command: { type: "string" }, timeoutMs: { type: "number" } }, required: ["hostID", "command"] } } },
+      { type: "function", function: { name: "ssh_terminal_read", description: "按 sequence 补读远程 SSH 终端 transcript", parameters: { type: "object", properties: { hostID: { type: "string", enum: hostIDs }, afterSequence: { type: "number" } }, required: ["hostID"] } } },
+      { type: "function", function: { name: "ssh_terminal_close", description: "关闭持久化 SSH 终端", parameters: { type: "object", properties: { hostID: { type: "string", enum: hostIDs } }, required: ["hostID"] } } }
+    ],
+    handlers: { ssh_execute: handler, ssh_terminal_open: terminalOpen, ssh_terminal_exec: terminalExec, ssh_terminal_read: terminalRead, ssh_terminal_close: terminalClose }
   }
 }
 
@@ -361,7 +458,24 @@ async function githubCIStatus(sessionID: string, projectPath: string): Promise<u
   const result = await getGitHubCIStatus(projectPath, commit, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout)
   await emitSessionEvent(sessionID, { type: "ci_status", commit, currentRunCount: result.currentCommit.length, staleRunCount: result.staleCount, passed: result.passed })
   if (result.passed) await emitSessionEvent(sessionID, { type: "verification_passed", kind: "github_ci", command: commit })
-  return { commit, ...result }
+  const pullRequest = await findGitHubPullRequestForCommit(commit, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout).catch(() => undefined)
+  return { commit, ...result, ...(pullRequest ? { pullRequest } : {}) }
+}
+
+async function githubPRContext(sessionID: string, projectPath: string): Promise<unknown> {
+  const commit = (await execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 })).stdout.trim()
+  const pullRequest = await findGitHubPullRequestForCommit(commit, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout)
+  if (!pullRequest) return { commit, pullRequest: null, message: "当前 Commit 没有找到关联 Pull Request" }
+  return { commit, pullRequest }
+}
+
+async function githubPRComment(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const number = typeof input.number === "number" && Number.isInteger(input.number) ? input.number : 0
+  const body = typeof input.body === "string" ? input.body : ""
+  if (number < 1 || !body.trim()) throw new Error("github_pr_comment requires number and body")
+  const result = await updateGitHubPullRequest(number, body, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout)
+  await emitSessionEvent(sessionID, { type: "github_pr_updated", number })
+  return result
 }
 
 async function githubCIFailureLog(sessionID: string, projectPath: string, input: Record<string, unknown>, repairConfig?: RepairRuntimeConfig, allowRepair = true): Promise<unknown> {
@@ -374,7 +488,8 @@ async function githubCIFailureLog(sessionID: string, projectPath: string, input:
   if (!allowRepair) return { runID, ...classification, log, repairState: "not_scheduled_from_repair_session" }
 
   const commit = (await execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 })).stdout.trim()
-  const repair = createCIRepairSession({ parentSessionID: sessionID, projectPath, commit, runID, failure: classification, log })
+  const pullRequest = await findGitHubPullRequestForCommit(commit, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout).catch(() => undefined)
+  const repair = createCIRepairSession({ parentSessionID: sessionID, projectPath, commit, runID, failure: classification, log, ...(pullRequest ? { pullRequest } : {}) })
   const alreadyRecorded = (await eventStore.loadEvents(sessionID)).some((event) => event.type === "ci_repair_session_created" && event.payload?.repairSessionID === repair.sessionID)
   if (!alreadyRecorded) {
     await emitSessionEvent(sessionID, { type: "ci_repair_session_created", repairSessionID: repair.sessionID, runID, commit, kind: classification.kind, summary: classification.summary })
@@ -386,7 +501,8 @@ async function githubCIFailureLog(sessionID: string, projectPath: string, input:
       runID: repair.runID,
       failureKind: repair.failureKind,
       failureSummary: repair.failureSummary,
-      logHash: repair.logHash
+      logHash: repair.logHash,
+      ...(repair.pullRequest ? { pullRequest: repair.pullRequest } : {})
     })
   }
   const scheduled = repairConfig ? deferredCIRepairs.schedule(repair, repairConfig) : false
@@ -412,6 +528,12 @@ async function completeCIRepair(repair: CIRepairLineage, result: ExecuteResult):
   const summary = redact(result.text).slice(0, 4_000)
   await eventStore.append(repair.sessionID, "repair_session_completed", { status: result.status, delivery: result.delivery, summary })
   await emitSessionEvent(repair.parentSessionID, { type: "ci_repair_session_completed", repairSessionID: repair.sessionID, runID: repair.runID, status: result.status, delivery: result.delivery, summary })
+  if (repair.pullRequest && result.status === "completed") {
+    const body = buildCIRepairComment({ runID: repair.runID, commit: repair.commit, summary: repair.failureKind, repairSessionID: repair.sessionID, result: summary })
+    await emitSessionEvent(repair.parentSessionID, { type: "ci_repair_pr_update_ready", repairSessionID: repair.sessionID, number: repair.pullRequest.number, body })
+  }
+  const delivery = evaluateDeliveryGate(await eventStore.loadEvents(repair.parentSessionID))
+  await emitSessionEvent(repair.parentSessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
 }
 
 async function failCIRepair(repair: CIRepairLineage, error: string): Promise<void> {
@@ -430,6 +552,90 @@ async function browserEvidence(sessionID: string, input: Record<string, unknown>
   await emitSessionEvent(sessionID, { type: "browser_evidence", url, ok: evidence.ok, ...(screenshotPath && { screenshotPath }), consoleErrorCount: evidence.console.filter((value) => value === "error").length, networkCount: evidence.network.length })
   if (evidence.ok) await emitSessionEvent(sessionID, { type: "verification_passed", kind: "browser", command: url })
   return { ...evidence, screenshot: undefined, screenshotPath }
+}
+
+type RemoteTerminalRequest = {
+  protocolVersion?: number
+  requestID?: string
+  type?: "terminal_open" | "terminal_attach" | "terminal_exec" | "terminal_read" | "terminal_close"
+  sessionID?: string
+  terminalID?: string
+  cwd?: string
+  command?: string
+  timeoutMs?: number
+  afterSequence?: number
+}
+
+async function runRemoteTerminalHelper(): Promise<void> {
+  const terminals = new Map<string, { sessionID: string; cwd: string; terminal: PersistentTerminal }>()
+  const root = process.env.DEEPSEEK_REMOTE_WORKSPACE_ROOT ? resolve(process.env.DEEPSEEK_REMOTE_WORKSPACE_ROOT) : undefined
+  let tail: Promise<void> = Promise.resolve()
+  const respondRemote = (request: RemoteTerminalRequest, payload: Record<string, unknown>): void => {
+    process.stdout.write(`${JSON.stringify({ protocolVersion: 1, requestID: request.requestID, ...payload })}\n`)
+  }
+  const safeCwd = (requested?: string): string => {
+    const candidate = resolve(requested && isAbsolute(requested) ? requested : root ?? process.cwd())
+    if (root) {
+      const escaped = relative(root, candidate)
+      if (escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped)) throw new Error("Remote terminal workspace is outside the configured root")
+    }
+    return candidate
+  }
+  const handle = async (request: RemoteTerminalRequest): Promise<void> => {
+    if (request.protocolVersion !== 1 || !request.requestID || !request.type) { respondRemote(request, { type: "error", error: "Invalid terminal request" }); return }
+    try {
+      if (request.type === "terminal_open") {
+        if (!request.sessionID) throw new Error("terminal_open requires sessionID")
+        const terminalID = `remote-${request.sessionID}`
+        const existing = terminals.get(terminalID)
+        if (existing) { respondRemote(request, { type: "terminal_opened", terminalID, sequence: existing.terminal.read(0).at(-1)?.sequence ?? 0 }); return }
+        const cwd = safeCwd(request.cwd)
+        const terminal = new PersistentTerminal({ cwd })
+        terminals.set(terminalID, { sessionID: request.sessionID, cwd, terminal })
+        respondRemote(request, { type: "terminal_opened", terminalID, sequence: 0 })
+        return
+      }
+      if (request.type === "terminal_attach") {
+        if (!request.terminalID || !terminals.has(request.terminalID)) throw new Error("Remote terminal is not available for attach")
+        const value = terminals.get(request.terminalID)!
+        respondRemote(request, { type: "terminal_attached", terminalID: request.terminalID, sequence: value.terminal.read(0).at(-1)?.sequence ?? 0 })
+        return
+      }
+      if (!request.terminalID) throw new Error(`${request.type} requires terminalID`)
+      const value = terminals.get(request.terminalID)
+      if (!value) throw new Error("Remote terminal is not available")
+      if (request.type === "terminal_exec") {
+        if (!request.command?.trim()) throw new Error("terminal_exec requires command")
+        const entry = await value.terminal.exec(request.command, typeof request.timeoutMs === "number" ? request.timeoutMs : 120_000)
+        respondRemote(request, { type: "terminal_completed", terminalID: request.terminalID, ...entry })
+      } else if (request.type === "terminal_read") {
+        const afterSequence = Number.isInteger(request.afterSequence) && request.afterSequence! >= 0 ? request.afterSequence! : 0
+        respondRemote(request, { type: "terminal_read_result", terminalID: request.terminalID, entries: value.terminal.read(afterSequence) })
+      } else if (request.type === "terminal_close") {
+        await value.terminal.close()
+        terminals.delete(request.terminalID)
+        respondRemote(request, { type: "terminal_closed", terminalID: request.terminalID })
+      }
+    } catch (error) {
+      respondRemote(request, { type: "error", error: redact(error instanceof Error ? error.message : String(error)) })
+    }
+  }
+  let buffer = ""
+  process.stdin.setEncoding("utf8")
+  process.stdin.on("data", (chunk: string) => {
+    buffer += chunk
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let request: RemoteTerminalRequest
+      try { request = JSON.parse(line) as RemoteTerminalRequest } catch { respondRemote({}, { type: "error", error: "Invalid JSON" }); continue }
+      tail = tail.then(() => handle(request)).catch(() => undefined)
+    }
+  })
+  await new Promise<void>((resolveDone) => process.stdin.once("end", () => resolveDone()))
+  await tail
+  await Promise.all([...terminals.values()].map((value) => value.terminal.close().catch(() => undefined)))
 }
 
 function respond(response: OutputFrame): void {
@@ -519,6 +725,8 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       github_ci_status: () => githubCIStatus(sessionID, projectPath),
       github_ci_failure_log: (input) => githubCIFailureLog(sessionID, projectPath, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !request.repair),
       browser_evidence: (input) => browserEvidence(sessionID, input),
+      github_pr_context: () => githubPRContext(sessionID, projectPath),
+      github_pr_comment: (input) => githubPRComment(sessionID, projectPath, input),
       ...mcp.handlers,
       ...ssh.handlers,
       ...lsp.handlers
@@ -583,7 +791,7 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
     toolDefinitions: pipelineDefinitions(schemas),
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), github_pr_context: () => githubPRContext(sessionID, params.projectPath!), github_pr_comment: (input) => githubPRComment(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
@@ -668,7 +876,9 @@ async function handle(request: Request): Promise<void> {
   enqueue(request)
 }
 
-if (process.argv[2] === "--worker-stdio") {
+if (process.argv[2] === "--terminal-stdio") {
+  void runRemoteTerminalHelper()
+} else if (process.argv[2] === "--worker-stdio") {
   let workerBuffer = ""
   process.stdin.setEncoding("utf8")
   process.stdin.on("data", (chunk: string) => {

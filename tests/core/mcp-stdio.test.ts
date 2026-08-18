@@ -46,4 +46,19 @@ describe('MCP stdio client', () => {
       await expect(client.callTool('hello', {})).resolves.toEqual({ content: [{ type: 'text', text: 'reconnected' }] });
     } finally { await client.close(); }
   });
+
+  test('reads MCP resources and resolves prompts through the same JSON-RPC session', async () => {
+    const server = `
+      let buffer = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => { buffer += chunk; const lines = buffer.split('\\n'); buffer = lines.pop() || ''; for (const line of lines) { if (!line.trim()) continue; const request = JSON.parse(line); const result = request.method === 'initialize' ? {} : request.method === 'tools/list' ? { tools: [] } : request.method === 'resources/list' ? { resources: [{ uri: 'fixture://readme', name: 'README' }] } : request.method === 'resources/read' ? { contents: [{ uri: request.params.uri, text: 'readme' }] } : request.method === 'prompts/list' ? { prompts: [{ name: 'summarize' }] } : request.method === 'prompts/get' ? { messages: [{ role: 'user', content: { type: 'text', text: 'summarize this' } }] } : {}; process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n'); } });
+    `;
+    const client = new MCPStdioClient({ command: process.execPath, args: ['-e', server] });
+    try {
+      await expect(client.listResources()).resolves.toEqual([{ uri: 'fixture://readme', name: 'README' }]);
+      await expect(client.readResource('fixture://readme')).resolves.toEqual({ contents: [{ uri: 'fixture://readme', text: 'readme' }] });
+      await expect(client.listPrompts()).resolves.toEqual([{ name: 'summarize' }]);
+      await expect(client.getPrompt('summarize', { text: 'x' })).resolves.toEqual({ messages: [{ role: 'user', content: { type: 'text', text: 'summarize this' } }] });
+    } finally { await client.close(); }
+  });
 });

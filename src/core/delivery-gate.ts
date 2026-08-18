@@ -6,6 +6,11 @@ export function evaluateDeliveryGate(events: DeliveryEvent[]): { state: Delivery
   const pending = events.filter((event) => event.type === 'approval_pending' && typeof event.payload?.approvalID === 'string' && !resolved.has(event.payload?.approvalID as string));
   if (pending.length) return { state: 'needsAttention', reasons: ['存在未解决审批。'] };
   if (events.some((event) => event.type === 'tool_indeterminate')) return { state: 'needsAttention', reasons: ['存在结果未知的副作用。'] };
+  const pendingPRUpdates = events.filter((event) => event.type === 'ci_repair_pr_update_ready' && typeof event.payload?.number === 'number').filter((event) => {
+    const number = event.payload?.number as number;
+    return !events.some((candidate) => candidate.type === 'github_pr_updated' && candidate.payload?.number === number);
+  });
+  if (pendingPRUpdates.length) return { state: 'needsAttention', reasons: ['CI 修复结果尚未回写原始 Pull Request。'] };
   const completedToolIDs = new Set(events.filter((event) => (event.type === 'tool_completed' || event.type === 'tool_failed') && typeof event.payload?.id === 'string').map((event) => event.payload?.id as string));
   const incompleteTool = events.find((event) => event.type === 'tool_started' && typeof event.payload?.id === 'string' && !completedToolIDs.has(event.payload?.id as string));
   if (incompleteTool) return { state: 'needsAttention', reasons: ['存在开始后未确认结果的工具调用。'] };

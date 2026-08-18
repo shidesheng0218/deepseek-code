@@ -24,4 +24,15 @@ describe('CI repair sessions', () => {
     expect(repair.prompt).toContain('TS2322');
     expect(createCIRepairSession(input).sessionID).toBe(repair.sessionID);
   });
+
+  test('inherits the original pull request without granting external write permission', () => {
+    const repair = createCIRepairSession({
+      parentSessionID: 'parent', projectPath: '/workspace/app', commit: 'abc123', runID: 9,
+      failure: { kind: 'test', summary: '测试失败。' }, log: 'failure',
+      pullRequest: { number: 7, title: 'Fix', headBranch: 'fix/login', baseBranch: 'main', headSHA: 'abc123', url: 'https://github.com/o/r/pull/7', body: '' }
+    });
+    expect(repair.pullRequest?.number).toBe(7);
+    expect(repair.prompt).toContain('原始 PR：#7');
+    expect(repair.prompt).toContain('经审批');
+  });
 });

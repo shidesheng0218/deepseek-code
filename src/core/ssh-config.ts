@@ -23,6 +23,7 @@ export async function loadSSHProjectConfig(projectPath: string): Promise<SSHProj
       port: Number(value.port ?? 0),
       fingerprint: String(value.fingerprint ?? ''),
       remotePath: String(value.remotePath ?? ''),
+      ...(typeof value.remoteWorkspace === 'string' ? { remoteWorkspace: value.remoteWorkspace } : {}),
       ...(typeof value.timeoutMs === 'number' ? { timeoutMs: value.timeoutMs } : {})
     };
     const validation = validateSSHHost(host);

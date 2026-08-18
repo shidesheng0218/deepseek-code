@@ -8,7 +8,7 @@ type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
 type SessionSummary = { sessionId: string; title: string; updatedAt: number }
 type RestoredMessage = { role: "user" | "assistant"; text: string }
-type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean }; result?: { text?: string; status?: string }; error?: string }
+type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string }; result?: { text?: string; status?: string }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
 type Approval = { id: string; tool: string; risk: string }
 
@@ -101,6 +101,13 @@ function App() {
       } else if (runtimeEvent.type === "ssh_completed") {
         const state = runtimeEvent.indeterminate ? "结果未知" : runtimeEvent.ok ? "已完成" : "失败"
         setMessages((current) => [...current, { role: runtimeEvent.indeterminate || !runtimeEvent.ok ? "system" : "tool", text: `SSH · ${runtimeEvent.hostID ?? "主机"} · ${runtimeEvent.remoteTool ?? "远程工具"}：${state}`, kind: runtimeEvent.indeterminate || !runtimeEvent.ok ? "error" : runtimeEvent.type }])
+      } else if (runtimeEvent.type === "ssh_terminal_opened") {
+        setMessages((current) => [...current, { role: "tool", text: `SSH 终端 · ${runtimeEvent.hostID ?? "主机"}${runtimeEvent.attached ? " · 已恢复" : " · 已连接"}`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "ssh_terminal_completed") {
+        const state = runtimeEvent.state === "indeterminate" ? "结果未知，不会自动重试" : `退出码 ${runtimeEvent.exitCode ?? "?"}`
+        setMessages((current) => [...current, { role: runtimeEvent.state === "indeterminate" ? "system" : "tool", text: `SSH 终端 #${runtimeEvent.sequence ?? ""}：${state}`, kind: runtimeEvent.state === "indeterminate" ? "error" : runtimeEvent.type }])
+      } else if (runtimeEvent.type === "ssh_terminal_closed") {
+        setMessages((current) => [...current, { role: "tool", text: `SSH 终端 · ${runtimeEvent.hostID ?? "主机"} · 已关闭`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "terminal_completed") {
         setMessages((current) => [...current, { role: "tool", text: `终端 #${runtimeEvent.sequence ?? ""}：${runtimeEvent.command ?? "命令"}（退出码 ${runtimeEvent.exitCode ?? "?"}）`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "worker_completed") {
@@ -115,6 +122,10 @@ function App() {
         setMessages((current) => [...current, { role: "tool", text: `CI 修复会话结束：${runtimeEvent.status ?? "completed"}${runtimeEvent.delivery ? ` · ${runtimeEvent.delivery}` : ""}${runtimeEvent.summary ? ` · ${runtimeEvent.summary}` : ""}`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "ci_repair_session_failed") {
         setMessages((current) => [...current, { role: "system", text: `CI 修复会话失败：${runtimeEvent.error ?? "未知错误"}`, kind: "error" }])
+      } else if (runtimeEvent.type === "ci_repair_pr_update_ready") {
+        setMessages((current) => [...current, { role: "system", text: `CI 修复已完成，等待确认回写原始 PR #${runtimeEvent.number ?? "?"}。`, kind: "approval" }])
+      } else if (runtimeEvent.type === "github_pr_updated") {
+        setMessages((current) => [...current, { role: "tool", text: `已回写原始 PR #${runtimeEvent.number ?? "?"}。`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "delivery_evaluated") {
         const label: Record<string, string> = { delivered: "已交付", handoffReady: "待交接", needsRepair: "需要修复", needsAttention: "需要关注" }
         setMessages((current) => [...current, { role: "tool", text: `交付门禁：${label[runtimeEvent.state ?? ""] ?? runtimeEvent.state}${runtimeEvent.reasons?.length ? ` · ${runtimeEvent.reasons.join(" ")}` : ""}`, kind: runtimeEvent.type }])

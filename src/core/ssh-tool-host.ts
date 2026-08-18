@@ -7,6 +7,7 @@ export interface SSHHostConfig {
   port: number;
   fingerprint: string;
   remotePath: string;
+  remoteWorkspace?: string;
   timeoutMs?: number;
 }
 
@@ -47,6 +48,7 @@ export function validateSSHHost(host: SSHHostConfig): { ok: true } | { ok: false
   if (!Number.isInteger(host.port) || host.port < 1 || host.port > 65_535) return { ok: false, error: 'Invalid SSH port' };
   if (!/^SHA256:[A-Za-z0-9+/=_-]+$/.test(host.fingerprint.trim())) return { ok: false, error: 'SSH Host Key fingerprint is required' };
   if (!host.remotePath || host.remotePath.includes('\0') || !host.remotePath.startsWith('/')) return { ok: false, error: 'Invalid remote Tool Host path' };
+  if (host.remoteWorkspace !== undefined && (!host.remoteWorkspace || host.remoteWorkspace.includes('\0') || !host.remoteWorkspace.startsWith('/'))) return { ok: false, error: 'Invalid remote workspace path' };
   return { ok: true };
 }
 
@@ -56,6 +58,10 @@ export function fingerprintMatches(expected: string, observed: string): boolean 
 
 export function buildSSHArguments(host: SSHHostConfig): string[] {
   return ['-p', String(host.port), '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', `${host.user}@${host.hostname}`, host.remotePath];
+}
+
+export function buildSSHPersistentTerminalArguments(host: SSHHostConfig): string[] {
+  return ['-T', '-p', String(host.port), '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', `${host.user}@${host.hostname}`, host.remotePath, '--terminal-stdio'];
 }
 
 function systemCommandRunner(): SSHCommandRunner {
