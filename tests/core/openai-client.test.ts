@@ -49,4 +49,15 @@ describe('OpenAI-compatible HTTP client', () => {
 
     expect((receivedBody?.messages as Array<Record<string, unknown>>)[0]).toMatchObject({ role: 'tool', tool_call_id: 'call_123' });
   });
+
+  test('passes the configured abort signal into the model request', async () => {
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | null | undefined;
+    const client = new OpenAICompatibleClient({
+      baseUrl: 'https://api.example.test/v1/', apiKey: 'secret-key', signal: controller.signal,
+      fetchImpl: async (_url, init) => { receivedSignal = init?.signal; return new Response('data: [DONE]\n\n', { status: 200 }); }
+    });
+    for await (const _event of client.stream({ model: 'deepseek-chat', messages: [], feature: 'main_agent', tools: [] })) { void _event; }
+    expect(receivedSignal).toBe(controller.signal);
+  });
 });

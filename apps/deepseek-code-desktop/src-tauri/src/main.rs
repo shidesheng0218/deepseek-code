@@ -46,6 +46,10 @@ struct ApprovalRequest {
     decision: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelRequest { session_id: String }
+
 struct RuntimeProcess(Arc<Mutex<Option<CommandChild>>>);
 
 fn settings_path() -> PathBuf {
@@ -148,6 +152,14 @@ fn resolve_approval(app: AppHandle, state: State<'_, RuntimeProcess>, request: A
     send_runtime_request(&app, &state, payload)
 }
 
+#[tauri::command]
+fn cancel_session(state: State<'_, RuntimeProcess>, request: CancelRequest) -> Result<(), String> {
+    if request.session_id.trim().is_empty() { return Err("sessionId 不能为空".into()); }
+    let payload = serde_json::json!({ "id": format!("{}-{}", request.session_id, uuid_like()), "method": "session.cancel", "params": { "sessionID": request.session_id } });
+    let mut process = state.0.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+    process.as_mut().ok_or_else(|| "runtime 未启动".to_string())?.write(format!("{}\n", payload).as_bytes()).map_err(|error| error.to_string())
+}
+
 fn send_runtime_request(app: &AppHandle, state: &RuntimeProcess, payload: serde_json::Value) -> Result<(), String> {
     ensure_runtime(app, state)?;
     let mut process = state.0.lock().map_err(|_| "runtime lock poisoned".to_string())?;
@@ -160,7 +172,7 @@ fn main() {
     tauri::Builder::default()
         .manage(RuntimeProcess(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![runtime_status, load_settings, save_settings, run_agent, resolve_approval])
+        .invoke_handler(tauri::generate_handler![runtime_status, load_settings, save_settings, run_agent, resolve_approval, cancel_session])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
 }

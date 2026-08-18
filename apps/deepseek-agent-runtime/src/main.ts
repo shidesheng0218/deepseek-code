@@ -21,7 +21,7 @@ import type { AgentMode } from "../../../src/core/permissions"
 
 type Request = {
   id: string
-  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval"
+  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel"
   params?: {
     sessionID?: string
     projectPath?: string
@@ -174,6 +174,7 @@ const eventStore = new JsonlEventStore()
 const execFile = promisify(execFileCallback)
 const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
+const activeControllers = new Map<string, AbortController>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
 const mcpClients = new Map<string, MCPStdioClient>()
 const lspClients = new Map<string, LanguageServerClient>()
@@ -317,7 +318,9 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
   const projectPath = params.projectPath
   const prompt = params.prompt.trim()
   if (!params.baseURL || !params.apiKey || !params.model || !projectPath || !prompt) throw new Error("session.run requires projectPath, prompt, baseURL, apiKey and model")
-  const client = new OpenAICompatibleClient({ baseUrl: params.baseURL, apiKey: params.apiKey })
+  const controller = new AbortController()
+  activeControllers.set(sessionID, controller)
+  const client = new OpenAICompatibleClient({ baseUrl: params.baseURL, apiKey: params.apiKey, signal: controller.signal })
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const mcp = await mcpBindings(sessionID, projectPath)
@@ -366,9 +369,15 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
     await emitSessionEvent(sessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
     return { text: redact(result.text), status: result.status, messages: result.messages, delivery: delivery.state }
   } catch (error) {
+    if (controller.signal.aborted) {
+      await emitSessionEvent(sessionID, { type: "turn_ended", reason: "cancelled", status: "cancelled" })
+      return { text: "已取消当前任务。", status: "cancelled", messages: await eventStore.loadConversation(sessionID) }
+    }
     const message = redact(error instanceof Error ? error.message : String(error))
     await emitSessionEvent(sessionID, { type: "turn_ended", reason: "error", error: message })
     throw new Error(message)
+  } finally {
+    if (activeControllers.get(sessionID) === controller) activeControllers.delete(sessionID)
   }
 }
 
@@ -449,6 +458,13 @@ async function handle(request: Request): Promise<void> {
   if (request.method === "session.resolveApproval") {
     try { respond({ id: request.id, type: "response", ok: true, result: await executeApproval(request) }) }
     catch (error) { respond({ id: request.id, type: "response", ok: false, error: redact(error instanceof Error ? error.message : String(error)) }) }
+    return
+  }
+  if (request.method === "session.cancel") {
+    const sessionID = request.params?.sessionID?.trim()
+    const controller = sessionID ? activeControllers.get(sessionID) : undefined
+    if (!controller) respond({ id: request.id, type: "response", ok: false, error: "No cancellable operation is active for this session" })
+    else { controller.abort(); respond({ id: request.id, type: "response", ok: true, result: { sessionID, cancelling: true } }) }
     return
   }
   // A run request receives exactly one terminal response after the turn;

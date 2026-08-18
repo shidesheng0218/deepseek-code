@@ -36,6 +36,7 @@ export interface OpenAICompatibleClientOptions {
   baseUrl: string;
   apiKey: string;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 }
 
 const OUTPUT_CAPS: Record<ChatRequestInput['feature'], number> = {
@@ -80,7 +81,8 @@ export class OpenAICompatibleClient {
         'Content-Type': 'application/json',
         Accept: 'text/event-stream'
       },
-      body: JSON.stringify(buildChatRequest(input))
+      body: JSON.stringify(buildChatRequest(input)),
+      ...(this.options.signal ? { signal: this.options.signal } : {})
     });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 500);

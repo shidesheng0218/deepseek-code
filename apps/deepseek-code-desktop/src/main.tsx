@@ -106,6 +106,11 @@ function App() {
     }
   }
 
+  async function cancel() {
+    try { await invoke("cancel_session", { request: { sessionId: sessionID } }) }
+    catch (error) { setMessages((current) => [...current, { role: "system", text: String(error), kind: "error" }]) }
+  }
+
   return <main className="shell">
     <aside className="sidebar">
       <div className="brand"><span>◆</span><strong>DeepSeek Code</strong></div>
@@ -122,7 +127,7 @@ function App() {
         {approval && <section className="approval"><strong>需要确认</strong><span>{approval.tool}（{approval.risk}）将执行受控操作。</span><div><button type="button" onClick={() => void resolveApproval("deny")}>取消</button><button className="allow" type="button" onClick={() => void resolveApproval("allow")}>允许一次</button></div></section>}
         {busy && <div className="typing"><i /><i /><i /> 正在工作</div>}
       </section>
-      <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行，事件会实时显示" : "回车发送 · Shift+Enter 换行"}</span><button type="button" disabled={!canRun} onClick={() => void submit()}>{busy ? "执行中…" : "开始任务"}</button></footer></section>
+      <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行，事件会实时显示" : "回车发送 · Shift+Enter 换行"}</span>{busy ? <button type="button" onClick={() => void cancel()}>停止</button> : <button type="button" disabled={!canRun} onClick={() => void submit()}>开始任务</button>}</footer></section>
       {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>模型<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
     </section>
   </main>
