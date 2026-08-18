@@ -11,4 +11,8 @@ describe('delivery gate', () => {
     expect(evaluateDeliveryGate([{ type: 'terminal_completed', payload: { exitCode: 0 } }]).state).toBe('handoffReady');
     expect(evaluateDeliveryGate([{ type: 'verification_passed', payload: { kind: 'test' } }]).state).toBe('delivered');
   });
+
+  test('rejects failed tool completions emitted by the executor', () => {
+    expect(evaluateDeliveryGate([{ type: 'tool_completed', payload: { ok: false, error: 'fixture failure' } }]).state).toBe('needsRepair');
+  });
 });
