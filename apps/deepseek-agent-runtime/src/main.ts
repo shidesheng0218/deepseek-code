@@ -14,6 +14,8 @@ import { loadMCPServerConfigs } from "../../../src/core/mcp-config"
 import { MCPStdioClient } from "../../../src/core/mcp-stdio"
 import { loadLanguageServerConfigs } from "../../../src/core/lsp-config"
 import { LanguageServerClient } from "../../../src/core/lsp-client"
+import { loadSSHProjectConfig } from "../../../src/core/ssh-config"
+import { createSystemSSHFingerprintProbe, createSystemSSHProcessRunner, SSHRemoteToolHost, type SSHRemoteToolInvocation } from "../../../src/core/ssh-tool-host"
 import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
 import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from "../../../src/core/worker-runtime"
 import { getGitHubCIStatus } from "../../../src/core/github-ci"
@@ -78,6 +80,7 @@ type RuntimeEvent =
   | { type: "ci_repair_session_started"; repairSessionID: string; runID: number; commit: string }
   | { type: "ci_repair_session_completed"; repairSessionID: string; runID: number; status: string; delivery?: string; summary: string }
   | { type: "ci_repair_session_failed"; repairSessionID: string; runID: number; error: string }
+  | { type: "ssh_completed"; hostID: string; remoteTool: string; ok: boolean; indeterminate: boolean }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -111,7 +114,7 @@ function pipelineDefinitions(schemas: ToolSchema[]): Record<string, ToolDefiniti
     const name = schema.function.name
     return [name, {
       name,
-      mutates: name === "apply_patch" || name === "run_command",
+      mutates: name === "apply_patch" || name === "run_command" || name === "ssh_execute",
       timeoutMs: toolTimeoutMs(name),
       ...(required?.length ? { inputSchema: { required } } : {})
     }]
@@ -258,6 +261,34 @@ async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPB
     }
   }
   return { schemas, handlers }
+}
+
+async function sshBindings(sessionID: string, projectPath: string): Promise<MCPBinding> {
+  let config: Awaited<ReturnType<typeof loadSSHProjectConfig>>
+  try { config = await loadSSHProjectConfig(projectPath) }
+  catch (error) {
+    await eventStore.append(sessionID, "ssh_config_failed", { error: redact(error instanceof Error ? error.message : String(error)) })
+    return { schemas: [], handlers: {} }
+  }
+  if (!config.hosts.length) return { schemas: [], handlers: {} }
+  const hosts = new Map(config.hosts.map((host) => [host.id, host]))
+  const runner = createSystemSSHProcessRunner()
+  const probe = createSystemSSHFingerprintProbe()
+  const remoteTools = new Set<SSHRemoteToolInvocation["tool"]>(["read_file", "list_directory", "search_workspace", "inspect_git", "apply_patch", "run_command"])
+  const handler = async (input: Record<string, unknown>): Promise<unknown> => {
+    const hostID = typeof input.hostID === "string" ? input.hostID : ""
+    const remoteTool = typeof input.tool === "string" ? input.tool : ""
+    const argumentsValue = input.arguments && typeof input.arguments === "object" && !Array.isArray(input.arguments) ? input.arguments as Record<string, unknown> : undefined
+    const host = hosts.get(hostID)
+    if (!host || !remoteTools.has(remoteTool as SSHRemoteToolInvocation["tool"]) || !argumentsValue) throw new Error("ssh_execute requires a configured hostID, supported tool and object arguments")
+    const result = await new SSHRemoteToolHost(host, runner, probe).execute({ id: crypto.randomUUID(), sessionID, tool: remoteTool as SSHRemoteToolInvocation["tool"], arguments: argumentsValue })
+    await emitSessionEvent(sessionID, { type: "ssh_completed", hostID, remoteTool, ok: result.ok, indeterminate: result.indeterminate })
+    return result
+  }
+  return {
+    schemas: [{ type: "function", function: { name: "ssh_execute", description: "通过已配置且 Host Key 指纹锁定的远程 Tool Host 执行结构化工具", parameters: { type: "object", properties: { hostID: { type: "string", enum: config.hosts.map((host) => host.id) }, tool: { type: "string", enum: [...remoteTools] }, arguments: { type: "object" } }, required: ["hostID", "tool", "arguments"] } } }],
+    handlers: { ssh_execute: handler }
+  }
 }
 
 async function lspBindings(sessionID: string, projectPath: string): Promise<MCPBinding> {
@@ -464,8 +495,9 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const mcp = await mcpBindings(sessionID, projectPath)
+  const ssh = await sshBindings(sessionID, projectPath)
   const lsp = await lspBindings(sessionID, projectPath)
-  const schemas = [...toolSchemas, ...mcp.schemas, ...lsp.schemas]
+  const schemas = [...toolSchemas, ...mcp.schemas, ...ssh.schemas, ...lsp.schemas]
   const history = await eventStore.loadConversation(sessionID)
   const instructions = await instructionsFor(projectPath)
   await emitSessionEvent(sessionID, { type: "turn_started", prompt })
@@ -488,6 +520,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       github_ci_failure_log: (input) => githubCIFailureLog(sessionID, projectPath, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !request.repair),
       browser_evidence: (input) => browserEvidence(sessionID, input),
       ...mcp.handlers,
+      ...ssh.handlers,
       ...lsp.handlers
     },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
@@ -540,8 +573,9 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
   const tools = createWorkspaceAgentTools({ root: params.projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const mcp = await mcpBindings(sessionID, params.projectPath)
+  const ssh = await sshBindings(sessionID, params.projectPath)
   const lsp = await lspBindings(sessionID, params.projectPath)
-  const schemas = [...toolSchemas, ...mcp.schemas, ...lsp.schemas]
+  const schemas = [...toolSchemas, ...mcp.schemas, ...ssh.schemas, ...lsp.schemas]
   const instructions = await instructionsFor(params.projectPath)
   const repairLineage = await eventStore.loadRepairLineage(sessionID)
   const executor = new AgentExecutor({
@@ -549,7 +583,7 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
     toolDefinitions: pipelineDefinitions(schemas),
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...lsp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)

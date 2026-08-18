@@ -48,4 +48,19 @@ describe('ToolExecutionPipeline', () => {
     expect(result).toMatchObject({ state: 'completed', content: expect.stringContaining('TOOL_INDETERMINATE') });
     expect(events).toEqual(['tool_requested', 'tool_started', 'tool_indeterminate']);
   });
+
+  test('preserves structured indeterminate results returned by a remote host', async () => {
+    const events: string[] = [];
+    const pipeline = new ToolExecutionPipeline({
+      runtime: new AgentRuntime({ sessionId: 's1', mode: 'auto' }),
+      tools: { remote_tool: async () => ({ ok: false, output: 'connection lost', indeterminate: true }) },
+      definitions: { remote_tool: { name: 'remote_tool', mutates: false } },
+      onEvent: (event) => events.push(event.type)
+    });
+
+    const result = await pipeline.execute({ id: 'ssh-1', tool: 'remote_tool', arguments: {} });
+
+    expect(result.content).toContain('connection lost');
+    expect(events).toEqual(['tool_requested', 'tool_started', 'tool_indeterminate']);
+  });
 });

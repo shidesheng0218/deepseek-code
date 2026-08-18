@@ -111,7 +111,18 @@ export class ToolExecutionPipeline {
     }
     this.emit({ type: 'tool_started', id: invocation.id, tool: invocation.tool });
     try {
-      const output = serialize(await withTimeout(host(invocation.arguments), definition?.timeoutMs ?? 120_000));
+      const rawResult = await withTimeout(host(invocation.arguments), definition?.timeoutMs ?? 120_000);
+      const output = serialize(rawResult);
+      if (rawResult && typeof rawResult === 'object' && 'indeterminate' in rawResult && rawResult.indeterminate === true) {
+        const error = 'output' in rawResult && typeof rawResult.output === 'string' ? rawResult.output : 'Tool result is indeterminate';
+        this.emit({ type: 'tool_indeterminate', id: invocation.id, tool: invocation.tool, error });
+        return { state: 'completed', content: output };
+      }
+      if (rawResult && typeof rawResult === 'object' && 'ok' in rawResult && rawResult.ok === false) {
+        const error = 'error' in rawResult && typeof rawResult.error === 'string' ? rawResult.error : 'Tool returned a failure';
+        this.emit({ type: 'tool_completed', id: invocation.id, tool: invocation.tool, ok: false, error, output });
+        return { state: 'completed', content: output };
+      }
       this.emit({ type: 'tool_completed', id: invocation.id, tool: invocation.tool, ok: true, output });
       return { state: 'completed', content: output };
     } catch (error) {
