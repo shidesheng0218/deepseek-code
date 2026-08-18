@@ -1,6 +1,6 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { AgentExecutor, type AgentExecutorEvent, type AgentMessage } from "../../../src/core/agent-executor"
+import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
 import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/providers/openai-compatible"
 import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
 import { createWebTools } from "../../../src/core/tools/web"
@@ -8,7 +8,7 @@ import type { AgentMode } from "../../../src/core/permissions"
 
 type Request = {
   id: string
-  method: "health" | "session.enqueue" | "session.run"
+  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval"
   params?: {
     sessionID?: string
     projectPath?: string
@@ -17,6 +17,8 @@ type Request = {
     apiKey?: string
     model?: string
     mode?: AgentMode
+    approvalID?: string
+    decision?: "allow" | "deny"
   }
 }
 
@@ -35,6 +37,7 @@ type RuntimeEvent =
   | { type: "turn_started"; prompt: string }
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
   | { type: "usage_recorded"; inputTokens?: number; outputTokens?: number }
+type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
   { type: "function", function: { name: "list_directory", description: "列出工作区目录", parameters: { type: "object", properties: { path: { type: "string" } }, required: [] } } },
@@ -108,6 +111,27 @@ class JsonlEventStore {
     }
     return messages.slice(-24)
   }
+
+  async loadPendingApproval(sessionID: string, approvalID: string): Promise<PendingApproval | undefined> {
+    const file = join(sessionRoot(), `${sessionID}.jsonl`)
+    try {
+      const entries = (await readFile(file, "utf8")).split("\n").filter(Boolean).flatMap((line) => {
+        try { return [JSON.parse(line) as { type?: string; payload?: Record<string, unknown> }] } catch { return [] }
+      })
+      for (const entry of entries.reverse()) {
+        if (entry.payload?.approvalID !== approvalID) continue
+        if (entry.type === "approval_resolved") return undefined
+        if (entry.type !== "approval_pending") continue
+        const tool = entry.payload.tool
+        const argumentsValue = entry.payload.arguments
+        const risk = entry.payload.risk
+        if (typeof tool === "string" && argumentsValue && typeof argumentsValue === "object" && typeof risk === "string") {
+          return { approvalID, id: approvalID, tool, arguments: argumentsValue as Record<string, unknown>, risk }
+        }
+      }
+    } catch { /* A missing event log means there is no recoverable approval. */ }
+    return undefined
+  }
 }
 
 const eventStore = new JsonlEventStore()
@@ -128,8 +152,15 @@ async function emitAgentEvent(sessionID: string, event: AgentExecutorEvent): Pro
   await emitSessionEvent(sessionID, event)
 }
 
-function redactPayload(event: AgentExecutorEvent): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(event).map(([key, value]) => [key, typeof value === "string" ? redact(value) : value]))
+function redactUnknown(value: unknown): unknown {
+  if (typeof value === "string") return redact(value)
+  if (Array.isArray(value)) return value.map(redactUnknown)
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => [key, redactUnknown(child)]))
+  return value
+}
+
+function redactPayload(event: AgentExecutorEvent | RuntimeEvent): Record<string, unknown> {
+  return redactUnknown(event) as Record<string, unknown>
 }
 
 function streamModel(sessionID: string, client: OpenAICompatibleClient, model: string, messages: AgentMessage[]): AsyncIterable<Extract<ModelEvent, { type: "text_delta" | "tool_call" }>> {
@@ -176,6 +207,14 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
   try {
     const result = await executor.run(sessionID, prompt, history)
     await eventStore.flush(sessionID)
+    if (result.pendingApproval) {
+      await eventStore.append(sessionID, "approval_pending", redactUnknown({
+        approvalID: result.pendingApproval.id,
+        tool: result.pendingApproval.tool,
+        arguments: result.pendingApproval.arguments,
+        risk: result.pendingApproval.risk
+      }) as Record<string, unknown>)
+    }
     await emitSessionEvent(sessionID, {
       type: "turn_ended",
       reason: result.status === "waiting_approval" ? "awaiting_approval" : "completed",
@@ -187,6 +226,33 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
     await emitSessionEvent(sessionID, { type: "turn_ended", reason: "error", error: message })
     throw new Error(message)
   }
+}
+
+async function executeApproval(request: Request): Promise<{ text: string; status: string; messages: AgentMessage[] }> {
+  const params = request.params
+  const sessionID = params?.sessionID?.trim()
+  const approvalID = params?.approvalID?.trim()
+  if (!sessionID || !approvalID || !params?.decision || !params.projectPath || !params.baseURL || !params.apiKey || !params.model) throw new Error("session.resolveApproval requires sessionID, approvalID, decision, projectPath, baseURL, apiKey and model")
+  const pending = await eventStore.loadPendingApproval(sessionID, approvalID)
+  if (!pending) throw new Error("Approval continuation was not found or has already been resolved")
+  await eventStore.append(sessionID, "approval_resolved", { approvalID, decision: params.decision })
+  if (params.decision === "deny") {
+    await emitSessionEvent(sessionID, { type: "turn_ended", reason: "approval_denied", status: "cancelled" })
+    return { text: "已取消该操作。", status: "cancelled", messages: await eventStore.loadConversation(sessionID) }
+  }
+  const client = new OpenAICompatibleClient({ baseUrl: params.baseURL, apiKey: params.apiKey })
+  const tools = createWorkspaceAgentTools({ root: params.projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
+  const webTools = createWebTools()
+  const executor = new AgentExecutor({
+    mode: params.mode ?? "accept_edits",
+    model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages) },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: tools.run_command, web_search: webTools.web_search, web_fetch: webTools.web_fetch },
+    onEvent: (event) => { void emitAgentEvent(sessionID, event) }
+  })
+  const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
+  await eventStore.flush(sessionID)
+  await emitSessionEvent(sessionID, { type: "turn_ended", reason: "completed", status: result.status })
+  return { text: redact(result.text), status: result.status, messages: result.messages }
 }
 
 async function drain(sessionID: string): Promise<void> {
@@ -227,6 +293,11 @@ async function handle(request: Request): Promise<void> {
   }
   if (request.method === "session.enqueue") {
     respond(enqueue(request))
+    return
+  }
+  if (request.method === "session.resolveApproval") {
+    try { respond({ id: request.id, type: "response", ok: true, result: await executeApproval(request) }) }
+    catch (error) { respond({ id: request.id, type: "response", ok: false, error: redact(error instanceof Error ? error.message : String(error)) }) }
     return
   }
   // A run request receives exactly one terminal response after the turn;

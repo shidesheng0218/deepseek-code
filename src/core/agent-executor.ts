@@ -8,6 +8,20 @@ export interface AgentMessage {
   toolCallId?: string;
 }
 
+export interface ApprovedToolCall {
+  id: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface AgentRunResult {
+  text: string;
+  runtime: AgentRuntime;
+  messages: AgentMessage[];
+  status: AgentRuntime['state']['status'];
+  pendingApproval?: ApprovedToolCall & { risk: string };
+}
+
 interface ToolCallEvent {
   type: 'tool_call';
   id: string;
@@ -51,9 +65,33 @@ export class AgentExecutor {
     this.maxTurns = options.maxTurns ?? 8;
   }
 
-  async run(sessionId: string, prompt: string, history: AgentMessage[] = []): Promise<{ text: string; runtime: AgentRuntime; messages: AgentMessage[]; status: AgentRuntime['state']['status'] }> {
+  async run(sessionId: string, prompt: string, history: AgentMessage[] = []): Promise<AgentRunResult> {
     const runtime = new AgentRuntime({ sessionId, mode: this.options.mode });
     const messages: AgentMessage[] = [...history, { role: 'user', content: prompt }];
+    return this.executeConversation(runtime, messages);
+  }
+
+  async resume(sessionId: string, history: AgentMessage[], approved: ApprovedToolCall): Promise<AgentRunResult> {
+    const runtime = new AgentRuntime({ sessionId, mode: this.options.mode });
+    const messages = [...history];
+    const emit = (event: AgentExecutorEvent): void => this.options.onEvent?.(event);
+    const tool = this.options.tools[approved.tool];
+    if (!tool) throw new Error(`Tool not found: ${approved.tool}`);
+    emit({ type: 'tool_started', id: approved.id, tool: approved.tool });
+    try {
+      const output = serializeToolResult(await tool(approved.arguments));
+      messages.push({ role: 'tool', content: output, toolCallId: approved.id });
+      emit({ type: 'tool_completed', id: approved.id, tool: approved.tool, ok: true, output });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const content = JSON.stringify({ ok: false, code: 'TOOL_ERROR', message });
+      messages.push({ role: 'tool', content, toolCallId: approved.id });
+      emit({ type: 'tool_completed', id: approved.id, tool: approved.tool, ok: false, error: message });
+    }
+    return this.executeConversation(runtime, messages);
+  }
+
+  private async executeConversation(runtime: AgentRuntime, messages: AgentMessage[]): Promise<AgentRunResult> {
     let text = '';
     const emit = (event: AgentExecutorEvent): void => this.options.onEvent?.(event);
 
@@ -75,7 +113,7 @@ export class AgentExecutor {
             messages.push({ role: 'tool', content: JSON.stringify({ ok: false, code }), toolCallId: event.id });
             if (decision.decision === 'ask') {
               emit({ type: 'approval_required', id: event.id, tool: event.name, risk: decision.risk });
-              return { text, runtime, messages, status: runtime.state.status };
+              return { text, runtime, messages, status: runtime.state.status, pendingApproval: { id: event.id, tool: event.name, arguments: event.arguments, risk: decision.risk } };
             }
             continue;
           }

@@ -100,4 +100,28 @@ describe('agent executor', () => {
       { role: 'user', content: '第二个问题' }
     ]);
   });
+
+  test('resumes an approved tool call and continues the same model conversation', async () => {
+    const events: string[] = [];
+    const calls: Array<{ role: string; content: string; toolCallId?: string }> = [];
+    const executor = new AgentExecutor({
+      mode: 'manual',
+      model: {
+        stream: async function* (messages) {
+          calls.push(...messages);
+          yield { type: 'text_delta', text: '工具结果已确认' } as const;
+        }
+      },
+      tools: { apply_patch: async () => ({ changedFiles: ['README.md'] }) },
+      onEvent: (event) => events.push(event.type)
+    });
+
+    const result = await executor.resume('s1', [{ role: 'user', content: '修改 README' }], {
+      id: 'patch-1', tool: 'apply_patch', arguments: { changes: [{ path: 'README.md', content: 'next' }] }
+    });
+
+    expect(result.status).toBe('completed');
+    expect(calls).toContainEqual({ role: 'tool', toolCallId: 'patch-1', content: JSON.stringify({ changedFiles: ['README.md'] }) });
+    expect(events).toEqual(['tool_started', 'tool_completed', 'assistant_text', 'completed']);
+  });
 });

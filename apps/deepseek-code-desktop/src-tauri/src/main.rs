@@ -33,6 +33,19 @@ struct AgentRequest {
     mode: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalRequest {
+    session_id: String,
+    project_path: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+    mode: String,
+    approval_id: String,
+    decision: String,
+}
+
 struct RuntimeProcess(Arc<Mutex<Option<CommandChild>>>);
 
 fn settings_path() -> PathBuf {
@@ -123,8 +136,20 @@ fn ensure_runtime(app: &AppHandle, state: &RuntimeProcess) -> Result<(), String>
 fn run_agent(app: AppHandle, state: State<'_, RuntimeProcess>, request: AgentRequest) -> Result<(), String> {
     if request.session_id.trim().is_empty() || request.project_path.trim().is_empty() || request.prompt.trim().is_empty() { return Err("sessionId、projectPath 和 prompt 不能为空".into()); }
     if request.base_url.trim().is_empty() || request.api_key.trim().is_empty() || request.model.trim().is_empty() { return Err("请先配置 Base URL、API Key 和模型".into()); }
-    ensure_runtime(&app, &state)?;
     let payload = serde_json::json!({ "id": format!("{}-{}", request.session_id, uuid_like()), "method": "session.run", "params": request });
+    send_runtime_request(&app, &state, payload)
+}
+
+#[tauri::command]
+fn resolve_approval(app: AppHandle, state: State<'_, RuntimeProcess>, request: ApprovalRequest) -> Result<(), String> {
+    if request.session_id.trim().is_empty() || request.approval_id.trim().is_empty() || !matches!(request.decision.as_str(), "allow" | "deny") { return Err("审批参数无效".into()); }
+    if request.project_path.trim().is_empty() || request.base_url.trim().is_empty() || request.api_key.trim().is_empty() || request.model.trim().is_empty() { return Err("请先配置 Base URL、API Key、模型和项目目录".into()); }
+    let payload = serde_json::json!({ "id": format!("{}-{}", request.session_id, uuid_like()), "method": "session.resolveApproval", "params": request });
+    send_runtime_request(&app, &state, payload)
+}
+
+fn send_runtime_request(app: &AppHandle, state: &RuntimeProcess, payload: serde_json::Value) -> Result<(), String> {
+    ensure_runtime(app, state)?;
     let mut process = state.0.lock().map_err(|_| "runtime lock poisoned".to_string())?;
     process.as_mut().ok_or_else(|| "runtime 未启动".to_string())?.write(format!("{}\n", payload).as_bytes()).map_err(|error| error.to_string())
 }
@@ -135,7 +160,7 @@ fn main() {
     tauri::Builder::default()
         .manage(RuntimeProcess(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![runtime_status, load_settings, save_settings, run_agent])
+        .invoke_handler(tauri::generate_handler![runtime_status, load_settings, save_settings, run_agent, resolve_approval])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
 }
