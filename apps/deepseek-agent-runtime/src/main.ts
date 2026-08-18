@@ -265,6 +265,7 @@ const execFile = promisify(execFileCallback)
 const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
 const activeControllers = new Map<string, AbortController>()
+const pendingCancels = new Set<string>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
 const sshTerminals = new Map<string, SSHRemotePersistentTerminal>()
 type MCPClient = MCPStdioClient | MCPStreamableHTTPClient
@@ -712,6 +713,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
   if (!params.baseURL || !params.apiKey || !params.model || !projectPath || !prompt) throw new Error("session.run requires projectPath, prompt, baseURL, apiKey and model")
   const controller = new AbortController()
   activeControllers.set(sessionID, controller)
+  if (pendingCancels.delete(sessionID)) controller.abort()
   const client = createProviderClient(params, controller.signal)
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
@@ -884,7 +886,10 @@ async function handle(request: Request): Promise<void> {
   if (request.method === "session.cancel") {
     const sessionID = request.params?.sessionID?.trim()
     const controller = sessionID ? activeControllers.get(sessionID) : undefined
-    if (!controller) respond({ id: request.id, type: "response", ok: false, error: "No cancellable operation is active for this session" })
+    if (!controller && sessionID && activeSessions.has(sessionID)) {
+      pendingCancels.add(sessionID)
+      respond({ id: request.id, type: "response", ok: true, result: { sessionID, cancelling: true, pending: true } })
+    } else if (!controller) respond({ id: request.id, type: "response", ok: false, error: "No cancellable operation is active for this session" })
     else { controller.abort(); respond({ id: request.id, type: "response", ok: true, result: { sessionID, cancelling: true } }) }
     return
   }
