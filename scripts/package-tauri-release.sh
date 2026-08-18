@@ -23,10 +23,11 @@ mkdir -p "$release_dir"
 cp "$source_dmg" "$release_dmg"
 shasum -a 256 "$release_dmg" > "$release_dir/SHA256SUMS.txt"
 
-node - "$release_dir/release-metadata.json" "$version" "$(basename "$release_dmg")" <<'NODE'
+build_stamp="${version}-$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+node - "$release_dir/release-metadata.json" "$version" "$(basename "$release_dmg")" "$build_stamp" <<'NODE'
 const fs = require("fs")
-const [output, version, artifact] = process.argv.slice(2)
-fs.writeFileSync(output, `${JSON.stringify({ product: "DeepSeek Code", version, artifact, runtime: "tauri-sidecar", browserRuntime: "bundled-chromium-playwright-core", signing: "adhoc" }, null, 2)}\n`)
+const [output, version, artifact, buildStamp] = process.argv.slice(2)
+fs.writeFileSync(output, `${JSON.stringify({ product: "DeepSeek Code", version, artifact, buildStamp, runtime: "tauri-sidecar", browserRuntime: "bundled-chromium-playwright-core", signing: "adhoc" }, null, 2)}\n`)
 NODE
 
 echo "Tauri release artifact: $release_dmg"

@@ -29,6 +29,7 @@ assert.strictEqual(metadata.version, version)
 assert.strictEqual(metadata.artifact, artifact)
 assert.strictEqual(metadata.runtime, "tauri-sidecar")
 assert.strictEqual(metadata.browserRuntime, "bundled-chromium-playwright-core")
+assert.match(metadata.buildStamp, new RegExp(`^${version}-[0-9a-f]+$`))
 NODE
 
 mount_dir="$(mktemp -d /tmp/deepseek-code-release.XXXXXX)"

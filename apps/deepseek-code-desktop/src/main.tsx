@@ -24,6 +24,7 @@ function initialSessionID(): string {
 
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus>({ ready: false, version: "检查中" })
+  const [buildStamp, setBuildStamp] = useState("加载中")
   const [settings, setSettings] = useState<Settings>(defaults)
   const [prompt, setPrompt] = useState("")
   const [messages, setMessages] = useState<Message[]>([])
@@ -58,9 +59,10 @@ function App() {
   }
 
   useEffect(() => {
-    void Promise.all([invoke<RuntimeStatus>("runtime_status"), invoke<Settings>("load_settings"), invoke<SessionSummary[]>("list_sessions")])
-      .then(async ([status, saved, summaries]) => {
+    void Promise.all([invoke<RuntimeStatus>("runtime_status"), invoke<Settings>("load_settings"), invoke<SessionSummary[]>("list_sessions"), invoke<string>("build_stamp")])
+      .then(async ([status, saved, summaries, stamp]) => {
         setRuntime(status)
+        setBuildStamp(stamp)
         setSettings({ ...defaults, ...saved, protocol: saved.protocol || defaults.protocol })
         setSessions(summaries)
         const stored = initialSessionID()
@@ -193,7 +195,7 @@ function App() {
       <div className="privacy">本地优先 · 凭据保存在 Keychain</div>
     </aside>
     <section className="workspace">
-      <header><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "准备开始一个任务"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}</span></header>
+      <header><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "准备开始一个任务"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
       <section className="conversation" aria-live="polite">
         {!messages.length && <div className="welcome-card"><h2>自己的轻量编码工作台</h2><p>描述一个问题，DeepSeek Code 会在当前项目中理解、修改并验证。公开只读研究自动执行；写入和外部交付仍受控。</p><button type="button" onClick={() => setShowSettings(true)}>配置项目与模型</button></div>}

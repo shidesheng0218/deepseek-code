@@ -11,6 +11,8 @@ use tauri_plugin_shell::ShellExt;
 #[serde(rename_all = "camelCase")]
 struct RuntimeStatus { ready: bool, version: String, detail: Option<String> }
 
+fn build_stamp_value() -> String { format!("{}-{}", env!("CARGO_PKG_VERSION"), option_env!("DEEPSEEK_GIT_SHA").unwrap_or("unknown")) }
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeSettings {
@@ -161,6 +163,9 @@ async fn runtime_status(app: AppHandle) -> RuntimeStatus {
 }
 
 #[tauri::command]
+fn build_stamp() -> String { build_stamp_value() }
+
+#[tauri::command]
 fn load_settings() -> Result<RuntimeSettings, String> {
     let path = settings_path();
     let mut settings = if path.exists() {
@@ -253,7 +258,7 @@ fn main() {
     tauri::Builder::default()
         .manage(RuntimeProcess(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![runtime_status, load_settings, save_settings, list_sessions, load_session_history, run_agent, resolve_approval, cancel_session])
+        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, load_session_history, run_agent, resolve_approval, cancel_session])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
 }
@@ -275,5 +280,10 @@ mod tests {
             RestoredMessage { role: "user".into(), text: "修复登录问题".into() },
             RestoredMessage { role: "assistant".into(), text: "已定位并修复。".into() }
         ]);
+    }
+
+    #[test]
+    fn exposes_a_non_empty_build_stamp() {
+        assert!(build_stamp_value().contains('-'));
     }
 }
