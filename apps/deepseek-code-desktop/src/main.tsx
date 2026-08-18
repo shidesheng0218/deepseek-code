@@ -6,7 +6,7 @@ import "./styles.css"
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string }
-type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number }; result?: { text?: string; status?: string }; error?: string }
+type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number }; result?: { text?: string; status?: string }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
 type Approval = { id: string; tool: string; risk: string }
 
@@ -56,6 +56,8 @@ function App() {
         setMessages((current) => [...current, { role: "tool", text: `${runtimeEvent.tool ?? "工具"} 已完成`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "terminal_completed") {
         setMessages((current) => [...current, { role: "tool", text: `终端 #${runtimeEvent.sequence ?? ""}：${runtimeEvent.command ?? "命令"}（退出码 ${runtimeEvent.exitCode ?? "?"}）`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "worker_completed") {
+        setMessages((current) => [...current, { role: "tool", text: `${runtimeEvent.workerType ?? "Worker"} 已完成：${runtimeEvent.summary ?? ""}（${runtimeEvent.evidenceCount ?? 0} 条 Evidence）`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "approval_required" && runtimeEvent.id) {
         setApproval({ id: runtimeEvent.id, tool: runtimeEvent.tool ?? "操作", risk: runtimeEvent.risk ?? "L2" })
         setBusy(false)

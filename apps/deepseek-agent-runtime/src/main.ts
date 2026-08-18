@@ -1,5 +1,6 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
+import { spawn } from "node:child_process"
 import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
 import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/providers/openai-compatible"
 import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
@@ -11,6 +12,7 @@ import { MCPStdioClient } from "../../../src/core/mcp-stdio"
 import { loadLanguageServerConfigs } from "../../../src/core/lsp-config"
 import { LanguageServerClient } from "../../../src/core/lsp-client"
 import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
+import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from "../../../src/core/worker-runtime"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 
@@ -46,6 +48,7 @@ type RuntimeEvent =
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
   | { type: "usage_recorded"; inputTokens?: number; outputTokens?: number }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
+  | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -56,7 +59,8 @@ const toolSchemas = [
   { type: "function", function: { name: "inspect_git", description: "查看 Git 状态", parameters: { type: "object", properties: {}, required: [] } } },
   { type: "function", function: { name: "run_command", description: "在工作区目录运行命令", parameters: { type: "object", properties: { command: { type: "string" }, timeoutMs: { type: "number" } }, required: ["command"] } } },
   { type: "function", function: { name: "web_search", description: "搜索公开网页资料，最多返回 8 条来源", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
-  { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } }
+  { type: "function", function: { name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面并返回清洗内容、来源和内容哈希", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
+  { type: "function", function: { name: "delegate_worker", description: "启动独立、只读的 Explore 或 Review Worker，并返回 Evidence", parameters: { type: "object", properties: { type: { type: "string", enum: ["explore", "review"] } }, required: ["type"] } } }
 ]
 type ToolSchema = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }
 type MCPBinding = { schemas: ToolSchema[]; handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> }
@@ -221,6 +225,31 @@ async function runPersistentCommand(sessionID: string, projectPath: string, inpu
   return { ok: entry.exitCode === 0, sequence: entry.sequence, stdout: entry.stdout.slice(0, 50_000), stderr: entry.stderr.slice(0, 20_000), exitCode: entry.exitCode }
 }
 
+async function delegateWorker(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const type = input.type
+  if (type !== "explore" && type !== "review") throw new Error("delegate_worker requires type explore or review")
+  const workerID = `worker-${crypto.randomUUID()}`
+  const result = await new Promise<WorkerResultEnvelope>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--worker-stdio"], { stdio: ["pipe", "pipe", "pipe"] })
+    let output = ""
+    let errorOutput = ""
+    const timeout = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Worker timed out")) }, 30_000)
+    child.stdout.setEncoding("utf8")
+    child.stderr.setEncoding("utf8")
+    child.stdout.on("data", (chunk: string) => { output += chunk })
+    child.stderr.on("data", (chunk: string) => { errorOutput += chunk })
+    child.once("error", (error) => { clearTimeout(timeout); reject(error) })
+    child.once("exit", (code) => {
+      clearTimeout(timeout)
+      if (code !== 0) return reject(new Error(errorOutput || `Worker exited with ${code}`))
+      try { resolve(JSON.parse(output) as WorkerResultEnvelope) } catch { reject(new Error("Worker returned invalid JSON")) }
+    })
+    child.stdin.end(`${JSON.stringify({ workerID, type, projectPath })}\n`)
+  })
+  await emitSessionEvent(sessionID, { type: "worker_completed", workerID: result.workerID, workerType: result.type, state: result.state, summary: result.summary, evidenceCount: result.evidence.length })
+  return result
+}
+
 function respond(response: OutputFrame): void {
   process.stdout.write(`${JSON.stringify(response)}\n`)
 }
@@ -289,6 +318,7 @@ async function executeRun(request: RunRequest): Promise<{ text: string; status: 
       run_command: (input) => runPersistentCommand(sessionID, projectPath, input),
       web_search: webTools.web_search,
       web_fetch: webTools.web_fetch,
+      delegate_worker: (input) => delegateWorker(sessionID, projectPath, input),
       ...mcp.handlers,
       ...lsp.handlers
     },
@@ -341,7 +371,7 @@ async function executeApproval(request: Request): Promise<{ text: string; status
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, ...mcp.handlers, ...lsp.handlers },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), ...mcp.handlers, ...lsp.handlers },
     onEvent: (event) => { void emitAgentEvent(sessionID, event) }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
@@ -400,20 +430,40 @@ async function handle(request: Request): Promise<void> {
   enqueue(request)
 }
 
-if (process.argv[2] === "health") {
-  process.stdout.write("deepseek-agent-runtime/0.2.0\n")
-  process.exit(0)
-}
-
-let buffer = ""
-process.stdin.setEncoding("utf8")
-process.stdin.on("data", (chunk: string) => {
-  buffer += chunk
-  const lines = buffer.split("\n")
-  buffer = lines.pop() ?? ""
-  for (const line of lines) {
-    if (!line.trim()) continue
-    try { void handle(JSON.parse(line) as Request) }
-    catch { respond({ id: "unknown", type: "response", ok: false, error: "invalid JSON request" }) }
+if (process.argv[2] === "--worker-stdio") {
+  let workerBuffer = ""
+  process.stdin.setEncoding("utf8")
+  process.stdin.on("data", (chunk: string) => {
+    workerBuffer += chunk
+    const lines = workerBuffer.split("\n")
+    workerBuffer = lines.pop() ?? ""
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try {
+        const contract = JSON.parse(line) as { workerID: string; type: WorkerType; projectPath: string }
+        void runReadOnlyWorker(contract).then((result) => { process.stdout.write(`${JSON.stringify(result)}\n`); process.exit(0) })
+      } catch {
+        process.stderr.write("invalid worker contract\n")
+        process.exit(1)
+      }
+    }
+  })
+} else {
+  if (process.argv[2] === "health") {
+    process.stdout.write("deepseek-agent-runtime/0.2.0\n")
+    process.exit(0)
   }
-})
+
+  let buffer = ""
+  process.stdin.setEncoding("utf8")
+  process.stdin.on("data", (chunk: string) => {
+    buffer += chunk
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try { void handle(JSON.parse(line) as Request) }
+      catch { respond({ id: "unknown", type: "response", ok: false, error: "invalid JSON request" }) }
+    }
+  })
+}
