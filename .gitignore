@@ -1,4 +1,12 @@
 node_modules/
+apps/deepseek-code-desktop/dist/
+apps/deepseek-code-desktop/src-tauri/target/
+apps/deepseek-code-desktop/src-tauri/binaries/deepseek-agent-runtime-*
+apps/deepseek-code-desktop/src-tauri/gen/
+apps/deepseek-agent-runtime/dist/
+apps/deepseek-code-desktop/*.tsbuildinfo
+apps/deepseek-code-desktop/vite.config.js
+apps/deepseek-code-desktop/vite.config.d.ts
 dist/
 coverage/
 .DS_Store

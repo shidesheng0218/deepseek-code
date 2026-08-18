@@ -1,4 +1,4 @@
-name: macOS Release
+name: DeepSeek Code macOS Release
 
 on:
   push:
@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Marketing version, for example 0.1.0"
+        description: "Release version, for example 0.1.0"
         required: true
         default: "0.1.0"
       publish:
-        description: "Publish a GitHub Release; signing and notarization are optional"
+        description: "Publish a GitHub Release"
         required: true
         type: boolean
         default: false
@@ -20,125 +20,61 @@ permissions:
 
 jobs:
   build-and-release:
-    # macos-15 is the current Apple Silicon image with Xcode 16 / Swift 6.
-    # macos-14 is deprecated and can resolve to Swift 5.10, which cannot
-    # build this package's swift-tools-version: 6.0 manifest.
     runs-on: macos-15
     env:
       RELEASE_VERSION: ${{ startsWith(github.ref_name, 'v') && github.ref_name || inputs.version }}
-      BUILD_NUMBER: ${{ github.run_number }}
       SHOULD_PUBLISH: ${{ github.event_name == 'push' || inputs.publish == true }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select and verify Swift 6 toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          xcode_app="$(ls -d /Applications/Xcode_16*.app /Applications/Xcode.app 2>/dev/null | head -1 || true)"
-          if [[ -z "$xcode_app" ]]; then
-            echo "Xcode 16 is required for swift-tools-version 6.0." >&2
-            ls -d /Applications/Xcode*.app 2>/dev/null || true
-            exit 1
-          fi
-          sudo xcode-select --switch "$xcode_app/Contents/Developer"
-          xcodebuild -version
-          swift --version
-          swift_major="$(swift --version | sed -nE 's/.*Swift version ([0-9]+).*/\1/p' | head -1)"
-          if [[ -z "$swift_major" || "$swift_major" -lt 6 ]]; then
-            echo "Swift 6 or newer is required; detected: $(swift --version)" >&2
-            exit 1
-          fi
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/deepseek-code-desktop/package-lock.json
 
-      - name: Resolve release version
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Resolve and validate release version
         id: version
         shell: bash
         run: |
+          set -euo pipefail
           version="${RELEASE_VERSION#v}"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release version: $version" >&2
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Release version: $version"
 
-      - name: Import Developer ID certificate when configured
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "$APPLE_CERTIFICATE_BASE64" && -z "$APPLE_CERTIFICATE_PASSWORD" && -z "$APPLE_SIGNING_IDENTITY" ]]; then
-            echo "No Developer ID certificate configured; this run will publish a GitHub ad-hoc build."
-            echo "HAS_DEVELOPER_ID=0" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          if [[ -z "$APPLE_CERTIFICATE_BASE64" || -z "$APPLE_CERTIFICATE_PASSWORD" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
-            echo "Developer ID secrets are incomplete; provide all three or none." >&2
-            exit 1
-          fi
-          keychain_password="$(openssl rand -hex 24)"
-          keychain_path="$RUNNER_TEMP/deepseek-code-build.keychain-db"
-          certificate_path="$RUNNER_TEMP/deepseek-code-developer-id.p12"
-          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
-          security create-keychain -p "$keychain_password" "$keychain_path"
-          security set-keychain-settings -lut 21600 "$keychain_path"
-          security unlock-keychain -p "$keychain_password" "$keychain_path"
-          security import "$certificate_path" -k "$keychain_path" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
-          security list-keychains -d user -s "$keychain_path"
-          security default-keychain -s "$keychain_path"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain_path"
-          echo "APPLE_CODESIGN_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
-          echo "DEEPSEEK_BUILD_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
-          echo "HAS_DEVELOPER_ID=1" >> "$GITHUB_ENV"
+      - name: Install desktop dependencies
+        run: npm ci --prefix apps/deepseek-code-desktop
 
-      - name: Run Swift checks
+      - name: Run Swift migration checks
         run: npm test
 
-      - name: Verify persistent SSH terminal loopback
-        run: ./scripts/verify-ssh-loopback-terminal.sh
-
-      - name: Package GitHub DMG
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          package_args=(
-            "RELEASE_VERSION=${{ steps.version.outputs.version }}"
-            "BUILD_NUMBER=$BUILD_NUMBER"
-          )
-          if [[ "${HAS_DEVELOPER_ID:-0}" == "1" ]]; then
-            package_args+=("APPLE_CODESIGN_IDENTITY=$APPLE_CODESIGN_IDENTITY")
-            if [[ -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
-              package_args+=("NOTARIZE=1")
-            else
-              package_args+=("NOTARIZE=0")
-            fi
-          else
-            package_args+=("DISTRIBUTION_LABEL=github-adhoc")
-          fi
-          env "${package_args[@]}" "$GITHUB_WORKSPACE/scripts/package-macos-release.sh"
-
-      - name: Verify DMG and checksums
+      - name: Build DeepSeek Code Tauri DMG
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          dmg="dist/release/DeepSeek-Code-${RELEASE_VERSION}-arm64.dmg"
-          ./scripts/verify-macos-release.sh "$dmg"
-          (cd dist/release && shasum -a 256 -c SHA256SUMS.txt)
+        run: npm run release:package
+
+      - name: Verify DMG, checksum and metadata
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: npm run release:verify
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: DeepSeek-Code-${{ steps.version.outputs.version }}-arm64
           path: |
-            dist/release/*.dmg
-            dist/release/SHA256SUMS.txt
-            dist/release/release-metadata.json
+            dist/DeepSeek-Code-*.dmg
+            dist/SHA256SUMS.txt
+            dist/release-metadata.json
 
       - name: Publish GitHub Release
         if: env.SHOULD_PUBLISH == 'true'
@@ -147,22 +83,7 @@ jobs:
         run: |
           tag="v${{ steps.version.outputs.version }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/release/* --clobber
+            gh release upload "$tag" dist/DeepSeek-Code-*.dmg dist/SHA256SUMS.txt dist/release-metadata.json --clobber
           else
-            distribution="$(python3 - <<'PY'
-          import json
-          with open('dist/release/release-metadata.json', encoding='utf-8') as f:
-              print(json.load(f)['distribution'])
-          PY
-          )"
-            case "$distribution" in
-              developer-id-notarized) title="DeepSeek Code ${{ steps.version.outputs.version }}";;
-              developer-id-signed-unnotarized) title="DeepSeek Code ${{ steps.version.outputs.version }} (Signed)";;
-              *) title="DeepSeek Code ${{ steps.version.outputs.version }} (Community)";;
-            esac
-            gh release create "$tag" dist/release/* --generate-notes --title "$title"
+            gh release create "$tag" dist/DeepSeek-Code-*.dmg dist/SHA256SUMS.txt dist/release-metadata.json --generate-notes --title "DeepSeek Code ${{ steps.version.outputs.version }} (Community)"
           fi
-
-      - name: Clean temporary keychain
-        if: always() && env.DEEPSEEK_BUILD_KEYCHAIN != ''
-        run: security delete-keychain "$DEEPSEEK_BUILD_KEYCHAIN" || true

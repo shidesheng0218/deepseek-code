@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability set for the DeepSeek Code main window.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [{
+        "name": "binaries/deepseek-agent-runtime",
+        "sidecar": true,
+        "args": ["health"]
+      }]
+    }
+  ]
+}

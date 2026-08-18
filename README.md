@@ -8,7 +8,7 @@
 
 [下载最新版](https://github.com/shidesheng0218/deepseek-code/releases/latest) · [快速开始](#下载使用) · [架构](#当前产品真源) · [安全与权限](#当前命令风险策略) · [开发](#本地开发)
 
-`macOS 14+` · `Apple Silicon` · `SwiftUI` · `BYOK` · `本地优先`
+`macOS 14+` · `Apple Silicon` · `Tauri 2` · `BYOK` · `本地优先`
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ```mermaid
 flowchart LR
-    U["开发者"] --> GUI["SwiftUI App / CLI"]
+    U["开发者"] --> GUI["Tauri App / CLI"]
     GUI --> IPC["本地 IPC"]
     IPC --> D["deepseekd"]
     D --> S["SessionSupervisor\n唯一命令与状态所有者"]
@@ -59,9 +59,11 @@ flowchart LR
 
 ## 当前产品真源
 
-正式产品仍然是 **DeepSeek Code.app**：由 SwiftUI、`DeepSeekCodeCore`、`deepseekd` 与本地 SQLite/Keychain 组成的原生 macOS 应用。`npm run dev`、构建脚本和 GitHub Release 都只启动或打包 DeepSeek Code，而不会启动 。
+正式产品是 **DeepSeek Code.app**：由 **Tauri 2 + 本地 Agent Sidecar** 组成的轻量 macOS 桌面应用。`npm run dev`、构建脚本和 GitHub Release 都只启动或打包 DeepSeek Code，而不会启动 ，也不要求最终用户安装 Node、Bun 或 Swift。
 
-- `macos/DeepSeekCode`：DeepSeek Code 的正式 UI、Agent Runtime、daemon、CLI、Keychain、Session 和发布产物。
+- `apps/deepseek-code-desktop`：Tauri 2 桌面壳、自有 React 界面、应用权限和 DMG 打包配置。
+- `apps/deepseek-agent-runtime`：随应用分发的本地 Agent Sidecar；负责会话、模型和工具协议，最终用户不需要安装 Bun。
+- `macos/DeepSeekCode`：旧 SwiftUI 版本和迁移参考；在 Tauri 版完成能力迁移前保留为开发回退。
 - `vendor/`：固定版本的  上游参考源码；仅用于移植经过审查的交互、工具协议、Provider/MCP/LSP 兼容与测试逻辑。
 - `integrations/`：上游差异分析、许可说明与移植清单；不保存运行时凭据，也不作为用户入口。
 - `src/`：更早的 Electron/React 实现，仅保留作迁移与兼容参考。
@@ -73,13 +75,14 @@ flowchart LR
 复用遵循“语义移植、产品自有”的边界：
 
 - 借鉴并移植：多轮 Turn/Step、Inbox、安全的工具调用协议、Provider 与 MCP/LSP 适配语义、上下文压缩、权限体验和 E2E Fixture。
-- DeepSeek Code 自行实现：SwiftUI 界面、`deepseekd`、Session/Event/Evidence、Keychain、Sandbox、发布签名和 GitHub DMG。
+- DeepSeek Code 自行实现：Tauri 界面、Agent Sidecar、Session/Event/Evidence、Keychain、Sandbox、发布签名和 GitHub DMG。
 - 不复用为运行时： Desktop、 CLI、Node/Bun Agent Loop、 用户配置或其凭据存储。
 - 每次移植都保留 MIT 许可、写入 DeepSeek Code 自有测试，并且必须经过安全与 API 边界审查。
 
 ## 当前实现
 
-- 原生 SwiftUI 三栏工作区：Session、Conversation、Workspace 与 Inspector。
+- Tauri 轻量工作区：Session、Conversation、Workspace 与 Runtime 状态。
+- SwiftUI 旧版仍保留完整的三栏工作区，作为能力迁移和旧数据验证参考。
 - 中文优先的 Session、计划、工具活动、Diff、Browser 和 Review 界面。
 - Plan / Manual / Accept Edits / Auto 四种权限模式。
 - 细粒度命令风险分类和审批决策。
@@ -93,7 +96,7 @@ flowchart LR
 - Agent IPC 执行闭环：模型流 → 工具调用 → 风险/审批 → 文件、Git、命令工具 → 脱敏事件回传。
 - 文件工具支持原子 Patch、乐观哈希、检查点恢复，以及目录/符号链接工作区隔离。
 - 真实本地项目选择与 Composer 任务发送入口。
-- `DeepSeekCodeCore` 提供 Durable Session、Provider、Keychain、事件流、权限、Workspace、Git、Review、Skills、MCP、Hooks、Browser、Terminal 与 SSH 运行时。
+- 旧版 `DeepSeekCodeCore` 提供 Durable Session、Provider、Keychain、事件流、权限、Workspace、Git、Review、Skills、MCP、Hooks、Browser、Terminal 与 SSH 运行时；这些能力按测试逐项迁移到 Agent Sidecar。
 - Composer 已接入真实 DeepSeek/OpenAI-compatible SSE 与 Anthropic Messages，支持工具审批、Token/费用和延迟审计。
 
 ## 一次任务如何完成
@@ -154,13 +157,13 @@ flowchart TB
 
 ## 本地开发
 
-默认开发入口启动新的 DeepSeek Code 原生桌面版：
+默认开发入口启动新的 DeepSeek Code Tauri 轻量桌面版：
 
 ```bash
 npm run dev
 ```
 
-`npm run dev:swift` 是同一 DeepSeek Code 桌面应用的显式别名，便于既有开发脚本迁移。
+`npm run dev:swift` 仍可启动旧 SwiftUI 版本，便于验证旧数据迁移；它不是默认产品入口。
 
 ### 使用 CLI 与 daemon
 
@@ -179,15 +182,21 @@ swift run deepseek run "修复登录问题并运行测试"
 
 GUI 与 CLI 通过本地 IPC 连接同一个 Runtime，因此可看到同一组 Session、审批、Terminal 与 Evidence。
 
-生成可分发的 macOS `.app`：
+生成新的 Tauri macOS `.app` 和 DMG：
 
 ```bash
-./scripts/build-macos-app.sh
+npm run build
 ```
 
-构建产物位于 `dist/DeepSeek Code.app`；设置 `APPLE_CODESIGN_IDENTITY` 后脚本会执行 Hardened Runtime 签名。
+构建产物位于 `apps/deepseek-code-desktop/src-tauri/target/release/bundle/`。打包 GitHub Release 工件：
 
-当前 SwiftUI 工程可使用 Command Line Tools 编译。用户下载版不走 App Store，而是通过 GitHub Releases 发布 `.dmg`：
+```bash
+npm run release:package
+```
+
+它会生成 `dist/DeepSeek-Code-<version>-arm64.dmg`、`SHA256SUMS.txt` 和 `release-metadata.json`。当前为 ad-hoc 社区构建；Developer ID 签名和公证将在发布硬化阶段接入 Tauri 产物。
+
+旧 SwiftUI 工程仍可使用 Command Line Tools 编译；当前用户下载版通过 Tauri GitHub Release 发布 `.dmg`。旧版兼容发布仍可显式运行：
 
 ```bash
 RELEASE_VERSION=0.1.0 \
@@ -274,7 +283,7 @@ flowchart LR
 
 | 已具备                                                     | 正在硬化，尚不应宣传为完成                         |
 | ---------------------------------------------------------- | -------------------------------------------------- |
-| SwiftUI + CLI、daemon、SessionSupervisor、SQLite Event Log | Browser → Test → Review → PR → CI 的真实端到端验收 |
+| Tauri App + Agent Sidecar、CLI、SQLite Event Log | Browser → Test → Review → PR → CI 的真实端到端验收 |
 | Tool Pipeline、审批续跑、Web Evidence、持久 Terminal 模型  | SSH 长连接与断线恢复的发布级验证                   |
 | Provider 路由、用量/费用记录、Worker Evidence 采纳         | 60 个真实任务、CI 修复与竞品同题基准               |
 | GitHub DMG 构建与可选签名/公证                             | 完整 XCUITest、故障注入与自动更新回滚              |
@@ -305,8 +314,8 @@ SSH loopback 检查需要设置 `DEEPSEEK_TOOLHOST_PATH`；未设置时会明确
 ```text
 .
 ├── macos/DeepSeekCode/
-│   ├── Sources/DeepSeekCodeApp/      # SwiftUI App
-│   ├── Sources/DeepSeekCodeCore/     # Domain、Runtime、Provider、Pipeline
+│   ├── Sources/DeepSeekCodeApp/      # SwiftUI 迁移版
+│   ├── Sources/DeepSeekCodeCore/     # 迁移参考 Runtime、Provider、Pipeline
 │   ├── Sources/DeepSeekCodeDaemon/   # deepseekd
 │   ├── Sources/DeepSeekCodeCLI/      # deepseek CLI
 │   └── Tests/                        # Core、Runtime、Harness、Daemon、Worker、CLI
