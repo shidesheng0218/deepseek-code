@@ -33,7 +33,7 @@ cask "deepseek-code" do
   homepage "https://github.com/shidesheng0218/deepseek-code"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
 
   app "DeepSeek Code.app"
 
