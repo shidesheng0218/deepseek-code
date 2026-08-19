@@ -1,4 +1,5 @@
 import { AgentRuntime } from './agent-runtime';
+import { buildContext, DEFAULT_CONTEXT_BUDGET, type ContextBudget } from './context-builder';
 import type { AgentMode } from './permissions';
 import type { ModelEvent } from './providers/openai-compatible';
 import { ToolExecutionPipeline, type ToolDefinition, type ToolPipelineEvent } from './tool-execution-pipeline';
@@ -39,6 +40,7 @@ export interface AgentExecutorOptions {
   tools: Record<string, (input: Record<string, unknown>) => Promise<unknown>>;
   toolDefinitions?: Record<string, ToolDefinition>;
   maxTurns?: number;
+  contextBudget?: ContextBudget;
   onEvent?: (event: AgentExecutorEvent) => void;
 }
 
@@ -97,7 +99,7 @@ export class AgentExecutor {
     try {
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
         let invokedTool = false;
-        for await (const event of this.options.model.stream(messages)) {
+        for await (const event of this.options.model.stream(buildContext(messages, this.options.contextBudget ?? DEFAULT_CONTEXT_BUDGET))) {
           if (event.type === 'text_delta') {
             text += event.text;
             emit({ type: 'assistant_text', text: event.text });

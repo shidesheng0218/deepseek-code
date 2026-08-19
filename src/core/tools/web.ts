@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
+import { dedupeAndRank, searchWithProvider, type SearchResultItem } from '../web-search-providers';
 
 type ResolveHost = (host: string) => Promise<string[]>;
 
@@ -47,6 +48,26 @@ function inputString(input: Record<string, unknown>, name: string): string {
   return typeof input[name] === 'string' ? input[name].trim() : '';
 }
 
+const INJECTION_PATTERNS = [
+  /ignore (all|any|previous|the above) instructions?/i,
+  /忽略(之前|以上|所有)(的)?(指令|指示|规则)/,
+  /you are now|new persona|system prompt/i,
+  /disregard (your|all) (guidelines|rules|training)/i
+];
+
+export function detectPromptInjection(text: string): string[] {
+  return INJECTION_PATTERNS.filter((pattern) => pattern.test(text)).map((pattern) => pattern.source);
+}
+
+function withCitations(results: SearchResultItem[], retrievedAt: string): Array<SearchResultItem & { citationID: string; retrievedAt: string; injectionWarnings: string[] }> {
+  return results.map((item) => ({
+    ...item,
+    citationID: createHash('sha256').update(`${item.url}\n${item.snippet}`).digest('hex').slice(0, 16),
+    retrievedAt,
+    injectionWarnings: detectPromptInjection(`${item.title}\n${item.snippet}`)
+  }));
+}
+
 async function defaultResolveHost(host: string): Promise<string[]> {
   const addresses = await lookup(host, { all: true, verbatim: true });
   return addresses.map((entry) => entry.address);
@@ -66,13 +87,20 @@ export function createWebTools(options: { fetchImpl?: typeof fetch; resolveHost?
     async web_search(input) {
       const query = inputString(input, 'query');
       if (!query) throw new Error('web_search requires query');
+      const retrievedAt = new Date().toISOString();
+      // BYOK API Provider 优先；未配置时回退 DuckDuckGo HTML 解析
+      const providerResponse = await searchWithProvider(query, process.env, fetchImpl).catch(() => undefined);
+      if (providerResponse && providerResponse.results.length) {
+        const ranked = dedupeAndRank(providerResponse.results).filter((item) => isSafePublicURL(item.url));
+        return { ok: true, query, results: withCitations(ranked, retrievedAt), provider: providerResponse.provider, retrievedAt };
+      }
       const url = new URL('https://html.duckduckgo.com/html/');
       url.searchParams.set('q', query);
       await assertSafe(url);
       const response = await fetchImpl(url, { headers: { 'user-agent': 'DeepSeek-Code/0.1' }, redirect: 'error', signal: AbortSignal.timeout(30_000) });
       if (!response.ok) throw new Error(`Search provider returned ${response.status}`);
       const html = await response.text();
-      const results: Array<{ title: string; url: string; snippet: string }> = [];
+      const results: SearchResultItem[] = [];
       const anchors = html.matchAll(/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi);
       for (const anchor of anchors) {
         const raw = anchor[1];
@@ -81,10 +109,10 @@ export function createWebTools(options: { fetchImpl?: typeof fetch; resolveHost?
         const candidate = raw.startsWith('/l/?') ? new URL(raw, url).searchParams.get('uddg') ?? raw : raw;
         if (!isSafePublicURL(candidate)) continue;
         const title = htmlToText(markup).content;
-        results.push({ title, url: candidate, snippet: '' });
+        results.push({ title, url: candidate, snippet: '', score: 0.5 });
         if (results.length === 8) break;
       }
-      return { ok: true, query, results, provider: 'duckduckgo-html', retrievedAt: new Date().toISOString() };
+      return { ok: true, query, results: withCitations(dedupeAndRank(results), retrievedAt), provider: 'duckduckgo-html', retrievedAt };
     },
 
     async web_fetch(input) {

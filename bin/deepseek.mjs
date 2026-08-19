@@ -9,7 +9,7 @@ const runtime = process.env.DEEPSEEK_RUNTIME_BINARY || join(root, 'apps/deepseek
 const sessionsRoot = process.env.DEEPSEEK_SESSION_ROOT || join(process.env.HOME || '.', 'Library/Application Support/DeepSeekCode/sessions');
 
 function usage() {
-  process.stderr.write('Usage: deepseek doctor | ask <prompt> | run <prompt> | session list | session attach <id>\n');
+  process.stderr.write('Usage: deepseek doctor | ask <prompt> | run <prompt> | session list | session attach <id> | session resume <id>\n');
   process.exit(2);
 }
 
@@ -73,6 +73,34 @@ async function attachSession(sessionID) {
   }
 }
 
+async function resumeSession(sessionID) {
+  const id = safeSessionID(sessionID);
+  const baseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
+  const apiKey = process.env.DEEPSEEK_API_KEY || '';
+  const model = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+  const projectPath = process.env.DEEPSEEK_PROJECT || process.cwd();
+  if (!apiKey) { process.stderr.write('Set DEEPSEEK_API_KEY before resuming.\n'); process.exit(2); }
+  const child = spawn(runtime, ['--stdio'], { cwd: root, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let buffer = '';
+  child.stdout.setEncoding('utf8');
+  const done = new Promise((resolve) => {
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split('\n'); buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let frame; try { frame = JSON.parse(line); } catch { continue; }
+        if (frame.type === 'event' && frame.event?.type === 'assistant_text') process.stdout.write(frame.event.text || '');
+        if (frame.type === 'event' && frame.event?.type === 'approval_required') process.stderr.write(`\nApproval required: ${frame.event.tool || 'tool'}\n`);
+        if (frame.type === 'response' && frame.result?.text !== undefined) { process.stdout.write(`\n${frame.result.text}\n`); resolve(); }
+      }
+    });
+  });
+  child.stdin.write(`${JSON.stringify({ id: `cli-resume-${Date.now()}`, method: 'session.recover', params: { sessionID: id, projectPath, baseURL, apiKey, model, protocol: process.env.DEEPSEEK_PROTOCOL || 'openai-compatible', mode: 'auto' } })}\n`);
+  await done;
+  child.kill('SIGTERM');
+}
+
 async function runPrompt(prompt) {
   const baseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
   const apiKey = process.env.DEEPSEEK_API_KEY || '';
@@ -105,6 +133,7 @@ try {
   else if (command === 'ask' || command === 'run') await runPrompt(args.join(' ').trim() || usage());
   else if (command === 'session' && args[0] === 'list') await listSessions();
   else if (command === 'session' && args[0] === 'attach' && args[1]) await attachSession(args[1]);
+  else if (command === 'session' && args[0] === 'resume' && args[1]) await resumeSession(args[1]);
   else usage();
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

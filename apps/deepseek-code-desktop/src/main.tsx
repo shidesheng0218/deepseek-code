@@ -6,14 +6,15 @@ import "./styles.css"
 import { canSubmitTask, shouldRenderFrame, submitActionLabel } from "./interaction-policy"
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
-type Settings = { baseUrl: string; model: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
+type Settings = { baseUrl: string; model: string; fastModel?: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
 type SessionSummary = { sessionId: string; title: string; updatedAt: number }
 type RestoredMessage = { role: "user" | "assistant"; text: string }
-type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string }; result?: { text?: string; status?: string }; error?: string }
+type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; inputID?: string }; result?: { text?: string; status?: string }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
 type Approval = { id: string; tool: string; risk: string }
+type Usage = { input: number; output: number; cached: number }
 
-const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", projectPath: "", apiKey: "", protocol: "openai-compatible" }
+const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", fastModel: "", projectPath: "", apiKey: "", protocol: "openai-compatible" }
 
 function newSessionID(): string { return `session-${Date.now()}` }
 
@@ -33,6 +34,8 @@ function App() {
   const [showSettings, setShowSettings] = useState(false)
   const [sessionID, setSessionID] = useState(initialSessionID)
   const [sessions, setSessions] = useState<SessionSummary[]>([])
+  const [usage, setUsage] = useState<Usage>({ input: 0, output: 0, cached: 0 })
+  const [currentRoute, setCurrentRoute] = useState<string>("")
   const seenFrameIDs = useRef(new Set<string>())
 
   async function refreshSessions() {
@@ -47,6 +50,10 @@ function App() {
     setMessages(history.map((message) => ({ role: message.role, text: message.text })))
     setApproval(null)
     try { localStorage.setItem("deepseek-code.active-session", nextSessionID) } catch { /* Local recovery remains optional in restricted webviews. */ }
+    // If the session was interrupted, offer to resume any safely recoverable work.
+    if (settings.apiKey.trim() && settings.projectPath.trim()) {
+      void invoke("resume_session", { request: { sessionId: nextSessionID, projectPath: settings.projectPath, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, protocol: settings.protocol, mode: "auto" } }).catch(() => undefined)
+    }
   }
 
   function beginNewSession() {
@@ -131,6 +138,14 @@ function App() {
         setMessages((current) => [...current, { role: "system", text: `CI 修复已完成，等待确认回写原始 PR #${runtimeEvent.number ?? "?"}。`, kind: "approval" }])
       } else if (runtimeEvent.type === "github_pr_updated") {
         setMessages((current) => [...current, { role: "tool", text: `已回写原始 PR #${runtimeEvent.number ?? "?"}。`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "recovery_attention") {
+        setMessages((current) => [...current, { role: "system", text: `恢复提示：${runtimeEvent.error ?? runtimeEvent.reason ?? "存在需要关注的中断状态"}`, kind: "error" }])
+      } else if (runtimeEvent.type === "recovery_input_restored") {
+        setMessages((current) => [...current, { role: "tool", text: "已恢复一条中断的输入，将继续处理。", kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "usage_recorded") {
+        setUsage((current) => ({ input: current.input + (runtimeEvent.inputTokens ?? 0), output: current.output + (runtimeEvent.outputTokens ?? 0), cached: current.cached + (runtimeEvent.cachedInputTokens ?? 0) }))
+      } else if (runtimeEvent.type === "decision_made") {
+        setCurrentRoute(runtimeEvent.route ?? "")
       } else if (runtimeEvent.type === "delivery_evaluated") {
         const label: Record<string, string> = { delivered: "已交付", handoffReady: "待交接", needsRepair: "需要修复", needsAttention: "需要关注" }
         setMessages((current) => [...current, { role: "tool", text: `交付门禁：${label[runtimeEvent.state ?? ""] ?? runtimeEvent.state}${runtimeEvent.reasons?.length ? ` · ${runtimeEvent.reasons.join(" ")}` : ""}`, kind: runtimeEvent.type }])
@@ -162,7 +177,7 @@ function App() {
     try {
       try { localStorage.setItem("deepseek-code.active-session", sessionID) } catch { /* Session recovery remains optional in restricted webviews. */ }
       await invoke("save_settings", { settings })
-      await invoke("run_agent", { request: { sessionId: sessionID, projectPath: settings.projectPath, prompt: text, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, protocol: settings.protocol, mode: "auto" } })
+      await invoke("run_agent", { request: { sessionId: sessionID, projectPath: settings.projectPath, prompt: text, baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model, fastModel: settings.fastModel ?? "", protocol: settings.protocol, mode: "auto" } })
     } catch (error) {
       setBusy(false)
       setMessages((current) => [...current, { role: "system", text: String(error), kind: "error" }])
@@ -196,6 +211,7 @@ function App() {
     </aside>
     <section className="workspace">
       <header><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "准备开始一个任务"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
+      {(usage.input > 0 || usage.output > 0 || currentRoute) && <div className="usage-bar">{currentRoute && <span className="route-chip">{currentRoute}</span>}<span>输入 {usage.input.toLocaleString()}{usage.cached > 0 ? `（缓存 ${usage.cached.toLocaleString()}）` : ""}</span><span>输出 {usage.output.toLocaleString()}</span><span>模型 {settings.model}{settings.fastModel ? ` · 快速 ${settings.fastModel}` : ""}</span></div>}
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
       <section className="conversation" aria-live="polite">
         {!messages.length && <div className="welcome-card"><h2>自己的轻量编码工作台</h2><p>描述一个问题，DeepSeek Code 会在当前项目中理解、修改并验证。公开只读研究自动执行；写入和外部交付仍受控。</p><button type="button" onClick={() => setShowSettings(true)}>配置项目与模型</button></div>}
@@ -204,7 +220,7 @@ function App() {
         {busy && <div className="typing"><i /><i /><i /> 正在工作</div>}
       </section>
       <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行；新消息会排队到安全边界" : "回车发送 · Shift+Enter 换行"}</span>{busy && <button type="button" onClick={() => void cancel()}>停止</button>}<button type="button" disabled={!canRun} onClick={() => void submit()}>{submitActionLabel(busy)}</button></footer></section>
-      {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /></label><label>协议<select value={settings.protocol} onChange={(event) => setSettings({ ...settings, protocol: event.target.value as Settings["protocol"] })}><option value="openai-compatible">OpenAI-compatible / DeepSeek</option><option value="anthropic-messages">Anthropic Messages</option></select></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>模型<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
+      {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /></label><label>协议<select value={settings.protocol} onChange={(event) => setSettings({ ...settings, protocol: event.target.value as Settings["protocol"] })}><option value="openai-compatible">OpenAI-compatible / DeepSeek</option><option value="anthropic-messages">Anthropic Messages</option></select></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>主模型（复杂任务/编码）<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>快速模型（简单问答/分类，可留空）<input value={settings.fastModel ?? ""} onChange={(event) => setSettings({ ...settings, fastModel: event.target.value })} placeholder="留空则全部使用主模型" /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
     </section>
   </main>
 }

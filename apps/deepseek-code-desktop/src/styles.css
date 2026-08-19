@@ -4,3 +4,5 @@
 .settings select { width: 100%; border: 1px solid #394457; border-radius: 7px; padding: 10px; color: #edf0f6; background: #10151f; outline: none; }
 .settings select:focus { border-color: #45a79d; }
 .approval { display: grid; gap: 8px; max-width: 560px; padding: 14px; border: 1px solid #98742f; border-radius: 10px; color: #fde7b0; background: rgba(120, 83, 16, .2); }.approval span { color: #d9c79d; font-size: 13px; }.approval div { display: flex; gap: 8px; }.approval button { border: 1px solid #6a5b3f; border-radius: 6px; padding: 7px 10px; color: #ece4d0; background: transparent; }.approval .allow { border-color: #248b77; color: #c6fff3; background: #125146; }
+.usage-bar { display: flex; align-items: center; gap: 16px; max-width: 900px; padding: 7px 12px; border: 1px solid #2b3140; border-radius: 8px; background: rgba(20, 25, 34, .6); color: #8490a3; font-size: 12px; }
+.usage-bar .route-chip { padding: 2px 8px; border: 1px solid #2f857e; border-radius: 99px; color: #9aecd8; background: #123a39; font-size: 11px; }

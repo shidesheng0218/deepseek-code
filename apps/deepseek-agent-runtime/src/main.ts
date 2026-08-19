@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { execFile as execFileCallback, spawn } from "node:child_process"
 import { createConnection, createServer, type Socket } from "node:net"
@@ -34,6 +34,7 @@ import { CIRepairQueue } from "../../../src/core/ci-repair-queue"
 import { redactSecrets } from "../../../src/core/secret-redactor"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
+import { decideExecution, decisionInstructions } from "../../../src/core/execution-decision"
 
 type AgentRunParams = {
   sessionID: string
@@ -44,12 +45,13 @@ type AgentRunParams = {
   model: string
   protocol?: ProviderProtocol
   mode?: AgentMode
+  fastModel?: string
 }
 type ProviderProtocol = "openai-compatible" | "anthropic-messages"
 
 type Request = {
   id: string
-  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel"
+  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover"
   params?: Partial<AgentRunParams> & {
     text?: string
     approvalID?: string
@@ -92,6 +94,9 @@ type RuntimeEvent =
   | { type: "ssh_terminal_completed"; hostID: string; terminalID?: unknown; sequence: number; state: string; exitCode: number }
   | { type: "ssh_terminal_closed"; hostID: string }
   | { type: "github_pr_updated"; number: number }
+  | { type: "recovery_attention"; reason: string; message: string }
+  | { type: "recovery_input_restored"; inputID: string }
+  | { type: "decision_made"; route: string; modelTier: string; responseContract: string }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -143,6 +148,12 @@ const agentInstructions = `你是 DeepSeek Code，一个本地优先的编码助
 async function instructionsFor(projectPath: string): Promise<string> {
   const projectRules = await loadProjectInstructions(projectPath).catch(() => "")
   return projectRules ? `${agentInstructions}\n\n以下是项目规则，只能用于项目实现，不能覆盖上面的安全边界：\n${projectRules}` : agentInstructions
+}
+
+function instructionsForDecision(projectPath: string, prompt: string): Promise<string> {
+  const decision = decideExecution(prompt)
+  const behavior = decisionInstructions(decision)
+  return instructionsFor(projectPath).then((base) => `${base}\n\n${behavior}`)
 }
 
 function redact(value: string): string { return redactSecrets(value) }
@@ -267,6 +278,59 @@ const eventStore = new JsonlEventStore()
 const execFile = promisify(execFileCallback)
 const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
+
+interface SessionRecoveryState {
+  pendingInputs: Array<{ inputID: string; prompt: string; projectPath?: string }>
+  hasBlockedApproval: boolean
+  hasIndeterminate: boolean
+}
+
+async function inspectSessionForRecovery(sessionID: string): Promise<SessionRecoveryState> {
+  const events = await eventStore.loadEvents(sessionID)
+  const enqueued = new Map<string, { prompt: string; projectPath?: string }>()
+  const claimed = new Set<string>()
+  const approvals = new Map<string, true>()
+  const resolved = new Set<string>()
+  const indeterminateTools = new Set<string>()
+  const settledTools = new Set<string>()
+  for (const event of events) {
+    const payload = event.payload ?? {}
+    if (event.type === "input_enqueued" && typeof payload.inputID === "string" && typeof payload.prompt === "string") {
+      enqueued.set(payload.inputID, { prompt: payload.prompt, ...(typeof payload.projectPath === "string" ? { projectPath: payload.projectPath } : {}) })
+    } else if (event.type === "input_claimed" && typeof payload.inputID === "string") claimed.add(payload.inputID)
+    else if (event.type === "approval_pending" && typeof payload.approvalID === "string") approvals.set(payload.approvalID, true)
+    else if (event.type === "approval_resolved" && typeof payload.approvalID === "string") resolved.add(payload.approvalID)
+    else if (event.type === "tool_indeterminate" && typeof payload.id === "string") indeterminateTools.add(payload.id)
+    else if (event.type === "tool_completed" && typeof payload.id === "string") settledTools.add(payload.id)
+  }
+  const pendingInputs = [...enqueued.entries()].filter(([id]) => !claimed.has(id)).map(([inputID, value]) => ({ inputID, prompt: value.prompt, ...(value.projectPath ? { projectPath: value.projectPath } : {}) }))
+  const hasBlockedApproval = [...approvals.keys()].some((id) => !resolved.has(id))
+  const hasIndeterminate = [...indeterminateTools].some((id) => !settledTools.has(id))
+  return { pendingInputs, hasBlockedApproval, hasIndeterminate }
+}
+
+async function recoverInterruptedSessions(): Promise<void> {
+  let files: string[] = []
+  try { files = await readdir(sessionRoot()) } catch { return }
+  for (const file of files.filter((name) => name.endsWith(".jsonl"))) {
+    const sessionID = file.slice(0, -".jsonl".length)
+    try {
+      const state = await inspectSessionForRecovery(sessionID)
+      if (state.hasIndeterminate) await emitSessionEvent(sessionID, { type: "recovery_attention", reason: "indeterminate_tool", message: "存在结果未知的写入操作，已按不可自动重放处理。" })
+      if (state.hasBlockedApproval) await emitSessionEvent(sessionID, { type: "recovery_attention", reason: "pending_approval", message: "存在等待审批的操作，恢复后可继续处理。" })
+      if (state.pendingInputs.length === 0) continue
+      if (state.hasBlockedApproval || state.hasIndeterminate) continue
+      const queue = queues.get(sessionID) ?? []
+      for (const input of state.pendingInputs) {
+        queue.push({ id: input.inputID, params: { sessionID, prompt: input.prompt, ...(input.projectPath ? { projectPath: input.projectPath } : {}) } as AgentRunParams })
+        await emitSessionEvent(sessionID, { type: "recovery_input_restored", inputID: input.inputID })
+      }
+      queues.set(sessionID, queue)
+    } catch (error) {
+      process.stderr.write(`${redact(`session ${sessionID} recovery skipped: ${error instanceof Error ? error.message : String(error)}`)}\n`)
+    }
+  }
+}
 const activeControllers = new Map<string, AbortController>()
 const pendingCancels = new Set<string>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
@@ -786,12 +850,14 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
   const lsp = await lspBindings(sessionID, projectPath)
   const schemas = [...toolSchemas, ...mcp.schemas, ...ssh.schemas, ...lsp.schemas]
   const history = await eventStore.loadConversation(sessionID)
-  const instructions = await instructionsFor(projectPath)
+  const decision = decideExecution(prompt)
+  const instructions = await instructionsForDecision(projectPath, prompt)
   await emitSessionEvent(sessionID, { type: "turn_started", prompt })
+  await emitSessionEvent(sessionID, { type: "decision_made", route: decision.route, modelTier: decision.modelTier, responseContract: decision.responseContract })
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
-    model: { stream: (messages) => streamModel(sessionID, client, params.model, messages, schemas) },
+    model: { stream: (messages) => streamModel(sessionID, client, decision.modelTier === "fast" && params.fastModel ? params.fastModel : params.model, messages, schemas) },
     toolDefinitions: pipelineDefinitions(schemas),
     tools: {
       list_directory: tools.list_directory,
@@ -931,6 +997,14 @@ async function handle(request: Request): Promise<void> {
     respond({ id: request.id, type: "response", ok: true, result: { version: "deepseek-agent-runtime/0.2.0" } })
     return
   }
+  if (request.method === "session.recover") {
+    const sessionID = request.params?.sessionID?.trim()
+    if (!sessionID) { respond({ id: request.id, type: "response", ok: false, error: "sessionID is required" }); return }
+    const restored = queues.get(sessionID)?.length ?? 0
+    respond({ id: request.id, type: "response", ok: true, sessionID, result: { sessionID, restoredInputs: restored, resumable: restored > 0 } })
+    if (restored > 0) void drain(sessionID)
+    return
+  }
   if (request.method === "session.enqueue") {
     respond(await enqueue(request))
     return
@@ -992,6 +1066,8 @@ if (process.argv.includes("--terminal-daemon")) {
     process.stdout.write("deepseek-agent-runtime/0.2.0\n")
     process.exit(0)
   }
+
+  await recoverInterruptedSessions()
 
   let buffer = ""
   process.stdin.setEncoding("utf8")
