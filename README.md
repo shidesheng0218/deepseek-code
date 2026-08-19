@@ -193,23 +193,6 @@ node bin/deepseek.mjs session attach <session-id>
 
 它通过 `DEEPSEEK_RUNTIME_BINARY` 指向打包后的 Sidecar，默认读取仓库中的 `apps/deepseek-agent-runtime/dist/deepseek-agent-runtime`；会话仍使用与桌面 App 相同的 JSONL Event Log。可用环境变量包括 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_PROJECT`、`DEEPSEEK_PROTOCOL` 和 `DEEPSEEK_SESSION_ROOT`。
 
-### Swift 兼容工具（非 Tauri 下载版入口）
-
-```bash
-# 终端 A：启动本地 Runtime
-cd macos/DeepSeekCode
-swift run deepseekd
-```
-
-```bash
-# 终端 B：连接同一个 Runtime
-cd macos/DeepSeekCode
-swift run deepseek ask "解释当前项目的构建入口"
-swift run deepseek run "修复登录问题并运行测试"
-```
-
-该 CLI 与 daemon 仅用于旧 Swift Runtime 的兼容/迁移验证，不与 Tauri 下载版共享会话。
-
 生成新的 Tauri macOS `.app` 和 DMG：
 
 ```bash
@@ -222,31 +205,9 @@ npm run build
 npm run release:package
 ```
 
-它会生成 `dist/DeepSeek-Code-<version>-arm64.dmg`、`SHA256SUMS.txt` 和 `release-metadata.json`。当前为 ad-hoc 社区构建；Developer ID 签名和公证将在发布硬化阶段接入 Tauri 产物。
+它会生成 `dist/DeepSeek-Code-<version>-arm64.dmg`、`SHA256SUMS.txt`、`release-metadata.json`、签名的 updater 包和 `latest.json`。当前为 ad-hoc 社区构建；Developer ID 签名和公证将在发布硬化阶段接入 Tauri 产物。
 
-旧 SwiftUI 工程仍可使用 Command Line Tools 编译；当前用户下载版通过 Tauri GitHub Release 发布 `.dmg`。旧版兼容发布仍可显式运行：
-
-```bash
-RELEASE_VERSION=0.1.0 \
-BUILD_NUMBER=1 \
-APPLE_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
-NOTARIZE=1 \
-./scripts/package-macos-release.sh
-```
-
-脚本会生成：
-
-- `DeepSeek-Code-<version>-arm64.dmg`：拖入 Applications 的安装包；
-- `SHA256SUMS.txt`：下载完整性校验；
-- `release-metadata.json`：版本、构建号、签名/公证状态。
-
-没有 Developer ID 时也可以发布 GitHub Release。该包会标记为 `github-adhoc`，用户首次打开可能需要右键“打开”，或在“系统设置 → 隐私与安全性”中确认。配置 Developer ID 后，包会标记为 `developer-id-signed-unnotarized`；同时配置公证凭据后，包会标记为 `developer-id-notarized`。
-
-GitHub Actions 在推送 `v*.*.*` 标签时自动执行 Swift 检查、SSH 回环验证、DMG 打包和 GitHub Release 上传。Developer ID 签名和 Apple 公证是可选增强项：
-
-`APPLE_CERTIFICATE_BASE64`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_TEAM_ID`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`。
-
-其中 `.p12` 证书只以 Base64 Secret 保存，不要提交到仓库。没有这些 Secrets 时，Actions 仍会发布 `github-adhoc` 下载包；只配置证书会发布已签名但未公证的包；配置证书和 Apple 公证凭据才会发布公证包。
+GitHub Actions 在推送 `v*.*.*` 标签时自动执行测试、Tauri DMG 打包、updater 签名包生成和 GitHub Release 上传。`TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 只以 GitHub Secrets 保存，不要提交到仓库。Developer ID 签名与 Apple 公证是后续发布硬化的可选增强项。
 
 本地发布工件可用以下命令验收：
 
@@ -260,14 +221,12 @@ npm run release:test
 shasum -a 256 -c SHA256SUMS.txt
 ```
 
-历史 Electron 代码的 Node 命令仍可用于迁移检查，但不代表正式 App 行为。
-
 ## DeepSeek 接入
 
 核心客户端使用 OpenAI-compatible Chat Completions 约定：
 
 - Base URL：`https://api.deepseek.com/v1/` 或用户自定义兼容端点。
-- API Key：仅通过 Swift 原生端 Keychain/受保护 Secret Store 保存；不要写入仓库、日志、SQLite 或 UI 事件。
+- API Key：仅通过 macOS Keychain/受保护 Secret Store 保存；不要写入仓库、日志、会话事件或 UI 事件。
 - 主 Agent 使用高能力模型；Explore、摘要和轻量任务可路由至更快模型。
 - 每个请求均应设置按功能区分的 `max_tokens`，并记录输入、缓存输入、输出 Token 与费用。
 
@@ -320,22 +279,16 @@ flowchart LR
 
 ## 验证
 
-当前测试覆盖权限策略、使用量计费、Session 事件回放、SQLite 存储、DeepSeek/OpenAI-compatible SSE、工作区隔离、Agent 审批状态机、Git Worktree 和关键 UI 交互。
+当前测试覆盖权限策略、使用量计费、Session 事件回放、JSONL 会话事件日志、DeepSeek/OpenAI-compatible SSE、工作区隔离、Agent 审批状态机、Git Worktree 和关键 UI 交互。
 
 建议在改动 Runtime 前至少运行：
 
 ```bash
-cd macos/DeepSeekCode
-swift build --jobs 2
-swift run --jobs 2 DeepSeekCodeChecks
-swift run --jobs 2 DeepSeekCodeRuntimeV2Checks
-swift run --jobs 2 DeepSeekCodeHarnessChecks
-swift run --jobs 2 DeepSeekCodeDaemonChecks
-swift run --jobs 2 DeepSeekCodeWorkerChecks
-swift run --jobs 2 DeepSeekCodeCLIChecks
+npx vitest run tests
+npm run test:sidecar
+npm run lint
+npm run typecheck
 ```
-
-SSH loopback 检查需要设置 `DEEPSEEK_TOOLHOST_PATH`；未设置时会明确跳过，不会被计为通过。
 
 ## 仓库结构
 
