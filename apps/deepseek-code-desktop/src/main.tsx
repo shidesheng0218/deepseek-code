@@ -7,7 +7,8 @@ import { canSubmitTask, shouldRenderFrame, submitActionLabel } from "./interacti
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; fastModel?: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
-type SessionSummary = { sessionId: string; title: string; updatedAt: number }
+type SessionSummary = { sessionId: string; title: string; updatedAt: number; projectPath: string }
+type UsageStats = { sessions: number; messages: number; totalTokens: number; inputTokens: number; outputTokens: number; cachedTokens: number; activeDays: number; currentStreak: number; longestStreak: number; peakHour: number | null; favoriteModel: string | null; dailyActivity: number[]; dailyStart: string | null; modelTokens: { model: string; tokens: number }[] }
 type RestoredMessage = { role: "user" | "assistant"; text: string }
 type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; inputID?: string; preview?: string; name?: string; names?: string[]; warnings?: string[] }; result?: { text?: string; status?: string }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
@@ -54,6 +55,89 @@ function ToolActivityGroup({ activities }: { activities: Message[] }) {
   </details>
 }
 
+function formatTokens(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  return String(value)
+}
+
+const STAT_RANGES = [{ key: "all", label: "全部", days: undefined }, { key: "30d", label: "30 天", days: 30 }, { key: "7d", label: "7 天", days: 7 }] as const
+type StatRangeKey = typeof STAT_RANGES[number]["key"]
+
+const QUICK_ACTIONS = [
+  { icon: "🐞", label: "修复 Bug", prompt: "定位并修复当前项目中最严重的一个问题，修复后运行相关测试验证。" },
+  { icon: "🔍", label: "理解代码", prompt: "梳理当前项目的整体架构，说明核心模块的职责和它们之间的交互。" },
+  { icon: "🌐", label: "联网研究", prompt: "联网查询本项目主要依赖的最新官方文档，总结与当前版本相关的重要变化。" },
+  { icon: "✅", label: "运行测试", prompt: "运行当前项目的测试套件，分析失败用例的根因并修复。" },
+]
+
+function Heatmap({ stats }: { stats: UsageStats }) {
+  const cells = stats.dailyActivity
+  const max = Math.max(1, ...cells)
+  const padded = [...cells]
+  while (padded.length % 7 !== 0) padded.push(0)
+  const weeks: number[][] = []
+  for (let index = 0; index < padded.length; index += 7) weeks.push(padded.slice(index, index + 7))
+  return <div className="heatmap" role="img" aria-label="活动热力图">
+    {weeks.map((week, weekIndex) => <div className="heatmap-week" key={weekIndex}>{week.map((count, dayIndex) => {
+      const level = count === 0 ? 0 : Math.min(4, 1 + Math.floor((count / max) * 3.999))
+      return <i key={dayIndex} className={`heatmap-cell level-${level}`} title={`${count} 个事件`} />
+    })}</div>)}
+  </div>
+}
+
+function StatsPanel({ stats, range, onRangeChange }: { stats: UsageStats | null; range: StatRangeKey; onRangeChange: (next: StatRangeKey) => void }) {
+  const [tab, setTab] = useState<"overview" | "models">("overview")
+  if (!stats) return null
+  const cards: { label: string; value: string }[] = [
+    { label: "会话", value: String(stats.sessions) },
+    { label: "消息", value: stats.messages.toLocaleString() },
+    { label: "总 Token", value: formatTokens(stats.totalTokens) },
+    { label: "活跃天数", value: String(stats.activeDays) },
+    { label: "当前连续", value: stats.currentStreak > 0 ? `${stats.currentStreak} 天` : "—" },
+    { label: "最长连续", value: stats.longestStreak > 0 ? `${stats.longestStreak} 天` : "—" },
+    { label: "高峰时段", value: stats.peakHour !== null ? `${stats.peakHour}:00` : "—" },
+    { label: "常用模型", value: stats.favoriteModel ?? "—" },
+  ]
+  const maxModelTokens = Math.max(1, ...stats.modelTokens.map((row) => row.tokens))
+  const books = Math.floor(stats.totalTokens / 1_000_000)
+  return <section className="stats-card">
+    <header className="stats-header">
+      <nav className="stats-tabs">
+        <button type="button" className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>概览</button>
+        <button type="button" className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}>模型</button>
+      </nav>
+      <nav className="stats-ranges">{STAT_RANGES.map((item) => <button key={item.key} type="button" className={range === item.key ? "active" : ""} onClick={() => onRangeChange(item.key)}>{item.label}</button>)}</nav>
+    </header>
+    {tab === "overview" && <>
+      <div className="stats-grid">{cards.map((card) => <div className="stat-card" key={card.label}><span>{card.label}</span><strong>{card.value}</strong></div>)}</div>
+      <Heatmap stats={stats} />
+      <p className="stats-fun">{books >= 1 ? `你的累计 Token 用量已超过 ${books} 本《红楼梦》。` : stats.totalTokens > 0 ? `累计 ${formatTokens(stats.totalTokens)} Token——再努力一点就赶上一本《红楼梦》了。` : "还没有 Token 记录，从第一个任务开始积累。"}</p>
+    </>}
+    {tab === "models" && <div className="model-rows">
+      {stats.modelTokens.length === 0 && <p className="stats-fun">暂无模型用量数据。</p>}
+      {stats.modelTokens.map((row) => <div className="model-row" key={row.model}><span className="model-name" title={row.model}>{row.model}</span><div className="model-bar"><i style={{ width: `${Math.max(2, (row.tokens / maxModelTokens) * 100)}%` }} /></div><span className="model-tokens">{formatTokens(row.tokens)}</span></div>)}
+    </div>}
+  </section>
+}
+
+function projectGroupName(projectPath: string): string {
+  if (!projectPath) return "未关联项目"
+  const parts = projectPath.split("/").filter(Boolean)
+  return parts.at(-1) ?? projectPath
+}
+
+function groupSessionsByProject(sessions: SessionSummary[]): { name: string; sessions: SessionSummary[] }[] {
+  const groups = new Map<string, SessionSummary[]>()
+  for (const session of sessions) {
+    const name = projectGroupName(session.projectPath)
+    const existing = groups.get(name) ?? []
+    existing.push(session)
+    groups.set(name, existing)
+  }
+  return [...groups.entries()].map(([name, grouped]) => ({ name, sessions: grouped }))
+}
+
 const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", fastModel: "", projectPath: "", apiKey: "", protocol: "openai-compatible" }
 
 function newSessionID(): string { return `session-${Date.now()}` }
@@ -76,11 +160,29 @@ function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [usage, setUsage] = useState<Usage>({ input: 0, output: 0, cached: 0 })
   const [currentRoute, setCurrentRoute] = useState<string>("")
+  const [stats, setStats] = useState<UsageStats | null>(null)
+  const [statsRange, setStatsRange] = useState<StatRangeKey>("all")
   const seenFrameIDs = useRef(new Set<string>())
 
   async function refreshSessions() {
     const summaries = await invoke<SessionSummary[]>("list_sessions")
     setSessions(summaries)
+  }
+
+  async function refreshStats(range: StatRangeKey = statsRange) {
+    const days = STAT_RANGES.find((item) => item.key === range)?.days
+    const result = await invoke<UsageStats>("usage_stats", { days: days ?? null })
+    setStats(result)
+  }
+
+  function changeStatsRange(range: StatRangeKey) {
+    setStatsRange(range)
+    void refreshStats(range).catch(() => undefined)
+  }
+
+  function applyQuickAction(actionPrompt: string) {
+    setPrompt(actionPrompt)
+    document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus()
   }
 
   async function openSession(nextSessionID: string) {
@@ -112,6 +214,7 @@ function App() {
         setBuildStamp(stamp)
         setSettings({ ...defaults, ...saved, protocol: saved.protocol || defaults.protocol })
         setSessions(summaries)
+        void refreshStats().catch(() => undefined)
         const stored = initialSessionID()
         const restore = summaries.some((session) => session.sessionId === stored) ? stored : summaries[0]?.sessionId
         if (restore) await openSession(restore)
@@ -222,7 +325,7 @@ function App() {
         setBusy(false)
       } else if (runtimeEvent.type === "completed" || runtimeEvent.type === "turn_ended") {
         setBusy(false)
-        if (runtimeEvent.type === "turn_ended") void refreshSessions()
+        if (runtimeEvent.type === "turn_ended") { void refreshSessions(); void refreshStats().catch(() => undefined) }
       }
     })
     return () => { disposed = true; void unlisten.then((stop) => stop()) }
@@ -269,15 +372,22 @@ function App() {
       <div className="brand"><span>◆</span><strong>DeepSeek Code</strong></div>
       <button className="new-session" type="button" onClick={beginNewSession}>＋ 新建任务</button>
       <nav><button className="active" type="button">会话</button><button type="button" onClick={() => setShowSettings(true)}>设置</button><button type="button">终端</button><button type="button">用量</button></nav>
-      <div className="session-list" aria-label="已保存会话">{sessions.slice(0, 8).map((session) => <button key={session.sessionId} className={session.sessionId === sessionID ? "active-session" : ""} type="button" onClick={() => void openSession(session.sessionId)} title={session.title}>{session.title}</button>)}</div>
+      <div className="session-list" aria-label="已保存会话">{groupSessionsByProject(sessions.slice(0, 24)).map((group) => <div className="session-group" key={group.name}>
+        <p className="session-group-name">{group.name}</p>
+        {group.sessions.map((session) => <button key={session.sessionId} className={session.sessionId === sessionID ? "active-session" : ""} type="button" onClick={() => void openSession(session.sessionId)} title={session.title}>{session.title}</button>)}
+      </div>)}</div>
       <div className="privacy">本地优先 · 凭据保存在 Keychain</div>
     </aside>
     <section className="workspace">
-      <header><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "准备开始一个任务"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
+      <header><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "✦ 接下来做点什么？"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
       {(usage.input > 0 || usage.output > 0 || currentRoute) && <div className="usage-bar">{currentRoute && <span className="route-chip">{currentRoute}</span>}<span>输入 {usage.input.toLocaleString()}{usage.cached > 0 ? `（缓存 ${usage.cached.toLocaleString()}）` : ""}</span><span>输出 {usage.output.toLocaleString()}</span><span>模型 {settings.model}{settings.fastModel ? ` · 快速 ${settings.fastModel}` : ""}</span></div>}
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
       <section className="conversation" aria-live="polite">
-        {!messages.length && <div className="welcome-card"><h2>自己的轻量编码工作台</h2><p>描述一个问题，DeepSeek Code 会在当前项目中理解、修改并验证。公开只读研究自动执行；写入和外部交付仍受控。</p><button type="button" onClick={() => setShowSettings(true)}>配置项目与模型</button></div>}
+        {!messages.length && <>
+          {(!settings.apiKey.trim() || !settings.projectPath.trim()) && <div className="welcome-card"><h2>自己的轻量编码工作台</h2><p>描述一个问题，DeepSeek Code 会在当前项目中理解、修改并验证。公开只读研究自动执行；写入和外部交付仍受控。</p><button type="button" onClick={() => setShowSettings(true)}>配置项目与模型</button></div>}
+          <StatsPanel stats={stats} range={statsRange} onRangeChange={changeStatsRange} />
+          <div className="quick-actions">{QUICK_ACTIONS.map((action) => <button key={action.label} type="button" onClick={() => applyQuickAction(action.prompt)}><span>{action.icon}</span>{action.label}</button>)}</div>
+        </>}
         {groupConversation(messages).map((item) => item.kind === "toolGroup"
           ? <ToolActivityGroup key={item.key} activities={item.activities} />
           : <article className={`message ${item.message.role} ${item.message.kind ?? ""}`} key={item.key}><span className="message-label">{item.message.role === "user" ? "你" : item.message.role === "tool" ? "Runtime" : item.message.role === "system" ? "系统" : "DeepSeek"}</span><div>{item.message.text}</div></article>)}

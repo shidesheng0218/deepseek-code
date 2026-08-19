@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use chrono::Timelike;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
@@ -32,7 +34,30 @@ struct RestoredMessage { role: String, text: String }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionSummary { session_id: String, title: String, updated_at: u64 }
+struct SessionSummary { session_id: String, title: String, updated_at: u64, project_path: String }
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageStats {
+    sessions: u64,
+    messages: u64,
+    total_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    active_days: u64,
+    current_streak: u64,
+    longest_streak: u64,
+    peak_hour: Option<u32>,
+    favorite_model: Option<String>,
+    daily_activity: Vec<u64>,
+    daily_start: Option<String>,
+    model_tokens: Vec<ModelTokens>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelTokens { model: String, tokens: u64 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +159,17 @@ fn session_title(events: &str, fallback: &str) -> String {
     fallback.into()
 }
 
+fn session_project(events: &str) -> String {
+    for line in events.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("turn_started") { continue; }
+        if let Some(project) = event.get("payload").and_then(|value| value.get("projectPath")).and_then(serde_json::Value::as_str) {
+            return project.into();
+        }
+    }
+    String::new()
+}
+
 fn list_session_summaries() -> Vec<SessionSummary> {
     let Ok(entries) = fs::read_dir(sessions_path()) else { return Vec::new(); };
     let mut sessions = entries.filter_map(Result::ok).filter_map(|entry| {
@@ -142,10 +178,95 @@ fn list_session_summaries() -> Vec<SessionSummary> {
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") || !is_safe_session_id(&session_id) { return None; }
         let events = fs::read_to_string(&path).ok()?;
         let updated_at = entry.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        Some(SessionSummary { title: session_title(&events, &session_id), session_id, updated_at })
+        Some(SessionSummary { title: session_title(&events, &session_id), project_path: session_project(&events), session_id, updated_at })
     }).collect::<Vec<_>>();
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions
+}
+
+fn compute_usage_stats(days: Option<u32>) -> UsageStats {
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let cutoff = days.map(|value| today - chrono::Duration::days(i64::from(value)));
+    let mut stats = UsageStats {
+        sessions: 0, messages: 0, total_tokens: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0,
+        active_days: 0, current_streak: 0, longest_streak: 0, peak_hour: None, favorite_model: None,
+        daily_activity: Vec::new(), daily_start: None, model_tokens: Vec::new(),
+    };
+    let mut day_set = std::collections::BTreeSet::new();
+    let mut daily: HashMap<chrono::NaiveDate, u64> = HashMap::new();
+    let mut hours = [0u64; 24];
+    let mut models: HashMap<String, u64> = HashMap::new();
+    let Ok(entries) = fs::read_dir(sessions_path()) else { return stats; };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") { continue; }
+        let Some(session_id) = path.file_stem().and_then(|value| value.to_str()) else { continue; };
+        if !is_safe_session_id(session_id) { continue; }
+        let Ok(events) = fs::read_to_string(&path) else { continue; };
+        let mut counted_in_window = false;
+        for line in events.lines() {
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+            let Some(created) = event.get("createdAt").and_then(serde_json::Value::as_str)
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()) else { continue; };
+            let local = created.with_timezone(&chrono::Local);
+            let day = local.date_naive();
+            if cutoff.is_some_and(|limit| day < limit) { continue; }
+            counted_in_window = true;
+            *daily.entry(day).or_default() += 1;
+            day_set.insert(day);
+            let payload = event.get("payload");
+            match event.get("type").and_then(serde_json::Value::as_str) {
+                Some("turn_started") => {
+                    stats.messages += 1;
+                    hours[local.hour() as usize] += 1;
+                }
+                Some("turn_ended") => { stats.messages += 1; }
+                Some("usage_recorded") => {
+                    let number = |key: &str| payload.and_then(|value| value.get(key)).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let input = number("inputTokens");
+                    let output = number("outputTokens");
+                    stats.input_tokens += input;
+                    stats.output_tokens += output;
+                    stats.cached_tokens += number("cachedInputTokens");
+                    stats.total_tokens += input + output;
+                    if let Some(model) = payload.and_then(|value| value.get("model")).and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
+                        *models.entry(model.to_string()).or_default() += input + output;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if counted_in_window { stats.sessions += 1; }
+    }
+    stats.active_days = day_set.len() as u64;
+    let heatmap_start = today - chrono::Duration::days(139);
+    stats.daily_start = Some(heatmap_start.to_string());
+    stats.daily_activity = (0..140).map(|offset| daily.get(&(heatmap_start + chrono::Duration::days(offset))).copied().unwrap_or(0)).collect();
+    let streak_from = |anchor: chrono::NaiveDate| -> u64 {
+        let mut streak = 0;
+        let mut day = anchor;
+        while day_set.contains(&day) { streak += 1; day -= chrono::Duration::days(1); }
+        streak
+    };
+    stats.current_streak = if day_set.contains(&today) { streak_from(today) } else { streak_from(today - chrono::Duration::days(1)) };
+    let mut longest = 0u64;
+    let mut run = 0u64;
+    let mut previous: Option<chrono::NaiveDate> = None;
+    for day in &day_set {
+        run = if previous.is_some_and(|value| *day == value + chrono::Duration::days(1)) { run + 1 } else { 1 };
+        longest = longest.max(run);
+        previous = Some(*day);
+    }
+    stats.longest_streak = longest;
+    stats.peak_hour = hours.iter().enumerate().max_by_key(|(_, count)| *count).and_then(|(hour, count)| (*count > 0).then_some(hour as u32));
+    stats.favorite_model = models.iter().max_by_key(|(_, tokens)| *tokens).map(|(model, _)| model.clone());
+    stats.model_tokens = {
+        let mut rows = models.into_iter().map(|(model, tokens)| ModelTokens { model, tokens }).collect::<Vec<_>>();
+        rows.sort_by(|left, right| right.tokens.cmp(&left.tokens));
+        rows
+    };
+    stats
 }
 
 fn keychain_service() -> &'static str { "com.deepseekcode.desktop.api-key" }
@@ -193,6 +314,9 @@ fn load_settings() -> Result<RuntimeSettings, String> {
 
 #[tauri::command]
 fn list_sessions() -> Vec<SessionSummary> { list_session_summaries() }
+
+#[tauri::command]
+fn usage_stats(days: Option<u32>) -> UsageStats { compute_usage_stats(days) }
 
 #[tauri::command]
 fn load_session_history(session_id: String) -> Result<Vec<RestoredMessage>, String> {
@@ -304,7 +428,7 @@ fn main() {
         .manage(RuntimeProcess(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, load_session_history, run_agent, resolve_approval, cancel_session, resume_session, check_for_update])
+        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, usage_stats, load_session_history, run_agent, resolve_approval, cancel_session, resume_session, check_for_update])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
 }
@@ -331,5 +455,48 @@ mod tests {
     #[test]
     fn exposes_a_non_empty_build_stamp() {
         assert!(build_stamp_value().contains('-'));
+    }
+
+    #[test]
+    fn aggregates_usage_stats_from_session_event_logs() {
+        let temp = std::env::temp_dir().join(format!("deepseek-stats-test-{}", std::process::id()));
+        let sessions = temp.join("Library/Application Support/DeepSeekCode/sessions");
+        fs::create_dir_all(&sessions).expect("create temp sessions dir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &temp);
+        let now = chrono::Local::now();
+        let old = now - chrono::Duration::days(40);
+        let event = |created: chrono::DateTime<chrono::Local>, kind: &str, payload: &str| {
+            format!("{{\"type\":\"{kind}\",\"payload\":{payload},\"createdAt\":\"{}\"}}", created.to_rfc3339())
+        };
+        let lines = [
+            event(now, "turn_started", "{\"prompt\":\"修复登录问题\",\"projectPath\":\"/tmp/demo\"}"),
+            event(now, "usage_recorded", "{\"inputTokens\":100,\"outputTokens\":50,\"cachedInputTokens\":10,\"model\":\"deepseek-chat\"}"),
+            event(now, "turn_ended", "{\"status\":\"completed\"}"),
+            event(now, "turn_started", "{\"prompt\":\"第二个问题\"}"),
+            event(old, "turn_started", "{\"prompt\":\"旧问题\"}"),
+        ];
+        fs::write(sessions.join("session-stats-fixture.jsonl"), lines.join("\n")).expect("write fixture events");
+
+        let all = compute_usage_stats(None);
+        assert_eq!(all.sessions, 1);
+        assert_eq!(all.messages, 4);
+        assert_eq!(all.total_tokens, 150);
+        assert_eq!(all.cached_tokens, 10);
+        assert_eq!(all.active_days, 2);
+        assert_eq!(all.favorite_model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(all.model_tokens.first().map(|row| row.model.as_str()), Some("deepseek-chat"));
+        assert_eq!(all.daily_activity.len(), 140);
+        assert_eq!(all.daily_activity.iter().sum::<u64>(), 5);
+        assert!(all.current_streak >= 1);
+        assert!(all.longest_streak >= 1);
+        assert_eq!(all.peak_hour, Some(now.hour()));
+
+        let recent = compute_usage_stats(Some(30));
+        assert_eq!(recent.messages, 3);
+        assert_eq!(recent.active_days, 1);
+
+        if let Some(value) = previous_home { std::env::set_var("HOME", value); }
+        let _ = fs::remove_dir_all(&temp);
     }
 }

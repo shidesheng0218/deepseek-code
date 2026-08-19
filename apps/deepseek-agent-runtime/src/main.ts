@@ -79,9 +79,9 @@ type CIRepairLineage = Pick<CIRepairSession, "sessionID" | "parentSessionID" | "
 type ExecuteResult = { text: string; status: string; messages: AgentMessage[]; delivery?: string; repairLineage?: CIRepairLineage }
 type RuntimeEvent =
   | AgentExecutorEvent
-  | { type: "turn_started"; prompt: string }
+  | { type: "turn_started"; prompt: string; projectPath?: string }
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
-  | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number }
+  | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "ci_status"; commit: string; currentRunCount: number; staleRunCount: number; passed: boolean }
@@ -882,7 +882,8 @@ function streamModel(sessionID: string, client: StreamingProvider, model: string
           type: "usage_recorded",
           inputTokens: event.inputTokens,
           cachedInputTokens: event.cachedInputTokens,
-          outputTokens: event.outputTokens
+          outputTokens: event.outputTokens,
+          model
         })
       }
     }
@@ -925,7 +926,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
   if (runtimeContext.hooks.sessionStart.length > 0) {
     void runHook(runtimeContext.hooks.sessionStart, "sessionStart", { sessionID, projectPath }, projectPath, shellCommand()).catch(() => undefined)
   }
-  await emitSessionEvent(sessionID, { type: "turn_started", prompt })
+  await emitSessionEvent(sessionID, { type: "turn_started", prompt, projectPath })
   await emitSessionEvent(sessionID, { type: "decision_made", route: decision.route, modelTier: decision.modelTier, responseContract: decision.responseContract })
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
