@@ -38,10 +38,9 @@ cask "deepseek-code" do
   app "DeepSeek Code.app"
 
   caveats <<~EOS
-    DeepSeek Code 社区构建使用 adhoc 签名（未购买 Apple Developer ID）。
-    首次启动前执行一次：
-      xattr -dr com.apple.quarantine "/Applications/DeepSeek Code.app"
-    或在 Finder 中右键 App 选择"打开"。之后正常使用，自动更新不受影响。
+    DeepSeek Code 为 adhoc 签名的社区构建。通过 Homebrew 安装的应用不经过
+    浏览器隔离，双击即可启动，无需任何额外操作；内置自动更新同样不受影响。
+    仅当从浏览器直接下载 DMG 安装时，首次需在 Finder 右键 App 选择"打开"一次。
   EOS
 
   zap trash: [
