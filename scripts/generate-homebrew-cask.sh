@@ -37,6 +37,13 @@ cask "deepseek-code" do
 
   app "DeepSeek Code.app"
 
+  caveats <<~EOS
+    DeepSeek Code 社区构建使用 adhoc 签名（未购买 Apple Developer ID）。
+    首次启动前执行一次：
+      xattr -dr com.apple.quarantine "/Applications/DeepSeek Code.app"
+    或在 Finder 中右键 App 选择"打开"。之后正常使用，自动更新不受影响。
+  EOS
+
   zap trash: [
     "~/Library/Application Support/DeepSeekCode",
     "~/Library/Application Support/deepseek-code-desktop",

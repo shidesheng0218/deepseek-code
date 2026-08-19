@@ -51,10 +51,11 @@ flowchart LR
 brew tap shidesheng0218/tap
 brew trust shidesheng0218/tap
 brew install --cask shidesheng0218/tap/deepseek-code
+xattr -dr com.apple.quarantine "/Applications/DeepSeek Code.app"
 ```
 
 新版 Homebrew 对第三方 tap 的 Cask 要求先执行一次 `brew trust`。
-Homebrew 安装时自动剥离 quarantine 属性，**双击即用，不需要右键绕过 Gatekeeper**，也不需要 Apple 公证。之后用 `brew upgrade --cask deepseek-code` 升级；`brew uninstall --cask --zap deepseek-code` 可连同会话与设置数据一起删除。App 内置的自动更新与 brew 升级二选一即可。
+Homebrew 6 起不再处理 quarantine 属性，因此首次启动前需要执行一次上面的 `xattr` 命令（或在 Finder 里右键 App 选择"打开"），**只需一次**，之后双击即用。之后用 `brew upgrade --cask deepseek-code` 升级；`brew uninstall --cask --zap deepseek-code` 可连同会话与设置数据一起删除。App 内置的自动更新与 brew 升级二选一即可。
 
 ### 方式二：DMG 手动安装
 
