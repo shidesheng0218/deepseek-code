@@ -212,7 +212,7 @@ GitHub Actions 在推送 `v*.*.*` 标签时自动执行测试、Tauri DMG 打包
 本地发布工件可用以下命令验收：
 
 ```bash
-npm run release:test
+npm run release:verify
 ```
 
 下载 GitHub Release 后，用户可校验：
