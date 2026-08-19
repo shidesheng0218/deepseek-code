@@ -382,7 +382,7 @@ function App() {
       <header><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "✦ 接下来做点什么？"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
       {(usage.input > 0 || usage.output > 0 || currentRoute) && <div className="usage-bar">{currentRoute && <span className="route-chip">{currentRoute}</span>}<span>输入 {usage.input.toLocaleString()}{usage.cached > 0 ? `（缓存 ${usage.cached.toLocaleString()}）` : ""}</span><span>输出 {usage.output.toLocaleString()}</span><span>模型 {settings.model}{settings.fastModel ? ` · 快速 ${settings.fastModel}` : ""}</span></div>}
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
-      <section className="conversation" aria-live="polite">
+      <section className={messages.length ? "conversation" : "conversation home"} aria-live="polite">
         {!messages.length && <>
           {(!settings.apiKey.trim() || !settings.projectPath.trim()) && <div className="welcome-card"><h2>自己的轻量编码工作台</h2><p>描述一个问题，DeepSeek Code 会在当前项目中理解、修改并验证。公开只读研究自动执行；写入和外部交付仍受控。</p><button type="button" onClick={() => setShowSettings(true)}>配置项目与模型</button></div>}
           <StatsPanel stats={stats} range={statsRange} onRangeChange={changeStatsRange} />
