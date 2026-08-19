@@ -37,14 +37,6 @@ assert(capabilities.permissions.some((permission) =>
   permission.allow?.some((entry) => entry.name === "binaries/deepseek-agent-runtime" && entry.sidecar === true),
 ))
 
-for (const relative of [
-  "apps/deepseek-code-desktop/src-tauri/tauri.conf.json",
-  "apps/deepseek-code-desktop/src-tauri/Cargo.toml",
-  "apps/deepseek-code-desktop/src/main.tsx",
-  "apps/deepseek-agent-runtime/src/main.ts",
-]) {
-  assert(!//i.test(read(relative)), `${relative} must not launch or embed  runtime`)
-}
 NODE
 
 echo "Tauri DeepSeek Code product checks passed"

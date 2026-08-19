@@ -71,25 +71,12 @@ brew install --cask shidesheng0218/tap/deepseek-code
 
 ## 当前产品真源
 
-正式产品是 **DeepSeek Code.app**：由 **Tauri 2 + 本地 Agent Sidecar** 组成的轻量 macOS 桌面应用。`npm run dev`、构建脚本和 GitHub Release 都只启动或打包 DeepSeek Code，而不会启动 ，也不要求最终用户安装 Node、Bun 或 Swift。
+正式产品是 **DeepSeek Code.app**：由 **Tauri 2 + 本地 Agent Sidecar** 组成的轻量 macOS 桌面应用。`npm run dev`、构建脚本和 GitHub Release 都只启动或打包 DeepSeek Code，不要求最终用户安装 Node、Bun 或 Swift。
 
 - `apps/deepseek-code-desktop`：Tauri 2 桌面壳、自有 React 界面、应用权限和 DMG 打包配置。
 - `apps/deepseek-agent-runtime`：随应用分发的本地 Agent Sidecar；负责会话、模型和工具协议，最终用户不需要安装 Bun。
 - `macos/DeepSeekCode`：旧 SwiftUI 版本和迁移参考；在 Tauri 版完成能力迁移前保留为开发回退。
-- `vendor/`：固定版本的  上游参考源码；仅用于移植经过审查的交互、工具协议、Provider/MCP/LSP 兼容与测试逻辑。
-- `integrations/`：上游差异分析、许可说明与移植清单；不保存运行时凭据，也不作为用户入口。
 - `src/`：更早的 Electron/React 实现，仅保留作迁移与兼容参考。
-
-##  上游参考与复用边界
-
- 的 `dev` 分支固定在 `vendor/`，作为 DeepSeek Code 的上游工程参考。它**不会作为 DeepSeek Code 的运行时或用户入口**，也不会以 .app 的名义启动或分发。
-
-复用遵循“语义移植、产品自有”的边界：
-
-- 借鉴并移植：多轮 Turn/Step、Inbox、安全的工具调用协议、Provider 与 MCP/LSP 适配语义、上下文压缩、权限体验和 E2E Fixture。
-- DeepSeek Code 自行实现：Tauri 界面、Agent Sidecar、Session/Event/Evidence、Keychain、Sandbox、发布签名和 GitHub DMG。
-- 不复用为运行时： Desktop、 CLI、Node/Bun Agent Loop、 用户配置或其凭据存储。
-- 每次移植都保留 MIT 许可、写入 DeepSeek Code 自有测试，并且必须经过安全与 API 边界审查。
 
 ## 当前实现
 

@@ -177,7 +177,7 @@ public actor DaemonSessionExecutionDriver: SessionExecutionDriver {
         await finish(sessionID: session.id, runID: runID)
     }
 
-    /// Mirrors 's serial prompt queue: once a turn reaches a durable
+    /// Serial prompt queue: once a turn reaches a durable
     /// boundary, immediately claim and run the next accepted primary input.
     /// The next `start` call remains idempotent, so an overlapping GUI/CLI
     /// request cannot create a second concurrent model turn.

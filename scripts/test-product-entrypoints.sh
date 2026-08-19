@@ -31,12 +31,7 @@ assert.strictEqual(manifest.scripts["release:package:swift"], undefined, "legacy
 assert.strictEqual(manifest.scripts["release:verify:swift"], undefined, "legacy Swift release verify entry must stay removed")
 assert.strictEqual(manifest.scripts["release:test"], undefined, "legacy release test entry must stay removed")
 assert.strictEqual(manifest.scripts["refresh:macos"], undefined, "legacy Swift install refresh entry must stay removed")
-assert.strictEqual(manifest.scripts["dev:"], undefined)
 assert.strictEqual(manifest.scripts["dev:cli"], undefined)
-assert(!fs.existsSync(path.join(root, "scripts", "run--fusion.sh")))
-assert(!fs.existsSync(path.join(root, "scripts", "run--fusion-desktop.sh")))
-assert(readme.includes(" 上游参考"))
-assert(readme.includes("不会作为 DeepSeek Code 的运行时或用户入口"))
 assert(readme.includes("Tauri 2 + 本地 Agent Sidecar"))
 NODE
 

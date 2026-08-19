@@ -183,7 +183,7 @@ struct DeepSeekCodeDaemonChecks {
         precondition(executedParts == ["补充约束：保留对外 API", "通过 daemon 执行"])
         precondition(executionInputState == .consumed)
 
-        // -style prompt queues drain serially. A second user message
+        // Prompt queues drain serially. A second user message
         // admitted while a session is active must become the next turn without
         // requiring the GUI to issue another `start` command.
         let queuedSession = try repository.createSession(projectID: project.id, title: "Daemon queued execution", mode: .acceptEdits)
