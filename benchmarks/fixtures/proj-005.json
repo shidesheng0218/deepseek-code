@@ -1,0 +1,10 @@
+{
+  "id": "proj-005",
+  "category": "project_question",
+  "prompt": "当前工作区的 CI 配置文件在哪里？",
+  "mockReply": "我来定位 CI 配置。",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0
+  }
+}

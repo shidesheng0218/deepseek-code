@@ -1,0 +1,10 @@
+{
+  "id": "code-004",
+  "category": "code_change",
+  "prompt": "把这个 class 组件重构成函数组件。",
+  "mockReply": "我来重构组件。",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "web-006",
+  "category": "web_research",
+  "prompt": "look up the latest vitest migration guide",
+  "mockReply": "I will look it up.",
+  "expect": {
+    "route": "web_research",
+    "maxApprovals": 0
+  }
+}

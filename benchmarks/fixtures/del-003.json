@@ -1,0 +1,10 @@
+{
+  "id": "del-003",
+  "category": "delivery",
+  "prompt": "总结这个分支的变更并交付。",
+  "mockReply": "我来总结变更。",
+  "expect": {
+    "route": "delivery",
+    "maxApprovals": 0
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "qa-008",
+  "category": "direct_answer",
+  "prompt": "快速排序的平均时间复杂度是多少？",
+  "mockReply": "O(n log n)。",
+  "expect": {
+    "route": "direct_answer",
+    "maxApprovals": 0,
+    "noToolCalls": true
+  }
+}

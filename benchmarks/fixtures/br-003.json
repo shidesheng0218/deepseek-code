@@ -1,0 +1,10 @@
+{
+  "id": "br-003",
+  "category": "browser_fix",
+  "prompt": "修复登录页在浏览器里样式错位的问题。",
+  "mockReply": "我来修样式。",
+  "expect": {
+    "route": "browser_fix",
+    "maxApprovals": 0
+  }
+}

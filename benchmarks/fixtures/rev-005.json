@@ -1,0 +1,10 @@
+{
+  "id": "rev-005",
+  "category": "review",
+  "prompt": "review the diff for potential race conditions",
+  "mockReply": "I will review the diff.",
+  "expect": {
+    "route": "review",
+    "maxApprovals": 0
+  }
+}

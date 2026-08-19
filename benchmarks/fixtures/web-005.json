@@ -1,0 +1,10 @@
+{
+  "id": "web-005",
+  "category": "web_research",
+  "prompt": "查一下 GitHub 托管 runner 的最新 macos 镜像。",
+  "mockReply": "我来查镜像版本。",
+  "expect": {
+    "route": "web_research",
+    "maxApprovals": 0
+  }
+}

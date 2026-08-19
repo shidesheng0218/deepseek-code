@@ -1,0 +1,10 @@
+{
+  "id": "ci-005",
+  "category": "ci_repair",
+  "prompt": "CI 的 test 全部 fail 了，帮我定位。",
+  "mockReply": "我来分类失败原因。",
+  "expect": {
+    "route": "ci_repair",
+    "maxApprovals": 0
+  }
+}

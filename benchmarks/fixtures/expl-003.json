@@ -1,0 +1,10 @@
+{
+  "id": "expl-003",
+  "category": "exploration",
+  "prompt": "梳理这个项目的错误处理模式。",
+  "mockReply": "我来梳理错误处理。",
+  "expect": {
+    "route": "exploration",
+    "maxApprovals": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "ci-002",
+  "category": "ci_repair",
+  "prompt": "GitHub Actions 测试挂了，帮我看看。",
+  "mockReply": "我来读取 CI 状态。",
+  "expect": {
+    "route": "ci_repair",
+    "maxApprovals": 0
+  }
+}

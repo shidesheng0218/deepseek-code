@@ -1,0 +1,10 @@
+{
+  "id": "br-004",
+  "category": "browser_fix",
+  "prompt": "页面点击按钮没反应，修复一下。",
+  "mockReply": "我来排查点击事件。",
+  "expect": {
+    "route": "browser_fix",
+    "maxApprovals": 0
+  }
+}

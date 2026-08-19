@@ -1,0 +1,10 @@
+{
+  "id": "ci-006",
+  "category": "ci_repair",
+  "prompt": "ci 失败：打包步骤超时。",
+  "mockReply": "我来分析超时原因。",
+  "expect": {
+    "route": "ci_repair",
+    "maxApprovals": 0
+  }
+}

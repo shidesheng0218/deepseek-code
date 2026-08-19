@@ -1,0 +1,11 @@
+{
+  "id": "qa-005",
+  "category": "direct_answer",
+  "prompt": "把“hello world”翻译成中文。",
+  "mockReply": "你好，世界。",
+  "expect": {
+    "route": "direct_answer",
+    "maxApprovals": 0,
+    "noToolCalls": true
+  }
+}

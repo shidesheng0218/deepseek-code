@@ -6,3 +6,18 @@
 .approval { display: grid; gap: 8px; max-width: 560px; padding: 14px; border: 1px solid #98742f; border-radius: 10px; color: #fde7b0; background: rgba(120, 83, 16, .2); }.approval span { color: #d9c79d; font-size: 13px; }.approval div { display: flex; gap: 8px; }.approval button { border: 1px solid #6a5b3f; border-radius: 6px; padding: 7px 10px; color: #ece4d0; background: transparent; }.approval .allow { border-color: #248b77; color: #c6fff3; background: #125146; }
 .usage-bar { display: flex; align-items: center; gap: 16px; max-width: 900px; padding: 7px 12px; border: 1px solid #2b3140; border-radius: 8px; background: rgba(20, 25, 34, .6); color: #8490a3; font-size: 12px; }
 .usage-bar .route-chip { padding: 2px 8px; border: 1px solid #2f857e; border-radius: 99px; color: #9aecd8; background: #123a39; font-size: 11px; }
+.tool-group { justify-self: start; max-width: 84%; border: 1px solid #284e51; border-radius: 8px; background: rgba(18, 58, 57, .25); font-size: 13px; }
+.tool-group summary { display: flex; align-items: baseline; gap: 10px; padding: 7px 10px; cursor: pointer; list-style: none; }
+.tool-group summary::-webkit-details-marker { display: none; }
+.tool-group summary::before { content: "▸"; color: #5eead4; transition: transform .15s; }
+.tool-group[open] summary::before { transform: rotate(90deg); }
+.tool-group-title { color: #9aecd8; white-space: nowrap; }
+.tool-group-latest { overflow: hidden; color: #6f7b8e; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.tool-group-items { display: grid; gap: 4px; padding: 4px 10px 9px 24px; border-top: 1px solid #24404a; }
+.tool-group-item { color: #8fd9c8; font-size: 12px; }
+.approval header { display: flex; align-items: center; gap: 8px; }
+.risk-badge { padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 650; }
+.risk-badge.risk-l0, .risk-badge.risk-l1 { color: #9aecd8; background: #123a39; border: 1px solid #2f857e; }
+.risk-badge.risk-l2 { color: #fde7b0; background: rgba(120, 83, 16, .35); border: 1px solid #98742f; }
+.risk-badge.risk-l3, .risk-badge.risk-l4 { color: #fecaca; background: rgba(127, 29, 29, .4); border: 1px solid #b91c1c; }
+.approval-preview { display: block; max-height: 120px; overflow: auto; padding: 8px 10px; border: 1px solid #4a4030; border-radius: 6px; color: #e7dcc0; background: rgba(10, 12, 18, .55); font-size: 12px; white-space: pre-wrap; word-break: break-all; }

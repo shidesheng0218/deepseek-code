@@ -1,0 +1,10 @@
+{
+  "id": "rev-001",
+  "category": "review",
+  "prompt": "review 一下我这次提交的改动。",
+  "mockReply": "我来审查改动。",
+  "expect": {
+    "route": "review",
+    "maxApprovals": 0
+  }
+}

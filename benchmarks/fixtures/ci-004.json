@@ -1,0 +1,10 @@
+{
+  "id": "ci-004",
+  "category": "ci_repair",
+  "prompt": "流水线红了，处理一下。",
+  "mockReply": "我来定位失败任务。",
+  "expect": {
+    "route": "ci_repair",
+    "maxApprovals": 0
+  }
+}

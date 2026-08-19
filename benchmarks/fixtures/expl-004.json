@@ -1,0 +1,10 @@
+{
+  "id": "expl-004",
+  "category": "exploration",
+  "prompt": "帮我了解 User 类型定义在哪些文件。",
+  "mockReply": "我来了解 User 类型。",
+  "expect": {
+    "route": "exploration",
+    "maxApprovals": 0
+  }
+}

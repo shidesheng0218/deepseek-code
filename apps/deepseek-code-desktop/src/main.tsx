@@ -9,10 +9,50 @@ type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; fastModel?: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
 type SessionSummary = { sessionId: string; title: string; updatedAt: number }
 type RestoredMessage = { role: "user" | "assistant"; text: string }
-type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; inputID?: string }; result?: { text?: string; status?: string }; error?: string }
+type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; inputID?: string; preview?: string; name?: string; names?: string[]; warnings?: string[] }; result?: { text?: string; status?: string }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
-type Approval = { id: string; tool: string; risk: string }
+type Approval = { id: string; tool: string; risk: string; preview?: string }
 type Usage = { input: number; output: number; cached: number }
+
+type ConversationItem = { key: string } & (
+  | { kind: "message"; message: Message }
+  | { kind: "toolGroup"; activities: Message[] }
+)
+
+const TOOL_ACTIVITY_KINDS = new Set(["tool_requested", "tool_started", "tool_completed", "terminal_completed", "ssh_terminal_opened", "ssh_terminal_completed", "ssh_terminal_closed", "ssh_completed"])
+
+/** 连续的工具活动合并为一个可折叠分组，时间线保持干净。 */
+function groupConversation(messages: Message[]): ConversationItem[] {
+  const items: ConversationItem[] = []
+  let group: Message[] = []
+  const flush = () => {
+    if (group.length > 0) {
+      items.push({ key: `group-${items.length}`, kind: "toolGroup", activities: group })
+      group = []
+    }
+  }
+  messages.forEach((message, index) => {
+    if (message.role === "tool" && TOOL_ACTIVITY_KINDS.has(message.kind ?? "")) group.push(message)
+    else {
+      flush()
+      items.push({ key: `msg-${index}`, kind: "message", message })
+    }
+  })
+  flush()
+  return items
+}
+
+function ToolActivityGroup({ activities }: { activities: Message[] }) {
+  const failed = activities.filter((activity) => activity.kind === "tool_completed" && /失败|错误/.test(activity.text)).length
+  const latest = activities[activities.length - 1]?.text ?? ""
+  return <details className="tool-group">
+    <summary>
+      <span className="tool-group-title">工具活动 · {activities.length} 步{failed > 0 ? ` · ${failed} 个失败` : ""}</span>
+      <span className="tool-group-latest">{latest}</span>
+    </summary>
+    <div className="tool-group-items">{activities.map((activity, index) => <div className="tool-group-item" key={index}>{activity.text}</div>)}</div>
+  </details>
+}
 
 const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", fastModel: "", projectPath: "", apiKey: "", protocol: "openai-compatible" }
 
@@ -158,6 +198,13 @@ function App() {
         setMessages((current) => [...current, { role: "system", text: `恢复提示：${runtimeEvent.error ?? runtimeEvent.reason ?? "存在需要关注的中断状态"}`, kind: "error" }])
       } else if (runtimeEvent.type === "recovery_input_restored") {
         setMessages((current) => [...current, { role: "tool", text: "已恢复一条中断的输入，将继续处理。", kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "skill_invoked") {
+        setMessages((current) => [...current, { role: "tool", text: `已加载技能 /${runtimeEvent.name ?? ""}`, kind: runtimeEvent.type }])
+      } else if (runtimeEvent.type === "hook_blocked") {
+        setMessages((current) => [...current, { role: "system", text: `Hook 阻止了${runtimeEvent.kind === "userPromptSubmit" ? "本次输入" : "操作"}：${runtimeEvent.reason ?? "未说明原因"}`, kind: "error" }])
+      } else if (runtimeEvent.type === "extension_loaded") {
+        const warnings = runtimeEvent.warnings?.length ? `（${runtimeEvent.warnings.length} 个警告）` : ""
+        if (runtimeEvent.names?.length || warnings) setMessages((current) => [...current, { role: "tool", text: `扩展已加载：${runtimeEvent.names?.join("、") || "无"}${warnings}`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "usage_recorded") {
         setUsage((current) => ({ input: current.input + (runtimeEvent.inputTokens ?? 0), output: current.output + (runtimeEvent.outputTokens ?? 0), cached: current.cached + (runtimeEvent.cachedInputTokens ?? 0) }))
       } else if (runtimeEvent.type === "decision_made") {
@@ -168,7 +215,7 @@ function App() {
       } else if (runtimeEvent.type === "browser_evidence") {
         setMessages((current) => [...current, { role: "tool", text: `浏览器验收：${runtimeEvent.ok ? "通过" : "失败"} · ${runtimeEvent.url ?? ""} · ${runtimeEvent.consoleErrorCount ?? 0} 个 Console Error，${runtimeEvent.networkCount ?? 0} 个 Network 响应`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "approval_required" && runtimeEvent.id) {
-        setApproval({ id: runtimeEvent.id, tool: runtimeEvent.tool ?? "操作", risk: runtimeEvent.risk ?? "L2" })
+        setApproval({ id: runtimeEvent.id, tool: runtimeEvent.tool ?? "操作", risk: runtimeEvent.risk ?? "L2", preview: runtimeEvent.preview })
         setBusy(false)
       } else if (runtimeEvent.type === "failed" || runtimeEvent.type === "turn_ended" && runtimeEvent.reason === "error") {
         setMessages((current) => [...current, { role: "system", text: runtimeEvent.error ?? "任务执行失败", kind: "error" }])
@@ -231,8 +278,10 @@ function App() {
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
       <section className="conversation" aria-live="polite">
         {!messages.length && <div className="welcome-card"><h2>自己的轻量编码工作台</h2><p>描述一个问题，DeepSeek Code 会在当前项目中理解、修改并验证。公开只读研究自动执行；写入和外部交付仍受控。</p><button type="button" onClick={() => setShowSettings(true)}>配置项目与模型</button></div>}
-        {messages.map((message, index) => <article className={`message ${message.role} ${message.kind ?? ""}`} key={`${index}-${message.text.slice(0, 12)}`}><span className="message-label">{message.role === "user" ? "你" : message.role === "tool" ? "Runtime" : message.role === "system" ? "系统" : "DeepSeek"}</span><div>{message.text}</div></article>)}
-        {approval && <section className="approval"><strong>需要确认</strong><span>{approval.tool}（{approval.risk}）将执行受控操作。</span><div><button type="button" onClick={() => void resolveApproval("deny")}>取消</button><button className="allow" type="button" onClick={() => void resolveApproval("allow")}>允许一次</button></div></section>}
+        {groupConversation(messages).map((item) => item.kind === "toolGroup"
+          ? <ToolActivityGroup key={item.key} activities={item.activities} />
+          : <article className={`message ${item.message.role} ${item.message.kind ?? ""}`} key={item.key}><span className="message-label">{item.message.role === "user" ? "你" : item.message.role === "tool" ? "Runtime" : item.message.role === "system" ? "系统" : "DeepSeek"}</span><div>{item.message.text}</div></article>)}
+        {approval && <section className="approval"><header><strong>需要确认</strong><span className={`risk-badge risk-${approval.risk.toLowerCase()}`}>{approval.risk}</span></header><span>{approval.tool} 将执行受控操作。</span>{approval.preview && <code className="approval-preview">{approval.preview}</code>}<div><button type="button" onClick={() => void resolveApproval("deny")}>取消</button><button className="allow" type="button" onClick={() => void resolveApproval("allow")}>允许一次</button></div></section>}
         {busy && <div className="typing"><i /><i /><i /> 正在工作</div>}
       </section>
       <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行；Esc 停止 · 新消息会排队到安全边界" : "回车发送 · Shift+Enter 换行 · ⌘K 切换会话 · ⌘N 新任务"}</span>{busy && <button type="button" onClick={() => void cancel()}>停止</button>}<button type="button" disabled={!canRun} onClick={() => void submit()}>{submitActionLabel(busy)}</button></footer></section>

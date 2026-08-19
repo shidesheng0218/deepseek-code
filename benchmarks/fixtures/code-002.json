@@ -1,0 +1,10 @@
+{
+  "id": "code-002",
+  "category": "code_change",
+  "prompt": "修复设置页保存后不生效的问题。",
+  "mockReply": "我先定位保存逻辑。",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 0
+  }
+}

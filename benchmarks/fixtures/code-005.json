@@ -1,0 +1,10 @@
+{
+  "id": "code-005",
+  "category": "code_change",
+  "prompt": "为 user-service 新增单元测试。",
+  "mockReply": "我来补单元测试。",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 0
+  }
+}

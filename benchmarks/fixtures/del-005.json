@@ -1,0 +1,10 @@
+{
+  "id": "del-005",
+  "category": "delivery",
+  "prompt": "把当前改动 commit 并 push。",
+  "mockReply": "我来处理提交。",
+  "expect": {
+    "route": "delivery",
+    "maxApprovals": 0
+  }
+}

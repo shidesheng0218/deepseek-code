@@ -1,0 +1,10 @@
+{
+  "id": "proj-008",
+  "category": "project_question",
+  "prompt": "当前项目的技术栈是什么？",
+  "mockReply": "我来总结技术栈。",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0
+  }
+}

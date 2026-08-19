@@ -1,0 +1,10 @@
+{
+  "id": "br-002",
+  "category": "browser_fix",
+  "prompt": "浏览器控制台报错 undefined is not an object，修复它。",
+  "mockReply": "我来定位报错。",
+  "expect": {
+    "route": "browser_fix",
+    "maxApprovals": 0
+  }
+}

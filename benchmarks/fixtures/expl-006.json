@@ -1,0 +1,10 @@
+{
+  "id": "expl-006",
+  "category": "exploration",
+  "prompt": "分析一下这个模块的整体架构。",
+  "mockReply": "我来分析模块架构。",
+  "expect": {
+    "route": "exploration",
+    "maxApprovals": 0
+  }
+}

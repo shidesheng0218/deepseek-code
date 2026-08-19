@@ -1,0 +1,10 @@
+{
+  "id": "br-001",
+  "category": "browser_fix",
+  "prompt": "页面打开白屏，帮我修复并验证。",
+  "mockReply": "我先复现白屏。",
+  "expect": {
+    "route": "browser_fix",
+    "maxApprovals": 0
+  }
+}

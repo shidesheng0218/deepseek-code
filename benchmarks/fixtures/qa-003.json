@@ -1,0 +1,11 @@
+{
+  "id": "qa-003",
+  "category": "direct_answer",
+  "prompt": "1+1 等于几？",
+  "mockReply": "2。",
+  "expect": {
+    "route": "direct_answer",
+    "maxApprovals": 0,
+    "noToolCalls": true
+  }
+}

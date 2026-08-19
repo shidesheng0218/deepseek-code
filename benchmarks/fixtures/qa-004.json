@@ -1,0 +1,11 @@
+{
+  "id": "qa-004",
+  "category": "direct_answer",
+  "prompt": "用一句话解释什么是闭包。",
+  "mockReply": "闭包是函数与其词法作用域的组合。",
+  "expect": {
+    "route": "direct_answer",
+    "maxApprovals": 0,
+    "noToolCalls": true
+  }
+}

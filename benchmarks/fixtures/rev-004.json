@@ -1,0 +1,10 @@
+{
+  "id": "rev-004",
+  "category": "review",
+  "prompt": "走查一遍登录流程的代码。",
+  "mockReply": "我来走查登录流程。",
+  "expect": {
+    "route": "review",
+    "maxApprovals": 0
+  }
+}

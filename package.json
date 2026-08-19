@@ -18,6 +18,7 @@
     "release:verify": "bash scripts/verify-tauri-release.sh",
     "bench": "node benchmarks/runner.mjs && node benchmarks/score.mjs",
     "bench:real": "node benchmarks/runner.mjs --real && node benchmarks/score.mjs",
+    "bench:soak": "node benchmarks/soak.mjs",
     "test": "vitest run tests && npm run test:sidecar",
     "test:sidecar": "bash scripts/test-agent-runtime.sh && bash scripts/test-agent-approval.sh && bash scripts/test-agent-worker.sh && bash scripts/test-agent-terminal.sh && bash scripts/test-agent-cancel.sh",
     "legacy:dev": "electron-vite dev",

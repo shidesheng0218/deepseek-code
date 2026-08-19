@@ -1,0 +1,10 @@
+{
+  "id": "proj-002",
+  "category": "project_question",
+  "prompt": "当前项目的目录结构是怎样的？",
+  "mockReply": "我先看一下目录。",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0
+  }
+}

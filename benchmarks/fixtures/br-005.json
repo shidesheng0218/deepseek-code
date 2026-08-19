@@ -1,0 +1,10 @@
+{
+  "id": "br-005",
+  "category": "browser_fix",
+  "prompt": "修复浏览器控制台里报的 TypeScript 类型错误",
+  "mockReply": "我来定位浏览器报错。",
+  "expect": {
+    "route": "browser_fix",
+    "maxApprovals": 0
+  }
+}

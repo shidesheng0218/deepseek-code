@@ -1,0 +1,10 @@
+{
+  "id": "expl-005",
+  "category": "exploration",
+  "prompt": "熟悉一下项目里 WebSocket 的使用情况。",
+  "mockReply": "我来熟悉 WebSocket 使用。",
+  "expect": {
+    "route": "exploration",
+    "maxApprovals": 0
+  }
+}

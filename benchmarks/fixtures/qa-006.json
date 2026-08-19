@@ -1,0 +1,11 @@
+{
+  "id": "qa-006",
+  "category": "direct_answer",
+  "prompt": "TypeScript 的 interface 和 type 有什么区别？简单说。",
+  "mockReply": "interface 可合并声明，type 更灵活可表达联合。",
+  "expect": {
+    "route": "direct_answer",
+    "maxApprovals": 0,
+    "noToolCalls": true
+  }
+}

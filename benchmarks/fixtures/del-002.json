@@ -1,0 +1,10 @@
+{
+  "id": "del-002",
+  "category": "delivery",
+  "prompt": "把这次的修改提交并创建 PR。",
+  "mockReply": "我来整理变更。",
+  "expect": {
+    "route": "delivery",
+    "maxApprovals": 0
+  }
+}

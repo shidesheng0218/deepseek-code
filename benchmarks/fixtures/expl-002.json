@@ -1,0 +1,10 @@
+{
+  "id": "expl-002",
+  "category": "exploration",
+  "prompt": "探索一下登录功能相关的代码分布。",
+  "mockReply": "我来探索登录相关代码。",
+  "expect": {
+    "route": "exploration",
+    "maxApprovals": 0
+  }
+}

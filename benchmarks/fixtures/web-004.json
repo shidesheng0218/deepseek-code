@@ -1,0 +1,10 @@
+{
+  "id": "web-004",
+  "category": "web_research",
+  "prompt": "今天上海的天气怎么样？",
+  "mockReply": "我来查天气。",
+  "expect": {
+    "route": "web_research",
+    "maxApprovals": 0
+  }
+}

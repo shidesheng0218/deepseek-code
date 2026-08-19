@@ -1,0 +1,10 @@
+{
+  "id": "proj-007",
+  "category": "project_question",
+  "prompt": "当前项目有几个 package.json？",
+  "mockReply": "我来数一下。",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0
+  }
+}

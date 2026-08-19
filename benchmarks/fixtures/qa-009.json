@@ -1,0 +1,11 @@
+{
+  "id": "qa-009",
+  "category": "direct_answer",
+  "prompt": "现在几点了？",
+  "mockReply": "我无法获取实时时钟，请查看系统时间。",
+  "expect": {
+    "route": "direct_answer",
+    "maxApprovals": 0,
+    "noToolCalls": true
+  }
+}

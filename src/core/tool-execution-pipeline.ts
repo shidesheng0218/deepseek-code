@@ -20,16 +20,24 @@ export type ToolPipelineEvent =
   | { type: 'tool_started'; id: string; tool: string }
   | { type: 'tool_completed'; id: string; tool: string; ok: boolean; output?: string; error?: string }
   | { type: 'tool_indeterminate'; id: string; tool: string; error: string }
-  | { type: 'approval_required'; id: string; tool: string; risk: string };
+  | { type: 'approval_required'; id: string; tool: string; risk: string; preview?: string };
 
 export type ToolPipelineResult =
   | { state: 'completed'; content: string }
   | { state: 'awaitingApproval'; pending: PendingToolApproval };
 
+export interface PipelineHooks {
+  /** 在权限判定之前执行；返回 blocked 原因时阻止该工具（不进入审批、不执行 Host）。 */
+  preToolUse?(invocation: ToolInvocation): Promise<{ blocked?: string } | void>;
+  /** 在工具结算后执行（成功、失败、indeterminate 都会触发）；仅作观察，异常被吞掉。 */
+  postToolUse?(invocation: ToolInvocation, outcome: { ok: boolean; output?: string; error?: string }): Promise<void>;
+}
+
 interface ToolExecutionPipelineOptions {
   runtime: AgentRuntime;
   tools: Record<string, (input: Record<string, unknown>) => Promise<unknown>>;
   definitions?: Record<string, ToolDefinition>;
+  hooks?: PipelineHooks;
   onEvent?: (event: ToolPipelineEvent) => void;
 }
 
@@ -75,6 +83,12 @@ export class ToolExecutionPipeline {
       this.emit({ type: 'tool_completed', id: invocation.id, tool: invocation.tool, ok: false, error: invalid });
       return { state: 'completed', content };
     }
+    const hookVerdict = await this.options.hooks?.preToolUse?.(invocation);
+    if (hookVerdict?.blocked) {
+      const content = errorContent('HOOK_BLOCKED', hookVerdict.blocked);
+      this.emit({ type: 'tool_completed', id: invocation.id, tool: invocation.tool, ok: false, error: hookVerdict.blocked });
+      return { state: 'completed', content };
+    }
     const command = typeof invocation.arguments.command === 'string' ? invocation.arguments.command : undefined;
     const decision = this.options.runtime.requestTool({
       id: invocation.id,
@@ -84,7 +98,8 @@ export class ToolExecutionPipeline {
     });
     this.emit({ type: 'tool_requested', id: invocation.id, tool: invocation.tool, risk: decision.risk });
     if (decision.decision === 'ask') {
-      this.emit({ type: 'approval_required', id: invocation.id, tool: invocation.tool, risk: decision.risk });
+      const preview = JSON.stringify(invocation.arguments).slice(0, 300);
+      this.emit({ type: 'approval_required', id: invocation.id, tool: invocation.tool, risk: decision.risk, ...(preview && preview !== '{}' ? { preview } : {}) });
       return { state: 'awaitingApproval', pending: { ...invocation, risk: decision.risk } };
     }
     if (decision.decision === 'block') return { state: 'completed', content: errorContent('POLICY_BLOCKED') };
@@ -116,25 +131,38 @@ export class ToolExecutionPipeline {
       if (rawResult && typeof rawResult === 'object' && 'indeterminate' in rawResult && rawResult.indeterminate === true) {
         const error = 'output' in rawResult && typeof rawResult.output === 'string' ? rawResult.output : 'Tool result is indeterminate';
         this.emit({ type: 'tool_indeterminate', id: invocation.id, tool: invocation.tool, error });
+        await this.notifyPost(invocation, { ok: false, output, error });
         return { state: 'completed', content: output };
       }
       if (rawResult && typeof rawResult === 'object' && 'ok' in rawResult && rawResult.ok === false) {
         const error = 'error' in rawResult && typeof rawResult.error === 'string' ? rawResult.error : 'Tool returned a failure';
         this.emit({ type: 'tool_completed', id: invocation.id, tool: invocation.tool, ok: false, error, output });
+        await this.notifyPost(invocation, { ok: false, output, error });
         return { state: 'completed', content: output };
       }
       this.emit({ type: 'tool_completed', id: invocation.id, tool: invocation.tool, ok: true, output });
+      await this.notifyPost(invocation, { ok: true, output });
       return { state: 'completed', content: output };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (error instanceof TimeoutError) {
         const content = errorContent('TOOL_INDETERMINATE', message);
         this.emit({ type: 'tool_indeterminate', id: invocation.id, tool: invocation.tool, error: message });
+        await this.notifyPost(invocation, { ok: false, error: message });
         return { state: 'completed', content };
       }
       const content = errorContent('TOOL_ERROR', message);
       this.emit({ type: 'tool_completed', id: invocation.id, tool: invocation.tool, ok: false, error: message });
+      await this.notifyPost(invocation, { ok: false, error: message });
       return { state: 'completed', content };
+    }
+  }
+
+  private async notifyPost(invocation: ToolInvocation, outcome: { ok: boolean; output?: string; error?: string }): Promise<void> {
+    try {
+      await this.options.hooks?.postToolUse?.(invocation, outcome);
+    } catch {
+      // postToolUse Hook 仅作观察，失败不影响主流程。
     }
   }
 

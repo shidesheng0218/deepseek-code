@@ -2,7 +2,7 @@ import { AgentRuntime } from './agent-runtime';
 import { buildContext, DEFAULT_CONTEXT_BUDGET, type ContextBudget } from './context-builder';
 import type { AgentMode } from './permissions';
 import type { ModelEvent } from './providers/openai-compatible';
-import { ToolExecutionPipeline, type ToolDefinition, type ToolPipelineEvent } from './tool-execution-pipeline';
+import { ToolExecutionPipeline, type PipelineHooks, type ToolDefinition, type ToolPipelineEvent } from './tool-execution-pipeline';
 
 export interface AgentMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -39,6 +39,7 @@ export interface AgentExecutorOptions {
   model: { stream: (messages: AgentMessage[]) => AsyncIterable<ExecutorEvent> };
   tools: Record<string, (input: Record<string, unknown>) => Promise<unknown>>;
   toolDefinitions?: Record<string, ToolDefinition>;
+  hooks?: PipelineHooks;
   maxTurns?: number;
   contextBudget?: ContextBudget;
   onEvent?: (event: AgentExecutorEvent) => void;
@@ -88,6 +89,7 @@ export class AgentExecutor {
       runtime,
       tools: this.options.tools,
       definitions: { ...defaultToolDefinitions(this.options.tools), ...this.options.toolDefinitions },
+      ...(this.options.hooks ? { hooks: this.options.hooks } : {}),
       onEvent: (event) => this.options.onEvent?.(event)
     });
   }

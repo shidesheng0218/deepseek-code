@@ -1,0 +1,10 @@
+{
+  "id": "code-008",
+  "category": "code_change",
+  "prompt": "优化列表页：数据超过 100 条时分页加载。",
+  "mockReply": "我来加分页。",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 0
+  }
+}

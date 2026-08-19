@@ -1,0 +1,10 @@
+{
+  "id": "proj-003",
+  "category": "project_question",
+  "prompt": "本仓库用的什么测试框架？",
+  "mockReply": "我来确认测试框架。",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "web-007",
+  "category": "web_research",
+  "prompt": "现在的人民币汇率是多少，查一下",
+  "mockReply": "我来查汇率。",
+  "expect": {
+    "route": "web_research",
+    "maxApprovals": 0
+  }
+}

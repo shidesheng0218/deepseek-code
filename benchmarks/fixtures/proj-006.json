@@ -1,0 +1,10 @@
+{
+  "id": "proj-006",
+  "category": "project_question",
+  "prompt": "这个项目的构建产物输出到哪个目录？",
+  "mockReply": "我来看构建配置。",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "web-003",
+  "category": "web_research",
+  "prompt": "搜索 Zod 和 Valibot 官方文档的主要差异。",
+  "mockReply": "我来对比文档。",
+  "expect": {
+    "route": "web_research",
+    "maxApprovals": 0
+  }
+}

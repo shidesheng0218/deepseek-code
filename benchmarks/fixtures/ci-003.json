@@ -1,0 +1,10 @@
+{
+  "id": "ci-003",
+  "category": "ci_repair",
+  "prompt": "CI 构建失败，提示找不到模块。",
+  "mockReply": "我来分析构建日志。",
+  "expect": {
+    "route": "ci_repair",
+    "maxApprovals": 0
+  }
+}

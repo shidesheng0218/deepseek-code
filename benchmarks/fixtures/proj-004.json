@@ -1,0 +1,10 @@
+{
+  "id": "proj-004",
+  "category": "project_question",
+  "prompt": "当前项目里 React 是什么版本？",
+  "mockReply": "我来查依赖版本。",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0
+  }
+}

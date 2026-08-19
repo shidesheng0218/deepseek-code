@@ -1,0 +1,11 @@
+{
+  "id": "qa-007",
+  "category": "direct_answer",
+  "prompt": "帮我给“用户头像地址”起三个英文变量名。",
+  "mockReply": "avatarUrl、userAvatar、avatarSrc。",
+  "expect": {
+    "route": "direct_answer",
+    "maxApprovals": 0,
+    "noToolCalls": true
+  }
+}

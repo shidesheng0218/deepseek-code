@@ -1,0 +1,10 @@
+{
+  "id": "code-009",
+  "category": "code_change",
+  "prompt": "实现一个本地缓存层，减少重复请求。",
+  "mockReply": "我来实现缓存层。",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 0
+  }
+}

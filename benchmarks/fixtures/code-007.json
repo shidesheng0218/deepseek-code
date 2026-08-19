@@ -1,0 +1,10 @@
+{
+  "id": "code-007",
+  "category": "code_change",
+  "prompt": "把散落的 console.log 修改成统一的 logger 调用。",
+  "mockReply": "我来统一日志调用。",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 0
+  }
+}

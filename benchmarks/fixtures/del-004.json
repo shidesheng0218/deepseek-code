@@ -1,0 +1,10 @@
+{
+  "id": "del-004",
+  "category": "delivery",
+  "prompt": "完成后帮我部署到测试环境。",
+  "mockReply": "我来准备部署。",
+  "expect": {
+    "route": "delivery",
+    "maxApprovals": 0
+  }
+}

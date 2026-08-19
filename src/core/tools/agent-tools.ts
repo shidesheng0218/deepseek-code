@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { readWorkspaceFile } from './workspace';
 import { WorkspacePatchService, type WorkspaceChange } from './workspace-patch';
+import { shellCommand } from '../platform';
 
 const execFile = promisify(execFileCallback);
 
@@ -107,7 +108,8 @@ export function createWorkspaceAgentTools(options: { root: string; checkpointRoo
       const command = stringInput(input, 'command').trim();
       if (!command) throw new Error('run_command requires command');
       const timeout = Math.min(Math.max(numberInput(input, 'timeoutMs', 120_000), 1_000), 600_000);
-      const result = await execFile('/bin/sh', ['-lc', command], { cwd: options.root, timeout, maxBuffer: 500_000 });
+      const shell = shellCommand();
+      const result = await execFile(shell.file, [...shell.args, command], { cwd: options.root, timeout, maxBuffer: 500_000 });
       return { ok: true, stdout: result.stdout.slice(0, 50_000), stderr: result.stderr.slice(0, 20_000) };
     }
   };

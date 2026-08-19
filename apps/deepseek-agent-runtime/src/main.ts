@@ -35,6 +35,11 @@ import { redactSecrets } from "../../../src/core/secret-redactor"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 import { decideExecution, decisionInstructions } from "../../../src/core/execution-decision"
+import { loadSkills, resolveSlashSkill, skillPromptBlock, type Skill } from "../../../src/core/skills"
+import { loadHooks, mergeHookMaps, runHook, type HookMap } from "../../../src/core/hooks"
+import { loadExtensions, type LoadedExtensions } from "../../../src/core/extensions"
+import { shellCommand, userDataDir } from "../../../src/core/platform"
+import type { PipelineHooks } from "../../../src/core/tool-execution-pipeline"
 
 type AgentRunParams = {
   sessionID: string
@@ -97,6 +102,9 @@ type RuntimeEvent =
   | { type: "recovery_attention"; reason: string; message: string }
   | { type: "recovery_input_restored"; inputID: string }
   | { type: "decision_made"; route: string; modelTier: string; responseContract: string }
+  | { type: "skill_invoked"; name: string }
+  | { type: "hook_blocked"; kind: string; reason: string }
+  | { type: "extension_loaded"; names: string[]; warnings: string[] }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
 const toolSchemas = [
@@ -159,7 +167,49 @@ function instructionsForDecision(projectPath: string, prompt: string): Promise<s
 function redact(value: string): string { return redactSecrets(value) }
 
 function sessionRoot(): string {
-  return process.env.DEEPSEEK_SESSION_ROOT ?? join(process.env.HOME ?? ".", "Library", "Application Support", "DeepSeekCode", "sessions")
+  return process.env.DEEPSEEK_SESSION_ROOT ?? join(userDataDir("DeepSeekCode"), "sessions")
+}
+
+interface RuntimeContext {
+  skills: Skill[]
+  extensions: LoadedExtensions
+  hooks: HookMap
+  pipelineHooks: PipelineHooks
+  extraInstructions: string
+}
+
+/** 装配 Skills、Hooks 与运行时扩展；每次运行调用，磁盘修改即时生效。 */
+async function assembleRuntimeContext(sessionID: string, projectPath: string): Promise<RuntimeContext> {
+  const [skills, extensions, settingsHooks] = await Promise.all([
+    loadSkills(projectPath).catch(() => [] as Skill[]),
+    loadExtensions(projectPath).catch((error) => ({
+      names: [], tools: {}, definitions: {}, schemas: [], listeners: [],
+      hooks: { preToolUse: [], postToolUse: [], sessionStart: [], userPromptSubmit: [] },
+      warnings: [`扩展加载失败：${error instanceof Error ? error.message : String(error)}`]
+    })),
+    loadHooks(projectPath).catch(() => ({ preToolUse: [], postToolUse: [], sessionStart: [], userPromptSubmit: [] }))
+  ])
+  const hooks = mergeHookMaps(settingsHooks, extensions.hooks)
+  const shell = shellCommand()
+  const pipelineHooks: PipelineHooks = {}
+  if (hooks.preToolUse.length > 0) {
+    pipelineHooks.preToolUse = async (invocation) => {
+      const result = await runHook(hooks.preToolUse, "preToolUse", { sessionID, tool: invocation.tool, toolCallID: invocation.id, arguments: redactUnknown({ arguments: invocation.arguments }) }, projectPath, shell)
+      return result.blocked ? { blocked: result.blocked } : undefined
+    }
+  }
+  if (hooks.postToolUse.length > 0) {
+    pipelineHooks.postToolUse = async (invocation, outcome) => {
+      await runHook(hooks.postToolUse, "postToolUse", { sessionID, tool: invocation.tool, toolCallID: invocation.id, ok: outcome.ok, error: outcome.error }, projectPath, shell)
+    }
+  }
+  return {
+    skills,
+    extensions,
+    hooks,
+    pipelineHooks,
+    extraInstructions: skillPromptBlock(skills)
+  }
 }
 
 class JsonlEventStore {
@@ -283,6 +333,7 @@ interface SessionRecoveryState {
   pendingInputs: Array<{ inputID: string; prompt: string; projectPath?: string }>
   hasBlockedApproval: boolean
   hasIndeterminate: boolean
+  hasInterruptedTurn: boolean
 }
 
 async function inspectSessionForRecovery(sessionID: string): Promise<SessionRecoveryState> {
@@ -293,6 +344,8 @@ async function inspectSessionForRecovery(sessionID: string): Promise<SessionReco
   const resolved = new Set<string>()
   const indeterminateTools = new Set<string>()
   const settledTools = new Set<string>()
+  let turnStarted = 0
+  let turnEnded = 0
   for (const event of events) {
     const payload = event.payload ?? {}
     if (event.type === "input_enqueued" && typeof payload.inputID === "string" && typeof payload.prompt === "string") {
@@ -302,11 +355,13 @@ async function inspectSessionForRecovery(sessionID: string): Promise<SessionReco
     else if (event.type === "approval_resolved" && typeof payload.approvalID === "string") resolved.add(payload.approvalID)
     else if (event.type === "tool_indeterminate" && typeof payload.id === "string") indeterminateTools.add(payload.id)
     else if (event.type === "tool_completed" && typeof payload.id === "string") settledTools.add(payload.id)
+    else if (event.type === "turn_started") turnStarted += 1
+    else if (event.type === "turn_ended") turnEnded += 1
   }
   const pendingInputs = [...enqueued.entries()].filter(([id]) => !claimed.has(id)).map(([inputID, value]) => ({ inputID, prompt: value.prompt, ...(value.projectPath ? { projectPath: value.projectPath } : {}) }))
   const hasBlockedApproval = [...approvals.keys()].some((id) => !resolved.has(id))
   const hasIndeterminate = [...indeterminateTools].some((id) => !settledTools.has(id))
-  return { pendingInputs, hasBlockedApproval, hasIndeterminate }
+  return { pendingInputs, hasBlockedApproval, hasIndeterminate, hasInterruptedTurn: turnStarted > turnEnded }
 }
 
 async function recoverInterruptedSessions(): Promise<void> {
@@ -318,6 +373,7 @@ async function recoverInterruptedSessions(): Promise<void> {
       const state = await inspectSessionForRecovery(sessionID)
       if (state.hasIndeterminate) await emitSessionEvent(sessionID, { type: "recovery_attention", reason: "indeterminate_tool", message: "存在结果未知的写入操作，已按不可自动重放处理。" })
       if (state.hasBlockedApproval) await emitSessionEvent(sessionID, { type: "recovery_attention", reason: "pending_approval", message: "存在等待审批的操作，恢复后可继续处理。" })
+      if (state.hasInterruptedTurn) await emitSessionEvent(sessionID, { type: "recovery_attention", reason: "interrupted_turn", message: "上一次回复在写入完成前被中断；未完成的内容不会伪装成完整回答，可以继续提问。" })
       if (state.pendingInputs.length === 0) continue
       if (state.hasBlockedApproval || state.hasIndeterminate) continue
       const queue = queues.get(sessionID) ?? []
@@ -845,20 +901,38 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
   const client = createProviderClient(params, controller.signal)
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
+  const runtimeContext = await assembleRuntimeContext(sessionID, projectPath)
   const mcp = await mcpBindings(sessionID, projectPath)
   const ssh = await sshBindings(sessionID, projectPath)
   const lsp = await lspBindings(sessionID, projectPath)
-  const schemas = [...toolSchemas, ...mcp.schemas, ...ssh.schemas, ...lsp.schemas]
+  const schemas = [...toolSchemas, ...runtimeContext.extensions.schemas, ...mcp.schemas, ...ssh.schemas, ...lsp.schemas]
   const history = await eventStore.loadConversation(sessionID)
   const decision = decideExecution(prompt)
-  const instructions = await instructionsForDecision(projectPath, prompt)
+  const instructions = `${await instructionsForDecision(projectPath, prompt)}${runtimeContext.extraInstructions ? `\n\n${runtimeContext.extraInstructions}` : ""}`
+  if (runtimeContext.extensions.names.length > 0 || runtimeContext.extensions.warnings.length > 0) {
+    await emitSessionEvent(sessionID, { type: "extension_loaded", names: runtimeContext.extensions.names, warnings: runtimeContext.extensions.warnings })
+  }
+  const slash = resolveSlashSkill(prompt, runtimeContext.skills)
+  if (slash.skill) await emitSessionEvent(sessionID, { type: "skill_invoked", name: slash.skill.name })
+  if (runtimeContext.hooks.userPromptSubmit.length > 0) {
+    const verdict = await runHook(runtimeContext.hooks.userPromptSubmit, "userPromptSubmit", { sessionID, prompt: redact(prompt) }, projectPath, shellCommand())
+    if (verdict.blocked) {
+      await emitSessionEvent(sessionID, { type: "hook_blocked", kind: "userPromptSubmit", reason: verdict.blocked })
+      await emitSessionEvent(sessionID, { type: "turn_ended", reason: "hook_blocked", status: "cancelled" })
+      return { text: `已按项目 Hook 策略停止：${verdict.blocked}`, status: "cancelled", messages: await eventStore.loadConversation(sessionID) }
+    }
+  }
+  if (runtimeContext.hooks.sessionStart.length > 0) {
+    void runHook(runtimeContext.hooks.sessionStart, "sessionStart", { sessionID, projectPath }, projectPath, shellCommand()).catch(() => undefined)
+  }
   await emitSessionEvent(sessionID, { type: "turn_started", prompt })
   await emitSessionEvent(sessionID, { type: "decision_made", route: decision.route, modelTier: decision.modelTier, responseContract: decision.responseContract })
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, decision.modelTier === "fast" && params.fastModel ? params.fastModel : params.model, messages, schemas) },
-    toolDefinitions: pipelineDefinitions(schemas),
+    toolDefinitions: { ...pipelineDefinitions(schemas), ...runtimeContext.extensions.definitions },
+    hooks: runtimeContext.pipelineHooks,
     tools: {
       list_directory: tools.list_directory,
       search_workspace: tools.search_workspace,
@@ -876,12 +950,18 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       github_pr_comment: (input) => githubPRComment(sessionID, projectPath, input),
       ...mcp.handlers,
       ...ssh.handlers,
-      ...lsp.handlers
+      ...lsp.handlers,
+      ...runtimeContext.extensions.tools
     },
-    onEvent: (event) => { void emitAgentEvent(sessionID, event) }
+    onEvent: (event) => {
+      void emitAgentEvent(sessionID, event)
+      for (const listener of runtimeContext.extensions.listeners) {
+        try { listener(event) } catch { /* 扩展监听器异常不影响主流程 */ }
+      }
+    }
   })
   try {
-    const result = await executor.run(sessionID, prompt, history)
+    const result = await executor.run(sessionID, slash.prompt, history)
     await eventStore.flush(sessionID)
     if (result.pendingApproval) {
       await eventStore.append(sessionID, "approval_pending", redactUnknown({
@@ -927,19 +1007,26 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
   const client = createProviderClient(params)
   const tools = createWorkspaceAgentTools({ root: params.projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
+  const runtimeContext = await assembleRuntimeContext(sessionID, params.projectPath)
   const mcp = await mcpBindings(sessionID, params.projectPath)
   const ssh = await sshBindings(sessionID, params.projectPath)
   const lsp = await lspBindings(sessionID, params.projectPath)
-  const schemas = [...toolSchemas, ...mcp.schemas, ...ssh.schemas, ...lsp.schemas]
-  const instructions = await instructionsFor(params.projectPath)
+  const schemas = [...toolSchemas, ...runtimeContext.extensions.schemas, ...mcp.schemas, ...ssh.schemas, ...lsp.schemas]
+  const instructions = `${await instructionsFor(params.projectPath)}${runtimeContext.extraInstructions ? `\n\n${runtimeContext.extraInstructions}` : ""}`
   const repairLineage = await eventStore.loadRepairLineage(sessionID)
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
-    toolDefinitions: pipelineDefinitions(schemas),
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), github_pr_context: () => githubPRContext(sessionID, params.projectPath!), github_pr_comment: (input) => githubPRComment(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers },
-    onEvent: (event) => { void emitAgentEvent(sessionID, event) }
+    toolDefinitions: { ...pipelineDefinitions(schemas), ...runtimeContext.extensions.definitions },
+    hooks: runtimeContext.pipelineHooks,
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), github_pr_context: () => githubPRContext(sessionID, params.projectPath!), github_pr_comment: (input) => githubPRComment(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers, ...runtimeContext.extensions.tools },
+    onEvent: (event) => {
+      void emitAgentEvent(sessionID, event)
+      for (const listener of runtimeContext.extensions.listeners) {
+        try { listener(event) } catch { /* 扩展监听器异常不影响主流程 */ }
+      }
+    }
   })
   const result = await executor.resume(sessionID, await eventStore.loadConversation(sessionID), pending)
   await eventStore.flush(sessionID)

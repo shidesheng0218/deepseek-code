@@ -1,0 +1,10 @@
+{
+  "id": "code-003",
+  "category": "code_change",
+  "prompt": "给输入框添加 300ms 防抖。",
+  "mockReply": "我来添加防抖。",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 0
+  }
+}

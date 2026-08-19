@@ -1,0 +1,10 @@
+{
+  "id": "rev-003",
+  "category": "review",
+  "prompt": "检查一下这个函数的错误处理有没有问题。",
+  "mockReply": "我来检查错误处理。",
+  "expect": {
+    "route": "review",
+    "maxApprovals": 0
+  }
+}
