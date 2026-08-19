@@ -26,4 +26,11 @@ describe('MCP configuration', () => {
     const configs = await loadMCPServerConfigs(root, root);
     expect(configs).toEqual([{ name: 'docs', args: [], cwd: await realpath(root), url: 'https://mcp.example.test/mcp', transport: 'streamable-http', authEnv: 'DEEPSEEK_MCP_DOCS_TOKEN', headers: { 'x-project': 'fixture' } }]);
   });
+
+  test('loads WebSocket MCP servers without treating them as stdio commands', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'deepseek-mcp-ws-'));
+    await writeFile(join(root, '.mcp.json'), JSON.stringify({ mcpServers: { events: { url: 'wss://mcp.example.test/ws' } } }));
+    const configs = await loadMCPServerConfigs(root, root);
+    expect(configs).toEqual([{ name: 'events', args: [], cwd: await realpath(root), url: 'wss://mcp.example.test/ws', transport: 'websocket' }]);
+  });
 });

@@ -104,8 +104,9 @@ flowchart LR
 - SSH `--terminal-stdio` 只是短连接代理，远端 `--terminal-daemon` 会在代理断开后保留终端；重新连接可按原 `terminalID` Attach，关闭最后一个终端后 daemon 自动退出。
 - GitHub Actions 失败日志会分类并创建独立 CI 修复会话；修复结果回流到父会话，且当前 Commit 未重新通过 CI 前 Delivery Gate 会保持 `needsRepair`。
 - CI 修复会话会继承原始 Commit 与 Pull Request；回写 PR 使用独立的 `github_pr_comment` 外部写入工具，必须经过审批，Delivery Gate 在回写确认前不会显示 `delivered`。
-- MCP 同时支持 stdio 与 Streamable HTTP；工具目录、Resources、Prompts、`tools/list_changed` 动态刷新和输出上限都经过 Tool Pipeline，Resources/Prompts 默认按只读低打断策略处理。
+- MCP 支持 stdio、Streamable HTTP 与 WebSocket JSON-RPC；工具目录、Resources、Prompts、`tools/list_changed` 动态刷新和输出上限都经过 Tool Pipeline，Resources/Prompts 默认按只读低打断策略处理。
 - MCP HTTP 认证只接受 `authEnv` 环境变量引用（例如 `DEEPSEEK_MCP_DOCS_TOKEN`），不会把 Bearer Token、Cookie 或 API Key 从 `.mcp.json` 直接载入；401/403 会明确显示为认证失败。
+- 私有 MCP 的 Bearer Token 当前使用 Streamable HTTP `authEnv`；WebSocket 适用于公开或已有会话认证的 MCP，完整 OAuth 浏览器授权与刷新仍在生态收尾范围。
 - 运行中追加的第二条消息会进入同一 Session Inbox，在安全边界继续执行；事件帧复用持久 `eventID`，UI 按稳定 ID 去重，不重复渲染同一事件。
 - 旧版 `DeepSeekCodeCore` 仍是 Swift 迁移参考与兼容验证工具，不是 Tauri 用户下载版的运行时。
 

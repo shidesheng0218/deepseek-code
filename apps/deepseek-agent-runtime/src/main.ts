@@ -15,6 +15,7 @@ import { PersistentTerminal } from "../../../src/core/persistent-terminal"
 import { loadMCPServerConfigs } from "../../../src/core/mcp-config"
 import { MCPStdioClient } from "../../../src/core/mcp-stdio"
 import { MCPStreamableHTTPClient } from "../../../src/core/mcp-http"
+import { MCPWebSocketClient } from "../../../src/core/mcp-websocket"
 import { loadLanguageServerConfigs } from "../../../src/core/lsp-config"
 import { LanguageServerClient } from "../../../src/core/lsp-client"
 import { loadSSHProjectConfig } from "../../../src/core/ssh-config"
@@ -270,7 +271,7 @@ const activeControllers = new Map<string, AbortController>()
 const pendingCancels = new Set<string>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
 const sshTerminals = new Map<string, SSHRemotePersistentTerminal>()
-type MCPClient = MCPStdioClient | MCPStreamableHTTPClient
+type MCPClient = MCPStdioClient | MCPStreamableHTTPClient | MCPWebSocketClient
 const mcpClients = new Map<string, MCPClient>()
 const lspClients = new Map<string, LanguageServerClient>()
 const deferredCIRepairs = new CIRepairQueue<RepairRuntimeConfig>()
@@ -284,7 +285,8 @@ async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPB
     let client = mcpClients.get(key)
     try {
       if (!client) {
-        if (config.url) client = new MCPStreamableHTTPClient({ url: config.url, ...(config.headers ? { headers: config.headers } : {}), ...(config.authEnv ? { tokenProvider: async () => process.env[config.authEnv!] } : {}) })
+        if (config.url && config.transport === "websocket") client = new MCPWebSocketClient({ url: config.url })
+        else if (config.url) client = new MCPStreamableHTTPClient({ url: config.url, ...(config.headers ? { headers: config.headers } : {}), ...(config.authEnv ? { tokenProvider: async () => process.env[config.authEnv!] } : {}) })
         else if (config.command) client = new MCPStdioClient({ command: config.command, args: config.args, cwd: config.cwd, ...(config.env ? { env: config.env } : {}) })
         else throw new Error(`MCP server ${config.name} has no supported transport`)
         mcpClients.set(key, client)
@@ -911,7 +913,7 @@ async function drain(sessionID: string): Promise<void> {
   }
 }
 
-function enqueue(request: Request): Response {
+async function enqueue(request: Request): Promise<Response> {
   const params = request.params
   const sessionID = params?.sessionID?.trim()
   const text = params?.prompt?.trim() || params?.text?.trim()
@@ -919,7 +921,7 @@ function enqueue(request: Request): Response {
   const queue = queues.get(sessionID) ?? []
   queue.push({ id: request.id, params: { ...params, sessionID, prompt: text } as AgentRunParams })
   queues.set(sessionID, queue)
-  void eventStore.append(sessionID, "input_enqueued", { inputID: request.id, prompt: redact(text), projectPath: params?.projectPath })
+  await eventStore.append(sessionID, "input_enqueued", { inputID: request.id, prompt: redact(text), projectPath: params?.projectPath })
   void drain(sessionID)
   return { id: request.id, type: "response", ok: true, result: { queued: queue.length, sessionID } }
 }
@@ -930,7 +932,7 @@ async function handle(request: Request): Promise<void> {
     return
   }
   if (request.method === "session.enqueue") {
-    respond(enqueue(request))
+    respond(await enqueue(request))
     return
   }
   if (request.method === "session.resolveApproval") {
@@ -948,7 +950,7 @@ async function handle(request: Request): Promise<void> {
   if (request.method === "session.cancel") {
     const sessionID = request.params?.sessionID?.trim()
     const controller = sessionID ? activeControllers.get(sessionID) : undefined
-    if (!controller && sessionID && activeSessions.has(sessionID)) {
+    if (!controller && sessionID && (activeSessions.has(sessionID) || (queues.get(sessionID)?.length ?? 0) > 0)) {
       pendingCancels.add(sessionID)
       respond({ id: request.id, type: "response", ok: true, result: { sessionID, cancelling: true, pending: true } })
     } else if (!controller) respond({ id: request.id, type: "response", ok: false, error: "No cancellable operation is active for this session" })
@@ -957,7 +959,7 @@ async function handle(request: Request): Promise<void> {
   }
   // A run request receives exactly one terminal response after the turn;
   // queued runs never emit a misleading immediate success response.
-  enqueue(request)
+  await enqueue(request)
 }
 
 if (process.argv.includes("--terminal-daemon")) {

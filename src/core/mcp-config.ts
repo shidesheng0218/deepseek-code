@@ -9,7 +9,7 @@ export interface MCPServerConfig {
   cwd: string;
   url?: string;
   headers?: Record<string, string>;
-  transport?: 'streamable-http';
+  transport?: 'streamable-http' | 'websocket';
   authEnv?: string;
 }
 
@@ -34,10 +34,11 @@ export async function loadMCPServerConfigs(workspacePath: string, projectRoot = 
         if (server.env && typeof server.env === 'object') {
           env = Object.fromEntries(Object.entries(server.env as Record<string, unknown>).filter(([, item]) => typeof item === 'string').map(([key, item]) => [key, item as string]));
         }
-        if (typeof server.url === 'string' && /^https?:\/\//.test(server.url)) {
+        if (typeof server.url === 'string' && /^(https?|wss?):\/\//.test(server.url)) {
           const headers = server.headers && typeof server.headers === 'object' ? Object.fromEntries(Object.entries(server.headers as Record<string, unknown>).filter(([key, item]) => typeof item === 'string' && !/authorization|cookie|token|secret|api[-_]?key/i.test(key)).map(([key, item]) => [key, item as string])) : undefined;
           const authEnv = typeof server.authEnv === 'string' && /^[A-Z_][A-Z0-9_]*$/.test(server.authEnv) ? server.authEnv : undefined;
-          const config: MCPServerConfig = { name, args, cwd: directory, url: server.url, transport: 'streamable-http', ...(authEnv ? { authEnv } : {}), ...(headers && Object.keys(headers).length ? { headers } : {}) };
+          const transport = /^wss?:\/\//.test(server.url) ? 'websocket' : 'streamable-http';
+          const config: MCPServerConfig = { name, args, cwd: directory, url: server.url, transport, ...(authEnv ? { authEnv } : {}), ...(headers && Object.keys(headers).length ? { headers } : {}) };
           merged.set(name, config);
           continue;
         }
