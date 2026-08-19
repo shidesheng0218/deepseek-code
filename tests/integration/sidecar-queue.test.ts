@@ -65,6 +65,8 @@ describe('Agent Sidecar session inbox', () => {
     const eventLines = (await readFile(join(root, 'sessions', 'queue-session.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(eventLines.length).toBeGreaterThan(0);
     expect(eventLines.every((event) => event.schemaVersion === 1 && typeof event.eventID === 'string' && typeof event.commandID === 'string' && typeof event.correlationID === 'string' && typeof event.sequence === 'number')).toBe(true);
-    expect(eventLines.map((event) => event.type)).toEqual(expect.arrayContaining(['input_enqueued', 'input_claimed']));
+    const types = eventLines.map((event) => String(event.type));
+    expect(types).toEqual(expect.arrayContaining(['input_enqueued', 'input_claimed']));
+    expect(types.indexOf('input_enqueued')).toBeLessThan(types.indexOf('input_claimed'));
   });
 });
