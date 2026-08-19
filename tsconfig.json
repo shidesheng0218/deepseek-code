@@ -14,5 +14,5 @@
     "resolveJsonModule": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src", "tests", "electron.vite.config.ts", "eslint.config.js"]
+  "include": ["src", "tests", "eslint.config.js"]
 }

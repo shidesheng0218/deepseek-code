@@ -23,7 +23,7 @@ assert.strictEqual(
 )
 assert.strictEqual(manifest.scripts.build, "npm run build:tauri")
 assert.strictEqual(manifest.scripts["build:tauri"], "npm --prefix apps/deepseek-code-desktop run build")
-assert.strictEqual(manifest.scripts["dev:swift"], "cd macos/DeepSeekCode && swift run DeepSeekCode")
+assert.strictEqual(manifest.scripts["dev:swift"], undefined, "legacy Swift dev entry must stay removed")
 assert.strictEqual(manifest.scripts["release:package"], "bash scripts/package-tauri-release.sh")
 assert.strictEqual(manifest.scripts["release:verify"], "bash scripts/verify-tauri-release.sh")
 assert.strictEqual(manifest.scripts["build:swift"], undefined, "legacy Swift app build entry must stay removed")

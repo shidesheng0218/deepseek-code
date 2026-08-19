@@ -9,7 +9,6 @@
   "bin": { "deepseek": "bin/deepseek.mjs" },
   "scripts": {
     "dev": "npm run dev:tauri",
-    "dev:swift": "cd macos/DeepSeekCode && swift run DeepSeekCode",
     "dev:tauri": "npm --prefix apps/deepseek-code-desktop run dev",
     "build": "npm run build:tauri",
     "build:tauri": "npm --prefix apps/deepseek-code-desktop run build",
