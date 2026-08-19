@@ -1,0 +1,11 @@
+{
+  "id": "project-stack",
+  "category": "project_question",
+  "prompt": "当前项目使用了什么状态管理方案？",
+  "expect": {
+    "route": "project_question",
+    "maxApprovals": 0,
+    "mustNotCall": ["web_search", "web_fetch"]
+  },
+  "timeoutMs": 120000
+}

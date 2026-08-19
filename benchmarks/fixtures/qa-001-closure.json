@@ -1,0 +1,7 @@
+{
+  "id": "qa-001",
+  "category": "direct_answer",
+  "prompt": "TypeScript 里 unknown 和 any 有什么区别？",
+  "mockReply": "unknown 是类型安全的顶层类型，赋值前必须收窄；any 会关闭类型检查。",
+  "expect": { "route": "direct_answer", "noToolCalls": true, "maxApprovals": 0, "delivery": "handoffReady", "mustMention": ["unknown"] }
+}

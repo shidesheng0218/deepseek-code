@@ -1,0 +1,7 @@
+{
+  "id": "qa-002",
+  "category": "direct_answer",
+  "prompt": "Git detached HEAD 是什么意思？",
+  "mockReply": "detached HEAD 表示 HEAD 直接指向某个提交而非分支。",
+  "expect": { "route": "direct_answer", "noToolCalls": true, "maxApprovals": 0, "delivery": "handoffReady", "mustMention": ["HEAD"] }
+}

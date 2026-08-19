@@ -1,0 +1,7 @@
+{
+  "id": "expl-001",
+  "category": "exploration",
+  "prompt": "探索当前仓库的构建入口",
+  "mockReply": "我来梳理仓库结构和构建配置。",
+  "expect": { "route": "exploration", "maxApprovals": 0 }
+}

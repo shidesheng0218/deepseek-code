@@ -1,0 +1,7 @@
+{
+  "id": "ci-001",
+  "category": "ci_repair",
+  "prompt": "CI 构建失败了，帮我看看原因",
+  "mockReply": "我来读取 CI 状态和失败日志。",
+  "expect": { "route": "ci_repair" }
+}

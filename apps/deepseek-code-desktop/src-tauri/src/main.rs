@@ -278,11 +278,33 @@ fn send_runtime_request(app: &AppHandle, state: &RuntimeProcess, payload: serde_
 
 fn uuid_like() -> String { format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()) }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStatus { available: bool, version: Option<String>, detail: String }
+
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<UpdateStatus, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|error| error.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => {
+            let version = update.version.clone();
+            match update.download_and_install(|_, _| {}, || {}).await {
+                Ok(()) => Ok(UpdateStatus { available: true, version: Some(version), detail: "已下载并安装，重启后生效".into() }),
+                Err(error) => Ok(UpdateStatus { available: true, version: Some(version), detail: format!("下载失败：{error}") })
+            }
+        }
+        Ok(None) => Ok(UpdateStatus { available: false, version: None, detail: "已是最新版本".into() }),
+        Err(error) => Ok(UpdateStatus { available: false, version: None, detail: format!("检查失败：{error}") })
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(RuntimeProcess(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, load_session_history, run_agent, resolve_approval, cancel_session, resume_session])
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, load_session_history, run_agent, resolve_approval, cancel_session, resume_session, check_for_update])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
 }

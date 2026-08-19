@@ -1,0 +1,7 @@
+{
+  "id": "del-001",
+  "category": "delivery",
+  "prompt": "修复完成后提交并创建 PR",
+  "mockReply": "修复验证通过后我会准备提交。",
+  "expect": { "route": "delivery" }
+}

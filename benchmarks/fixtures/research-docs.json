@@ -1,0 +1,11 @@
+{
+  "id": "research-docs",
+  "category": "web_research",
+  "prompt": "查一下 React 官方文档中 useEffect 的最新用法说明",
+  "expect": {
+    "route": "web_research",
+    "maxApprovals": 0,
+    "mustCall": ["web_search"]
+  },
+  "timeoutMs": 180000
+}

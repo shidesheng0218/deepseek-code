@@ -1,0 +1,7 @@
+{
+  "id": "proj-001",
+  "category": "project_question",
+  "prompt": "当前项目使用了什么状态管理方案？",
+  "mockReply": "让我查看项目结构后回答。",
+  "expect": { "route": "project_question", "maxApprovals": 0 }
+}

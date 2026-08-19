@@ -1,17 +1,24 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DeepSeek Code",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.deepseekcode.desktop",
   "build": { "beforeDevCommand": "npm run dev:web", "beforeBuildCommand": "npm run build:web", "devUrl": "http://localhost:1420", "frontendDist": "../dist" },
   "app": { "windows": [{ "label": "main", "title": "DeepSeek Code", "width": 1360, "height": 880, "minWidth": 960, "minHeight": 640, "resizable": true }], "security": { "csp": null } },
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": true,
     "externalBin": ["binaries/deepseek-agent-runtime"],
     "resources": {
       "resources/browser/": "browser/",
       "resources/playwright-core/": "playwright-core/"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/shidesheng0218/deepseek-code/releases/latest/download/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExNUM5NTZBQzU5NkI3OEMKUldTTXQ1YkZhcFZjb2VzVHIyYWlmY3JmVUNUTmk4NlJrdGhuelpybFh3bmE3cCs2VUNkS2ZYMUYK"
     }
   }
 }

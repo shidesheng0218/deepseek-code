@@ -108,6 +108,12 @@ flowchart LR
 - MCP HTTP 认证只接受 `authEnv` 环境变量引用（例如 `DEEPSEEK_MCP_DOCS_TOKEN`），不会把 Bearer Token、Cookie 或 API Key 从 `.mcp.json` 直接载入；401/403 会明确显示为认证失败。
 - 私有 MCP 的 Bearer Token 当前使用 Streamable HTTP `authEnv`；WebSocket 适用于公开或已有会话认证的 MCP，完整 OAuth 浏览器授权与刷新仍在生态收尾范围。
 - 运行中追加的第二条消息会进入同一 Session Inbox，在安全边界继续执行；事件帧复用持久 `eventID`，UI 按稳定 ID 去重，不重复渲染同一事件。
+- 崩溃恢复：Sidecar 启动时扫描会话事件日志，未领取的输入会被持久恢复；存在"结果未知的写入"或"待审批"时不自动续跑，而是标记 `recovery_attention` 提示用户，未知副作用永不自动重放。
+- 模型质量层：输入先经过确定性任务路由（直接问答 / 项目理解 / 代码修改 / 联网研究 / Browser 修复 / Review / CI 修复 / 交付），再生成执行决策（模型分层、响应契约、验证要求）；简单问题直接回答不调用工具，项目问题不会误触发联网；可配置独立的快速模型处理分类与短答。
+- 上下文工程：进入模型的消息按预算裁剪，超长工具输出压缩为"摘要 + 已压缩 N 字符 + 完整内容保留在 Evidence"，事件日志始终保留完整证据。
+- 联网研究支持 BYOK 搜索 Provider（Tavily / Brave / Exa，未配置时回退 DuckDuckGo）；结果按规范化 URL 去重、按可信度排序，每条来源带稳定 Citation ID 与 Prompt Injection 警告。
+- 自动更新：Release 构建在存在签名密钥时产出 minisign 签名的 updater 包与 `latest.json`，App 内检查更新后下载安装、重启生效；密钥只保存在本地 `~/.tauri/` 或 CI Secrets，不进入仓库。
+- 基准评测：`npm run bench` 用内置 mock Provider 确定性地验证路由、工具约束与交付门禁；`npm run bench:real` 使用真实 BYOK Provider 跑同题语料，`benchmarks/score.mjs` 汇总成功率、审批次数与 Token 成本，用于与 Claude Code 同题对照。
 - 旧版 `DeepSeekCodeCore` 仍是 Swift 迁移参考与兼容验证工具，不是 Tauri 用户下载版的运行时。
 
 ## 一次任务如何完成

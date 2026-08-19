@@ -1,0 +1,7 @@
+{
+  "id": "code-001",
+  "category": "code_change",
+  "prompt": "修复登录状态不同步的问题，并运行相关测试",
+  "mockReply": "我先定位登录状态管理代码。",
+  "expect": { "route": "code_change" }
+}

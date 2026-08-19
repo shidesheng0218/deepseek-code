@@ -73,6 +73,8 @@ jobs:
       - name: Build DeepSeek Code Tauri DMG
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run release:package
 
       - name: Verify DMG, checksum and metadata
@@ -86,6 +88,9 @@ jobs:
           name: DeepSeek-Code-${{ steps.version.outputs.version }}-arm64
           path: |
             dist/DeepSeek-Code-*.dmg
+            dist/DeepSeek-Code-*.app.tar.gz
+            dist/DeepSeek-Code-*.app.tar.gz.sig
+            dist/latest.json
             dist/SHA256SUMS.txt
             dist/release-metadata.json
 
@@ -95,8 +100,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${{ steps.version.outputs.version }}"
+          assets=(dist/DeepSeek-Code-*.dmg dist/SHA256SUMS.txt dist/release-metadata.json)
+          if [[ -f dist/latest.json ]]; then
+            assets+=(dist/DeepSeek-Code-*.app.tar.gz dist/DeepSeek-Code-*.app.tar.gz.sig dist/latest.json)
+          fi
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/DeepSeek-Code-*.dmg dist/SHA256SUMS.txt dist/release-metadata.json --clobber
+            gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" dist/DeepSeek-Code-*.dmg dist/SHA256SUMS.txt dist/release-metadata.json --generate-notes --title "DeepSeek Code ${{ steps.version.outputs.version }} (Community)"
+            gh release create "$tag" "${assets[@]}" --generate-notes --title "DeepSeek Code ${{ steps.version.outputs.version }} (Community)"
           fi

@@ -1,0 +1,11 @@
+{
+  "id": "code-fix",
+  "category": "code_change",
+  "prompt": "修复 README 中的拼写错误并运行相关检查",
+  "expect": {
+    "route": "code_change",
+    "maxApprovals": 2,
+    "mustCall": ["read_file"]
+  },
+  "timeoutMs": 300000
+}

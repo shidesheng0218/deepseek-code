@@ -1,0 +1,7 @@
+{
+  "id": "web-001",
+  "category": "web_research",
+  "prompt": "查一下今天上海的天气",
+  "mockReply": "我搜索一下最新的天气信息。",
+  "expect": { "route": "web_research" }
+}
