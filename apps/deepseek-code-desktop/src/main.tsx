@@ -381,7 +381,7 @@ function App() {
   }
 
   return <main className="shell">
-    <aside className="sidebar">
+    <aside className="sidebar" data-tauri-drag-region>
       <div className="brand"><span>◆</span><strong>DeepSeek Code</strong></div>
       <button className="new-session" type="button" onClick={beginNewSession}>＋ 新建任务</button>
       <nav><button className="active" type="button">会话</button><button type="button" onClick={() => setShowSettings(true)}>设置</button><button type="button">终端</button><button type="button">用量</button></nav>
@@ -392,7 +392,7 @@ function App() {
       <div className="privacy">本地优先 · 凭据保存在 Keychain</div>
     </aside>
     <section className="workspace">
-      <header><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "✦ 接下来做点什么？"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
+      <header data-tauri-drag-region><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "✦ 接下来做点什么？"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
       {(usage.input > 0 || usage.output > 0 || currentRoute) && <div className="usage-bar">{currentRoute && <span className="route-chip">{currentRoute}</span>}<span>输入 {usage.input.toLocaleString()}{usage.cached > 0 ? `（缓存 ${usage.cached.toLocaleString()}）` : ""}</span><span>输出 {usage.output.toLocaleString()}</span><span>模型 {settings.model}{settings.fastModel ? ` · 快速 ${settings.fastModel}` : ""}</span></div>}
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
       <section className={messages.length ? "conversation" : "conversation home"} aria-live="polite">
