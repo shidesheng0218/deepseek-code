@@ -9,7 +9,7 @@ const runtime = process.env.DEEPSEEK_RUNTIME_BINARY || join(root, 'apps/deepseek
 const sessionsRoot = process.env.DEEPSEEK_SESSION_ROOT || join(process.env.HOME || '.', 'Library/Application Support/DeepSeekCode/sessions');
 
 function usage() {
-  process.stderr.write('Usage: deepseek doctor | ask <prompt> | run <prompt> | session list | session attach <id> | session resume <id> | session fork <id> [--at N] [--reason text] | session branches <id> | session replay <id> [--at N]\n');
+  process.stderr.write('Usage: deepseek doctor | ask <prompt> | run <prompt> | session list | session attach <id> | session resume <id> | session fork <id> [--at N] [--reason text] | session branches <id> | session replay <id> [--at N] | receipt verify <file>\n');
   process.exit(2);
 }
 
@@ -86,6 +86,28 @@ async function replayCommand(args) {
   const verdict = result.matched === null ? '（部分回放，无比对）' : result.matched ? '一致 ✓' : '不一致 ✗';
   process.stdout.write(`回放校验：${verdict}\n门禁重算：${result.gateState}${result.recordedState ? `（记录：${result.recordedState}）` : ''}\n事件 ${result.eventCount} 条 · 对话 ${result.turns} 条\n`);
   if (result.matched === false) process.exitCode = 1;
+}
+
+/** 离线校验交付回执：重算日志哈希、门禁与证据，逐项给出结论（第三方可复跑）。 */
+async function receiptVerifyCommand(file) {
+  if (!file) usage();
+  const receipt = JSON.parse(await readFile(file, 'utf8'));
+  const logFile = join(sessionsRoot, `${receipt.sessionID}.jsonl`);
+  const text = await readFile(logFile, 'utf8').catch(() => '');
+  if (!text) { process.stderr.write(`Session log not found: ${logFile}\n`); process.exit(1); }
+  const events = text.split('\n').filter(Boolean).flatMap((line) => {
+    try {
+      const event = JSON.parse(line);
+      return [{ sequence: event.sequence, type: event.type, payload: event.payload }];
+    } catch { return []; }
+  });
+  // Node ≥22.18 自带类型剥离，可直接 import 核心 TS 模块（零依赖、可单文件分发的校验路径）。
+  const { verifyDeliveryReceipt } = await import('../src/core/delivery-receipt.ts');
+  const { evaluateDeliveryGate } = await import('../src/core/delivery-gate.ts');
+  const result = verifyDeliveryReceipt({ receipt, events, evaluateGate: evaluateDeliveryGate });
+  for (const check of result.checks) process.stdout.write(`${check.ok ? '✓' : '✗'} ${check.name}：${check.detail}\n`);
+  process.stdout.write(result.ok ? `回执有效：会话 ${receipt.sessionID} 的交付声明可复核。\n` : '回执校验失败。\n');
+  if (!result.ok) process.exitCode = 1;
 }
 
 function runProcess(args, input) {
@@ -212,6 +234,7 @@ try {
   else if (command === 'session' && args[0] === 'fork' && args[1]) await forkSessionCommand(args.slice(1));
   else if (command === 'session' && args[0] === 'branches' && args[1]) await branchesCommand(args[1]);
   else if (command === 'session' && args[0] === 'replay' && args[1]) await replayCommand(args.slice(1));
+  else if (command === 'receipt' && args[0] === 'verify' && args[1]) await receiptVerifyCommand(args[1]);
   else usage();
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

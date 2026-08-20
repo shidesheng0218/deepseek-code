@@ -26,6 +26,7 @@ import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from ".
 import { getGitHubCIStatus } from "../../../src/core/github-ci"
 import { buildCIRepairComment, findGitHubPullRequestForCommit, updateGitHubPullRequest } from "../../../src/core/github-pr"
 import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
+import { buildDeliveryReceipt } from "../../../src/core/delivery-receipt"
 import { collectBrowserEvidence } from "../../../src/core/browser-evidence"
 import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
 import { classifyCIFailureLog } from "../../../src/core/ci-log-classifier"
@@ -104,6 +105,7 @@ type RuntimeEvent =
   | { type: "ssh_terminal_completed"; hostID: string; terminalID?: unknown; sequence: number; state: string; exitCode: number }
   | { type: "ssh_terminal_closed"; hostID: string }
   | { type: "github_pr_updated"; number: number }
+  | { type: "receipt_issued"; receiptID: string; logHash: string; evidenceCount: number; receiptPath: string }
   | { type: "recovery_attention"; reason: string; message: string }
   | { type: "recovery_input_restored"; inputID: string }
   | { type: "decision_made"; route: string; modelTier: string; responseContract: string }
@@ -1043,6 +1045,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
     })
     const delivery = evaluateDeliveryGate(await eventStore.loadEvents(sessionID))
     await emitSessionEvent(sessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
+    if (delivery.state === "delivered") await issueReceipt(sessionID, projectPath, delivery)
     return { text: redact(result.text), status: result.status, messages: result.messages, delivery: delivery.state }
   } catch (error) {
     if (controller.signal.aborted) {
@@ -1098,7 +1101,37 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
   await emitSessionEvent(sessionID, { type: "turn_ended", reason: "completed", status: result.status })
   const delivery = evaluateDeliveryGate(await eventStore.loadEvents(sessionID))
   await emitSessionEvent(sessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
+  if (delivery.state === "delivered") await issueReceipt(sessionID, params.projectPath, delivery)
   return { text: redact(result.text), status: result.status, messages: result.messages, delivery: delivery.state, repairLineage }
+}
+
+/** 交付回执签发：gate 判定 delivered 时把结论绑定到可离线复核的哈希链上。
+ *  回执签发失败只降级（不签发），绝不反过来影响交付状态。 */
+async function issueReceipt(sessionID: string, projectPath: string, delivery: { state: string; reasons: string[] }): Promise<void> {
+  try {
+    const [headCommit, branch] = await Promise.all([
+      execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 }).then((result) => result.stdout.trim()).catch(() => ""),
+      execFile("git", ["-C", projectPath, "branch", "--show-current"], { maxBuffer: 10_000 }).then((result) => result.stdout.trim()).catch(() => "")
+    ])
+    const events = await eventStore.loadEvents(sessionID)
+    const receipt = buildDeliveryReceipt({
+      sessionID,
+      events,
+      gate: delivery,
+      projectPath,
+      ...(headCommit ? { headCommit } : {}),
+      ...(branch ? { branch } : {}),
+      receiptID: crypto.randomUUID(),
+      issuedAt: new Date().toISOString()
+    })
+    const directory = join(sessionRoot(), "receipts")
+    await mkdir(directory, { recursive: true })
+    const receiptPath = join(directory, `${sessionID}-${receipt.receiptID}.json`)
+    await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
+    await emitSessionEvent(sessionID, { type: "receipt_issued", receiptID: receipt.receiptID, logHash: receipt.events.logHash, evidenceCount: receipt.evidence.length, receiptPath })
+  } catch (error) {
+    process.stderr.write(`${redact(`receipt issuance skipped: ${error instanceof Error ? error.message : String(error)}`)}\n`)
+  }
 }
 
 async function drain(sessionID: string): Promise<void> {
