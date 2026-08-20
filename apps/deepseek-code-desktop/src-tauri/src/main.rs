@@ -116,6 +116,74 @@ fn sessions_path() -> PathBuf {
     home.join("Library/Application Support/DeepSeekCode/sessions")
 }
 
+fn projection_path() -> PathBuf { sessions_path().join("projection.db") }
+
+/// 会话投影（SQLite 物化视图）由 sidecar 维护；JSONL 是真源。
+/// 投影缺失或损坏时一切读取都退回扫描 JSONL。
+fn open_projection() -> Option<rusqlite::Connection> {
+    let path = projection_path();
+    if !path.exists() { return None; }
+    rusqlite::Connection::open(&path).ok()
+}
+
+fn projected_session_summaries(connection: &rusqlite::Connection) -> Option<Vec<SessionSummary>> {
+    let mut statement = connection.prepare("SELECT session_id, title, project_path, updated_at FROM sessions ORDER BY updated_at DESC").ok()?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?))
+    }).ok()?;
+    let mut sessions = Vec::new();
+    for row in rows.flatten() {
+        let (session_id, title, project_path, updated_at) = row;
+        if !is_safe_session_id(&session_id) { continue; }
+        let updated = chrono::DateTime::parse_from_rfc3339(&updated_at).map(|value| value.timestamp().max(0) as u64).unwrap_or(0);
+        sessions.push(SessionSummary {
+            title: title.filter(|value| !value.is_empty()).unwrap_or_else(|| session_id.clone()),
+            project_path: project_path.unwrap_or_default(),
+            session_id,
+            updated_at: updated,
+        });
+    }
+    Some(sessions)
+}
+
+/// 从投影读取全部事件，按会话分组（与 JSONL 扫描产出同构的事件 Value）。
+fn projected_events_by_session(connection: &rusqlite::Connection) -> Option<Vec<Vec<serde_json::Value>>> {
+    let mut statement = connection.prepare("SELECT session_id, type, payload, created_at FROM events ORDER BY session_id, sequence").ok()?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+    }).ok()?;
+    let mut by_session: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut current_session: Option<String> = None;
+    for row in rows.flatten() {
+        let (session_id, event_type, payload, created_at) = row;
+        if current_session.as_deref() != Some(session_id.as_str()) {
+            by_session.push(Vec::new());
+            current_session = Some(session_id.clone());
+        }
+        by_session.last_mut()?.push(serde_json::json!({
+            "sessionID": session_id,
+            "type": event_type,
+            "payload": serde_json::from_str::<serde_json::Value>(&payload).unwrap_or(serde_json::json!({})),
+            "createdAt": created_at
+        }));
+    }
+    Some(by_session)
+}
+
+fn load_session_events_grouped() -> Vec<Vec<serde_json::Value>> {
+    if let Some(connection) = open_projection() {
+        if let Some(grouped) = projected_events_by_session(&connection) { return grouped; }
+    }
+    let Ok(entries) = fs::read_dir(sessions_path()) else { return Vec::new(); };
+    entries.filter_map(Result::ok).filter_map(|entry| {
+        let path = entry.path();
+        let session_id = path.file_stem()?.to_str()?.to_string();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") || !is_safe_session_id(&session_id) { return None; }
+        let events = fs::read_to_string(&path).ok()?;
+        Some(events.lines().filter(|line| !line.trim().is_empty()).filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).collect::<Vec<_>>())
+    }).collect()
+}
+
 fn is_safe_session_id(session_id: &str) -> bool {
     !session_id.is_empty() && session_id.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
 }
@@ -171,6 +239,9 @@ fn session_project(events: &str) -> String {
 }
 
 fn list_session_summaries() -> Vec<SessionSummary> {
+    if let Some(connection) = open_projection() {
+        if let Some(summaries) = projected_session_summaries(&connection) { return summaries; }
+    }
     let Ok(entries) = fs::read_dir(sessions_path()) else { return Vec::new(); };
     let mut sessions = entries.filter_map(Result::ok).filter_map(|entry| {
         let path = entry.path();
@@ -197,16 +268,9 @@ fn compute_usage_stats(days: Option<u32>) -> UsageStats {
     let mut daily: HashMap<chrono::NaiveDate, u64> = HashMap::new();
     let mut hours = [0u64; 24];
     let mut models: HashMap<String, u64> = HashMap::new();
-    let Ok(entries) = fs::read_dir(sessions_path()) else { return stats; };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") { continue; }
-        let Some(session_id) = path.file_stem().and_then(|value| value.to_str()) else { continue; };
-        if !is_safe_session_id(session_id) { continue; }
-        let Ok(events) = fs::read_to_string(&path) else { continue; };
+    for session_events in load_session_events_grouped() {
         let mut counted_in_window = false;
-        for line in events.lines() {
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        for event in session_events {
             let Some(created) = event.get("createdAt").and_then(serde_json::Value::as_str)
                 .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()) else { continue; };
             let local = created.with_timezone(&chrono::Local);
@@ -459,6 +523,7 @@ mod tests {
 
     #[test]
     fn aggregates_usage_stats_from_session_event_logs() {
+        let _guard = home_lock().lock().unwrap();
         let temp = std::env::temp_dir().join(format!("deepseek-stats-test-{}", std::process::id()));
         let sessions = temp.join("Library/Application Support/DeepSeekCode/sessions");
         fs::create_dir_all(&sessions).expect("create temp sessions dir");
@@ -495,6 +560,50 @@ mod tests {
         let recent = compute_usage_stats(Some(30));
         assert_eq!(recent.messages, 3);
         assert_eq!(recent.active_days, 1);
+
+        if let Some(value) = previous_home { std::env::set_var("HOME", value); }
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    fn home_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn reads_sessions_and_usage_stats_from_projection_when_available() {
+        let _guard = home_lock().lock().unwrap();
+        let temp = std::env::temp_dir().join(format!("deepseek-projection-test-{}", std::process::id()));
+        let sessions = temp.join("Library/Application Support/DeepSeekCode/sessions");
+        fs::create_dir_all(&sessions).expect("create temp sessions dir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &temp);
+
+        let connection = rusqlite::Connection::open(sessions.join("projection.db")).expect("open projection db");
+        connection.execute_batch("
+            CREATE TABLE events (session_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_id TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session_id, sequence));
+            CREATE TABLE sessions (session_id TEXT PRIMARY KEY, title TEXT, project_path TEXT, created_at TEXT, updated_at TEXT, event_count INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE usage (session_id TEXT NOT NULL, sequence INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, PRIMARY KEY (session_id, sequence));
+        ").expect("create projection schema");
+        let now = chrono::Local::now().to_rfc3339();
+        connection.execute("INSERT INTO events (session_id, sequence, type, payload, created_at) VALUES ('proj-session', 1, 'turn_started', '{\"prompt\":\"来自投影的标题\",\"projectPath\":\"/tmp/proj\"}', ?1)", [&now]).expect("insert turn_started");
+        connection.execute("INSERT INTO events (session_id, sequence, type, payload, created_at) VALUES ('proj-session', 2, 'usage_recorded', '{\"inputTokens\":120,\"outputTokens\":30,\"cachedInputTokens\":5,\"model\":\"kimi\"}', ?1)", [&now]).expect("insert usage");
+        connection.execute("INSERT INTO sessions (session_id, title, project_path, created_at, updated_at, event_count) VALUES ('proj-session', '来自投影的标题', '/tmp/proj', ?1, ?1, 2)", [&now]).expect("insert session");
+        drop(connection);
+
+        // 目录里没有任何 JSONL：读到数据只能来自投影（快速路径），
+        // 同时证明回退扫描不会被投影文件本身干扰。
+        let summaries = list_session_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].title, "来自投影的标题");
+        assert_eq!(summaries[0].project_path, "/tmp/proj");
+
+        let stats = compute_usage_stats(None);
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.total_tokens, 150);
+        assert_eq!(stats.cached_tokens, 5);
+        assert_eq!(stats.favorite_model.as_deref(), Some("kimi"));
 
         if let Some(value) = previous_home { std::env::set_var("HOME", value); }
         let _ = fs::remove_dir_all(&temp);

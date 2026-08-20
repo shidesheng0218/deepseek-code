@@ -32,6 +32,7 @@ import { classifyCIFailureLog } from "../../../src/core/ci-log-classifier"
 import { createCIRepairSession, type CIRepairSession } from "../../../src/core/ci-repair-session"
 import { CIRepairQueue } from "../../../src/core/ci-repair-queue"
 import { redactSecrets } from "../../../src/core/secret-redactor"
+import { openProjection, type Projection } from "../../../src/core/session-projection"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
 import { decideExecution, decisionInstructions } from "../../../src/core/execution-decision"
@@ -170,6 +171,35 @@ function sessionRoot(): string {
   return process.env.DEEPSEEK_SESSION_ROOT ?? join(userDataDir("DeepSeekCode"), "sessions")
 }
 
+/**
+ * 会话投影（SQLite 物化视图）。纪律：JSONL 是真源，投影只是缓存——
+ * 初始化失败或写入失败都只降级为"无投影"，绝不阻塞事件日志。
+ */
+let projection: Projection | null = null
+
+async function initProjection(): Promise<void> {
+  try {
+    const dbPath = join(sessionRoot(), "projection.db")
+    const exists = await readFile(dbPath).then(() => true, () => false)
+    const next = await openProjection(dbPath)
+    if (!exists) await next.rebuildFromJsonl(sessionRoot())
+    projection = next
+  } catch (error) {
+    projection = null
+    process.stderr.write(`${redact(`projection disabled: ${error instanceof Error ? error.message : String(error)}`)}\n`)
+  }
+}
+
+function projectEvent(sessionID: string, sequence: number, eventID: string, type: string, payload: Record<string, unknown>, createdAt: string): void {
+  if (!projection) return
+  try {
+    projection.recordEvent({ sessionID, sequence, eventID, type, payload, createdAt })
+  } catch {
+    projection = null
+    process.stderr.write("projection disabled after a write failure; JSONL remains the source of truth\n")
+  }
+}
+
 interface RuntimeContext {
   skills: Skill[]
   extensions: LoadedExtensions
@@ -247,7 +277,9 @@ class JsonlEventStore {
       this.correlations.set(sessionID, correlationID)
       const commandID = typeof payload.commandID === "string" ? payload.commandID : `command:${correlationID}`
       const causationID = typeof payload.causationID === "string" ? payload.causationID : commandID
-      await appendFile(file, `${JSON.stringify({ schemaVersion: 1, eventID, commandID, causationID, correlationID, sessionID, sequence, type, payload, createdAt: new Date().toISOString() })}\n`)
+      const createdAt = new Date().toISOString()
+      await appendFile(file, `${JSON.stringify({ schemaVersion: 1, eventID, commandID, causationID, correlationID, sessionID, sequence, type, payload, createdAt })}\n`)
+      projectEvent(sessionID, sequence, eventID, type, payload, createdAt)
       return eventID
     })
     this.tails.set(sessionID, next.then(() => undefined, () => undefined))
@@ -1155,6 +1187,7 @@ if (process.argv.includes("--terminal-daemon")) {
     process.exit(0)
   }
 
+  await initProjection()
   await recoverInterruptedSessions()
 
   let buffer = ""
