@@ -12,12 +12,16 @@
 .stats-tabs button, .stats-ranges button { border: 0; border-radius: 6px; padding: 5px 11px; background: transparent; color: #8e9aac; font-size: 12px; }
 .stats-tabs button.active, .stats-ranges button.active { background: #252c38; color: #fff; }
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.stats-overview { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 24px; }
+.stats-overview .stats-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.heatmap-panel { display: grid; align-content: center; justify-items: start; gap: 10px; padding: 4px 2px 4px 24px; border-left: 1px solid #262d3a; }
+.heatmap-title { color: #8490a3; font-size: 11px; }
 .stat-card { display: grid; gap: 5px; padding: 10px 12px; border: 1px solid #262d3a; border-radius: 9px; background: rgba(16, 20, 28, .55); }
 .stat-card span { color: #8490a3; font-size: 11px; }
 .stat-card strong { overflow: hidden; color: #edf0f6; font-size: 17px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .heatmap { display: flex; gap: 3px; }
 .heatmap-week { display: grid; gap: 3px; }
-.heatmap-cell { width: 11px; height: 11px; border-radius: 2px; background: #232a37; }
+.heatmap-cell { width: 12px; height: 12px; border-radius: 2px; background: #232a37; }
 .heatmap-cell.level-1 { background: #134843; }
 .heatmap-cell.level-2 { background: #17705f; }
 .heatmap-cell.level-3 { background: #1fae8b; }
@@ -44,8 +48,9 @@
   .stats-card { gap: 12px; padding: 14px 16px; }
   .stat-card { padding: 8px 10px; }
   .stat-card strong { font-size: 15px; }
-  .heatmap-cell { width: 9px; height: 9px; }
+  .heatmap-cell { width: 10px; height: 10px; }
   .heatmap, .heatmap-week { gap: 2px; }
+  .heatmap-panel { gap: 7px; padding-left: 18px; }
   .quick-actions button { padding: 8px 12px; font-size: 12px; }
   .composer textarea { min-height: 64px; padding: 12px 14px; }
   .conversation { gap: 10px; }
@@ -57,6 +62,18 @@
   .stats-card { gap: 9px; }
   .stats-grid { gap: 7px; }
   .composer textarea { min-height: 48px; }
+}
+
+/* Narrow widths: shrink the heatmap first, then stack it below the cards. */
+@media (max-width: 1300px) {
+  .heatmap-cell { width: 10px; height: 10px; }
+  .heatmap, .heatmap-week { gap: 2px; }
+  .heatmap-panel { padding-left: 16px; }
+}
+
+@media (max-width: 1060px) {
+  .stats-overview { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .heatmap-panel { justify-items: center; padding: 14px 0 2px; border-left: 0; border-top: 1px solid #262d3a; }
 }
 .tool-group { justify-self: start; max-width: 84%; border: 1px solid #284e51; border-radius: 8px; background: rgba(18, 58, 57, .25); font-size: 13px; }
 .tool-group summary { display: flex; align-items: baseline; gap: 10px; padding: 7px 10px; cursor: pointer; list-style: none; }

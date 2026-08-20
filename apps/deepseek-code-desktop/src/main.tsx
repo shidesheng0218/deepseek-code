@@ -110,8 +110,13 @@ function StatsPanel({ stats, range, onRangeChange }: { stats: UsageStats | null;
       <nav className="stats-ranges">{STAT_RANGES.map((item) => <button key={item.key} type="button" className={range === item.key ? "active" : ""} onClick={() => onRangeChange(item.key)}>{item.label}</button>)}</nav>
     </header>
     {tab === "overview" && <>
-      <div className="stats-grid">{cards.map((card) => <div className="stat-card" key={card.label}><span>{card.label}</span><strong>{card.value}</strong></div>)}</div>
-      <Heatmap stats={stats} />
+      <div className="stats-overview">
+        <div className="stats-grid">{cards.map((card) => <div className="stat-card" key={card.label}><span>{card.label}</span><strong>{card.value}</strong></div>)}</div>
+        <div className="heatmap-panel">
+          <span className="heatmap-title">近 140 天活动</span>
+          <Heatmap stats={stats} />
+        </div>
+      </div>
       <p className="stats-fun">{books >= 1 ? `你的累计 Token 用量已超过 ${books} 本《红楼梦》。` : stats.totalTokens > 0 ? `累计 ${formatTokens(stats.totalTokens)} Token——再努力一点就赶上一本《红楼梦》了。` : "还没有 Token 记录，从第一个任务开始积累。"}</p>
     </>}
     {tab === "models" && <div className="model-rows">
