@@ -1,0 +1,33 @@
+{
+  "modelLabel": "kimi-k2.7-code（Moonshot AI）——deepseek 与 claude-code 两个 harness 同模型对照",
+  "_priceTodo": "把 pricePerMToken 按 Moonshot 控制台最新价格填入 deepseek 节，成本列才有数据；不填则成本列如实显示 —",
+  "harnesses": {
+    "deepseek": {
+      "protocol": "openai-compatible",
+      "baseURL": "https://api.moonshot.cn/v1",
+      "model": "kimi-k2.7-code",
+      "apiKeyEnv": "MOONSHOT_API_KEY",
+      "_note": "模型名以 Moonshot 控制台 /v1/models 为准；国际站用 https://api.moonshot.ai/v1"
+    },
+    "claude-code": {
+      "model": "kimi-k2.7-code",
+      "extraArgs": ["--permission-mode", "acceptEdits"],
+      "trustReportedCost": false,
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://api.moonshot.cn/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "$MOONSHOT_API_KEY"
+      },
+      "_note": "Claude Code CLI 通过 Moonshot 的 Anthropic 兼容端点跑同一个 Kimi 模型（端点路径以 Moonshot 文档为准）；$ 前缀表示从环境变量取值，密钥不落盘。trustReportedCost=false：其上报成本按 Anthropic 价目表计算，对 Kimi 失真"
+    },
+    "codex": {
+      "model": "gpt-5-codex",
+      "extraArgs": ["--full-auto"],
+      "note": "Codex 仅支持 OpenAI 系模型，与 Kimi 对照属跨模型行，不参与同模型结论"
+    },
+    "opencode": {
+      "model": "moonshot/kimi-k2-0905-preview",
+      "extraArgs": [],
+      "_note": "OpenCode 走自带 Provider 体系，可直接同模型（moonshot provider 需在 opencode 配置好凭据）"
+    }
+  }
+}

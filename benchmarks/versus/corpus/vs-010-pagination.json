@@ -1,0 +1,10 @@
+{
+  "id": "vs-010-pagination",
+  "title": "分页每页丢掉最后一条记录",
+  "category": "bug_fix",
+  "project": "projects/pagination",
+  "prompt": "用户反馈列表页每页的最后一条数据总是不显示，翻页后也永远找不到。请修复 src/paginate.js 的边界计算，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

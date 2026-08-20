@@ -114,6 +114,7 @@ brew install --cask shidesheng0218/tap/deepseek-code
 - 联网研究支持 BYOK 搜索 Provider（Tavily / Brave / Exa，未配置时回退 DuckDuckGo）；结果按规范化 URL 去重、按可信度排序，每条来源带稳定 Citation ID 与 Prompt Injection 警告。
 - 自动更新：Release 构建在存在签名密钥时产出 minisign 签名的 updater 包与 `latest.json`，App 内检查更新后下载安装、重启生效；密钥只保存在本地 `~/.tauri/` 或 CI Secrets，不进入仓库。
 - 基准评测：`npm run bench` 用内置 mock Provider 确定性地验证路由、工具约束与交付门禁；`npm run bench:real` 使用真实 BYOK Provider 跑同题语料，`benchmarks/score.mjs` 汇总成功率、审批次数与 Token 成本，用于与 Claude Code 同题对照。
+- 同模型对照基准台：`npm run bench:versus` 把同一批可验证任务交给 DeepSeek Code 与竞品 harness（Claude Code / Codex / OpenCode）同题同机运行，成功判定只看隔离工作区里的 verify 命令；语料、驱动器与指标口径见 [benchmarks/versus/README.md](benchmarks/versus/README.md)。
 - 旧版 `DeepSeekCodeCore` 仍是 Swift 迁移参考与兼容验证工具，不是 Tauri 用户下载版的运行时。
 
 ## 一次任务如何完成

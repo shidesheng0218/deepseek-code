@@ -1,0 +1,6 @@
+{
+  "name": "retry-backoff",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

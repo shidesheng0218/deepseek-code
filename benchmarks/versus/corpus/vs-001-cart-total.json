@@ -1,0 +1,10 @@
+{
+  "id": "vs-001-cart-total",
+  "title": "购物车合计金额计算错误",
+  "category": "bug_fix",
+  "project": "projects/cart-total",
+  "prompt": "这个项目的购物车合计金额算错了：购买多件同一商品时金额明显偏低。请定位根因并修复，然后运行 npm test 确认全部测试通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

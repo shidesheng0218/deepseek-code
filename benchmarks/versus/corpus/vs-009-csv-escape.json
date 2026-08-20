@@ -1,0 +1,10 @@
+{
+  "id": "vs-009-csv-escape",
+  "title": "CSV 序列化不转义导致格式破裂",
+  "category": "bug_fix",
+  "project": "projects/csv-escape",
+  "prompt": "导出的 CSV 在单元格包含逗号、引号或换行时格式破裂，Excel 打开列错位。请按 RFC 4180 习惯修复 src/csv.js 的转义，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

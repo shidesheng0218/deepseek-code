@@ -1,0 +1,10 @@
+{
+  "id": "vs-002-async-report",
+  "title": "异步报表汇总返回空数组",
+  "category": "bug_fix",
+  "project": "projects/async-report",
+  "prompt": "用户反馈报表接口经常返回空数组。loadReport 的实现对异步回调的处理有问题，导致行还没取回就返回了。请修复，保证返回所有行且与输入 id 顺序一致，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

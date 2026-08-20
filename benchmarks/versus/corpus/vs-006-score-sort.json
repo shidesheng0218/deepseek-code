@@ -1,0 +1,10 @@
+{
+  "id": "vs-006-score-sort",
+  "title": "排行榜排序结果错误且污染入参",
+  "category": "bug_fix",
+  "project": "projects/score-sort",
+  "prompt": "排行榜分数排序结果明显不对（80 排在 9 后面），而且调用方发现自己传入的数组被改了。请修复 src/ranking.js 的 sortScoresDesc，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

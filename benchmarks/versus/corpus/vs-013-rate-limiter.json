@@ -1,0 +1,10 @@
+{
+  "id": "vs-013-rate-limiter",
+  "title": "令牌桶限流器吞掉最后一个令牌",
+  "category": "bug_fix",
+  "project": "projects/rate-limiter",
+  "prompt": "限流器容量配置为 2 时，突发只能放行 1 个请求，恰好用完令牌时总是误判为限流。请修复 src/limiter.js 的边界判断，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

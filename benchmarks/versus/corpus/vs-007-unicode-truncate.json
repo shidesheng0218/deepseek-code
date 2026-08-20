@@ -1,0 +1,10 @@
+{
+  "id": "vs-007-unicode-truncate",
+  "title": "截断函数把 emoji 切成半个代理对",
+  "category": "bug_fix",
+  "project": "projects/unicode-truncate",
+  "prompt": "用户列表里带 emoji 的昵称截断后出现乱码（半个代理对字符）。请修复 src/truncate.js，按 Unicode 字符而不是 UTF-16 码元截断，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

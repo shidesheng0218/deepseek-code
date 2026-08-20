@@ -11,7 +11,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const resultsDir = join(root, 'benchmarks', 'results');
 
 if (!existsSync(resultsDir)) { console.error('No benchmark results yet'); process.exit(2); }
-const runs = readdirSync(resultsDir).sort();
+const runs = readdirSync(resultsDir).filter((name) => existsSync(join(resultsDir, name, 'summary.json'))).sort();
 const latest = runs.at(-1);
 if (!latest) { console.error('No benchmark results yet'); process.exit(2); }
 const runDir = join(resultsDir, latest);

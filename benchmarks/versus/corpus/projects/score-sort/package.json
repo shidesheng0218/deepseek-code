@@ -1,0 +1,6 @@
+{
+  "name": "score-sort",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-014-path-guard",
+  "title": "路径穿越防护可被兄弟目录绕过",
+  "category": "bug_fix",
+  "project": "projects/path-guard",
+  "prompt": "安全评审发现 resolveUnderRoot 的穿越防护有漏洞：访问 ../data-secret/key.pem 这种兄弟目录的路径没有被拦住（根目录是 /srv/data 时 /srv/data-secret 被误判为内部）。请修复 src/safePath.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

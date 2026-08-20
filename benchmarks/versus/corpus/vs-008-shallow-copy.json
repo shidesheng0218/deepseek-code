@@ -1,0 +1,10 @@
+{
+  "id": "vs-008-shallow-copy",
+  "title": "浅拷贝导致调用方数据被污染",
+  "category": "bug_fix",
+  "project": "projects/shallow-copy",
+  "prompt": "调用方反馈：调用 addTag 给副本打标签后，自己手里的原始 user 对象的 tags 也变了。请修复 src/userTags.js，杜绝跨对象的数据污染，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

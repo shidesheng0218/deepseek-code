@@ -1,0 +1,10 @@
+{
+  "id": "vs-012-dedupe-objects",
+  "title": "对象数组按 id 去重失效",
+  "category": "bug_fix",
+  "project": "projects/dedupe-objects",
+  "prompt": "合并多个数据源的用户列表后按 id 去重没有生效，同 id 的记录重复出现在结果里。请修复 src/dedupe.js，保留每个 id 首次出现的记录，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-015-group-by",
+  "title": "按测试规格实现 groupBy",
+  "category": "feature_add",
+  "project": "projects/group-by",
+  "prompt": "test/groupBy.test.js 描述了 groupBy 的完整规格，但 src/groupBy.js 还不存在。请按规格实现并导出 groupBy，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-016-retry-backoff",
+  "title": "按测试规格实现指数退避重试",
+  "category": "feature_add",
+  "project": "projects/retry-backoff",
+  "prompt": "test/retry.test.js 描述了 withRetry 的完整规格（含注入 sleep 以便确定性测试），但 src/retry.js 还不存在。请按规格实现并导出 withRetry，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

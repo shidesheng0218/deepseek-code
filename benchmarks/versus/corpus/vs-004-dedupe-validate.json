@@ -1,0 +1,10 @@
+{
+  "id": "vs-004-dedupe-validate",
+  "title": "消除重复校验逻辑（重构，行为不变）",
+  "category": "refactor",
+  "project": "projects/dedupe-validate",
+  "prompt": "src/register.js 和 src/profile.js 里有一份完全重复的校验逻辑。请把公共校验抽取为共享模块，消除重复，保持对外行为与错误消息不变。完成后运行 npm test 与 node scripts/check.mjs 确认。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-005-tenant-cache",
+  "title": "缓存键漏掉租户维度导致串数据",
+  "category": "bug_fix",
+  "project": "projects/tenant-cache",
+  "prompt": "多租户系统里出现串数据事故：tenant A 的用户查询到了 tenant B 的同名用户资料。请定位 src/tenantCache.js 的根因并修复，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

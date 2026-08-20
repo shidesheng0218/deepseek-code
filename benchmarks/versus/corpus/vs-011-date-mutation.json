@@ -1,0 +1,10 @@
+{
+  "id": "vs-011-date-mutation",
+  "title": "startOfDay 原地修改了调用方的 Date",
+  "category": "bug_fix",
+  "project": "projects/date-mutation",
+  "prompt": "排期模块出现诡异的时间错乱：调用 startOfDay 之后，调用方手里的 Date 对象小时数变成了 0。请修复 src/dates.js，让纯函数语义成立，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

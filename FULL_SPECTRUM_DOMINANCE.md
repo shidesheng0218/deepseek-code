@@ -55,6 +55,20 @@ Claude Code 永远只能用 Claude，Codex 永远只能用 OpenAI。
 
 ### A1 同模型对照基准台（`bench:versus`，最高优先级）
 
+> **实施状态（2026-08-20）**：骨架已落地于 [benchmarks/versus/](benchmarks/versus/README.md)——
+> 四个驱动器（deepseek / claude-code / codex / opencode）、16 题语料（bug_fix 12 /
+> feature_add 2 / refactor 2，全部零外部依赖、命令可验证、双向校验"原始必挂/修复必过"）、
+> harvest 汇总与 Markdown/JSON 报告（可 minisign 签名），`--check-corpus` 与
+> `--self-test` 离线自检全绿。下一步：真实 issue 语料扩到 ≥60 题 + 接入 CI 周跑。
+>
+> **首跑实证（kimi-k2.7-code 同模型，当时语料 4 题 × 1 轮）**：deepseek 4/4、平均 8.3K tok、
+> 0 审批、中位 22s；claude-code 3/4、平均 20.1K tok、平均 1.8 次审批、中位 43s。
+> 唯一的失败是 claude-code 在 vs-003 实现了隐蔽 bug（符号当分隔符的规格漏处理）
+> 且 headless 下无法运行 npm test 自验——被隔离 verify 直接判死，
+> 这正是"成功判定不看 harness 自述"的价值。首跑还抓出并修复了一个核心协议缺陷：
+> 历史上下文缺 assistant tool_calls 配对消息（DeepSeek 宽容、Moonshot/Anthropic 严格拒绝），
+> 修复后 163 项测试全绿。早期样本不构成统计结论，只证明证据机已可用。
+
 唯一诚实的度量台。技术方案：
 
 ```

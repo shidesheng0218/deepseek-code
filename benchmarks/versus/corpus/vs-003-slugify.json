@@ -1,0 +1,10 @@
+{
+  "id": "vs-003-slugify",
+  "title": "按测试规格实现 slugify",
+  "category": "feature_add",
+  "project": "projects/slugify",
+  "prompt": "测试文件 test/slug.test.js 描述了一个 slugify 函数的完整规格，但 src/slug.js 还不存在。请按规格实现它（导出 slugify），运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}
