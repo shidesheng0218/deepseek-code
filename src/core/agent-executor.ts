@@ -60,7 +60,10 @@ export class AgentExecutor {
   private readonly maxTurns: number;
 
   constructor(private readonly options: AgentExecutorOptions) {
-    this.maxTurns = options.maxTurns ?? 8;
+    // 8 对"一回合一个工具"风格的模型太紧：read→patch→test→read→patch→test
+    // 的修复循环本身就占 7+ 回合（bench:versus 在 deepseek-v4-pro 上实测撞上）。
+    // 16 仍是有界上限，失控循环依然会被拦下。
+    this.maxTurns = options.maxTurns ?? 16;
   }
 
   async run(sessionId: string, prompt: string, history: AgentMessage[] = []): Promise<AgentRunResult> {
