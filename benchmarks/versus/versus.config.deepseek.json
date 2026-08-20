@@ -1,0 +1,23 @@
+{
+  "modelLabel": "deepseek-v4-pro（DeepSeek 官方）——deepseek 与 claude-code 两个 harness 同模型对照",
+  "_usage": "VS_CONFIG=benchmarks/versus/versus.config.deepseek.json node benchmarks/versus/run.mjs",
+  "harnesses": {
+    "deepseek": {
+      "protocol": "openai-compatible",
+      "baseURL": "https://api.deepseek.com/v1",
+      "model": "deepseek-v4-pro",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "_note": "另有 deepseek-v4-flash 可用于快速/低成本档"
+    },
+    "claude-code": {
+      "model": "deepseek-v4-pro",
+      "extraArgs": ["--permission-mode", "acceptEdits"],
+      "trustReportedCost": false,
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "$DEEPSEEK_API_KEY"
+      },
+      "_note": "DeepSeek 的 Anthropic 兼容端点已实测返回 200（2026-08-20）"
+    }
+  }
+}

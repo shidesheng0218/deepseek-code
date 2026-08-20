@@ -58,6 +58,18 @@ harness 差异的唯一诚实度量是控制模型不变。`versus.config.json`�
 价目表计算，对 Kimi 失真——配置里 `trustReportedCost: false` 会将其置空，
 跨 harness 成本比较一律用 token 口径。
 
+### 多模型 Profile（VS_CONFIG 切换）
+
+`VS_CONFIG=<path>` 可指定另一份配置，默认是 `versus.config.json`（Kimi）。
+仓库附带 `versus.config.deepseek.json`（deepseek-v4-pro 同模型对照，已实测）：
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+VS_CONFIG=benchmarks/versus/versus.config.deepseek.json node benchmarks/versus/run.mjs --harness=deepseek,claude-code
+```
+
+同一语料在多个模型族上各跑一遍，harness 差距是否跨模型稳定，是证据机最强的信号。
+
 ## 语料任务格式
 
 ```jsonc
