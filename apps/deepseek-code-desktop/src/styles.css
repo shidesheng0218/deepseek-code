@@ -36,6 +36,7 @@
 .quick-actions { display: flex; flex-wrap: wrap; gap: 10px; max-width: 900px; }
 .quick-actions button { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border: 1px solid #2f3847; border-radius: 10px; color: #d5dce8; background: rgba(26, 31, 42, .8); font-size: 13px; transition: border-color .15s, transform .15s; }
 .quick-actions button:hover { border-color: #45a79d; transform: translateY(-1px); }
+.quick-actions button svg { flex: 0 0 auto; width: 14px; height: 14px; color: #76e3d9; }
 .session-group { display: grid; gap: 2px; }
 .session-group-name { margin: 6px 4px 2px; overflow: hidden; color: #71809a; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 

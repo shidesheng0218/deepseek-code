@@ -65,11 +65,19 @@ const STAT_RANGES = [{ key: "all", label: "全部", days: undefined }, { key: "3
 type StatRangeKey = typeof STAT_RANGES[number]["key"]
 
 const QUICK_ACTIONS = [
-  { icon: "🐞", label: "修复 Bug", prompt: "定位并修复当前项目中最严重的一个问题，修复后运行相关测试验证。" },
-  { icon: "🔍", label: "理解代码", prompt: "梳理当前项目的整体架构，说明核心模块的职责和它们之间的交互。" },
-  { icon: "🌐", label: "联网研究", prompt: "联网查询本项目主要依赖的最新官方文档，总结与当前版本相关的重要变化。" },
-  { icon: "✅", label: "运行测试", prompt: "运行当前项目的测试套件，分析失败用例的根因并修复。" },
-]
+  { icon: "bug", label: "修复 Bug", prompt: "定位并修复当前项目中最严重的一个问题，修复后运行相关测试验证。" },
+  { icon: "code", label: "理解代码", prompt: "梳理当前项目的整体架构，说明核心模块的职责和它们之间的交互。" },
+  { icon: "globe", label: "联网研究", prompt: "联网查询本项目主要依赖的最新官方文档，总结与当前版本相关的重要变化。" },
+  { icon: "play", label: "运行测试", prompt: "运行当前项目的测试套件，分析失败用例的根因并修复。" },
+] as const
+
+function QuickIcon({ name }: { name: string }) {
+  const common = { fill: "none", stroke: "currentColor", strokeWidth: 1.4, strokeLinecap: "round", strokeLinejoin: "round" } as const
+  if (name === "bug") return <svg viewBox="0 0 16 16" {...common}><circle cx="8" cy="9.5" r="3.4" /><path d="M6 6.6 4.9 4.8M10 6.6l1.1-1.8M4.6 9H2.2M4.9 11.4l-1.7 1.4M11.4 9h2.4M11.1 11.4l1.7 1.4" /></svg>
+  if (name === "code") return <svg viewBox="0 0 16 16" {...common}><path d="M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5" /></svg>
+  if (name === "globe") return <svg viewBox="0 0 16 16" {...common}><circle cx="8" cy="8" r="5.8" /><ellipse cx="8" cy="8" rx="2.5" ry="5.8" /><path d="M2.2 8h11.6" /></svg>
+  return <svg viewBox="0 0 16 16" {...common}><circle cx="8" cy="8" r="5.8" /><path d="M6.6 5.4 11 8l-4.4 2.6z" fill="currentColor" stroke="none" /></svg>
+}
 
 function Heatmap({ stats }: { stats: UsageStats }) {
   const cells = stats.dailyActivity
@@ -391,7 +399,7 @@ function App() {
         {!messages.length && <>
           {(!settings.apiKey.trim() || !settings.projectPath.trim()) && <p className="setup-hint">先在<button type="button" className="setup-link" onClick={() => setShowSettings(true)}>设置</button>里配置项目目录和 API Key，然后直接描述任务。</p>}
           <StatsPanel stats={stats} range={statsRange} onRangeChange={changeStatsRange} />
-          <div className="quick-actions">{QUICK_ACTIONS.map((action) => <button key={action.label} type="button" onClick={() => applyQuickAction(action.prompt)}><span>{action.icon}</span>{action.label}</button>)}</div>
+          <div className="quick-actions">{QUICK_ACTIONS.map((action) => <button key={action.label} type="button" onClick={() => applyQuickAction(action.prompt)}><QuickIcon name={action.icon} />{action.label}</button>)}</div>
         </>}
         {groupConversation(messages).map((item) => item.kind === "toolGroup"
           ? <ToolActivityGroup key={item.key} activities={item.activities} />
