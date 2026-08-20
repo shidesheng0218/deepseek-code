@@ -1,9 +1,10 @@
-import type { ModelEvent } from './openai-compatible';
+import type { AgentToolCall, ModelEvent } from './openai-compatible';
 
 export interface AnthropicMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   toolCallId?: string;
+  toolCalls?: AgentToolCall[];
 }
 
 export interface AnthropicChatRequestInput {
@@ -19,9 +20,21 @@ interface AnthropicToolResultBlock {
   content: string;
 }
 
+interface AnthropicTextBlock {
+  type: 'text';
+  text: string;
+}
+
+interface AnthropicToolUseBlock {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
 interface AnthropicMessageRequest {
   role: 'user' | 'assistant';
-  content: string | AnthropicToolResultBlock[];
+  content: string | Array<AnthropicToolResultBlock | AnthropicTextBlock | AnthropicToolUseBlock>;
 }
 
 export interface AnthropicMessagesRequest {
@@ -69,6 +82,13 @@ export function buildAnthropicMessagesRequest(input: AnthropicChatRequestInput):
       return [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: message.toolCallId, content: message.content }] }];
     }
     if (message.role === 'tool') return [{ role: 'user', content: message.content }];
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      // tool_use 块必须先于对应的 tool_result 出现，否则 Anthropic 校验会拒绝整个请求。
+      const blocks: Array<AnthropicTextBlock | AnthropicToolUseBlock> = [];
+      if (message.content) blocks.push({ type: 'text', text: message.content });
+      for (const call of message.toolCalls) blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.arguments });
+      return [{ role: 'assistant', content: blocks }];
+    }
     return [{ role: message.role, content: message.content }];
   });
   const tools = lowerTools(input.tools);

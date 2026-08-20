@@ -1,13 +1,22 @@
+export interface AgentToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   toolCallId?: string;
+  /** assistant 消息携带的工具调用；与后续 tool 消息的 toolCallId 一一配对（严格 Provider 强制要求） */
+  toolCalls?: AgentToolCall[];
 }
 
 interface OpenAICompatibleMessage {
   role: ChatMessage['role'];
   content: string;
   tool_call_id?: string;
+  tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
 }
 
 export interface ChatRequestInput {
@@ -53,7 +62,16 @@ export function buildChatRequest(input: ChatRequestInput): OpenAICompatibleReque
     messages: input.messages.map((message) => ({
       role: message.role,
       content: message.content,
-      ...(message.toolCallId === undefined ? {} : { tool_call_id: message.toolCallId })
+      ...(message.toolCallId === undefined ? {} : { tool_call_id: message.toolCallId }),
+      ...(message.role === 'assistant' && message.toolCalls?.length
+        ? {
+            tool_calls: message.toolCalls.map((call) => ({
+              id: call.id,
+              type: 'function' as const,
+              function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+            }))
+          }
+        : {})
     })),
     max_tokens: OUTPUT_CAPS[input.feature],
     stream: true,

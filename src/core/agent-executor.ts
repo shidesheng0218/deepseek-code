@@ -1,13 +1,15 @@
 import { AgentRuntime } from './agent-runtime';
 import { buildContext, DEFAULT_CONTEXT_BUDGET, type ContextBudget } from './context-builder';
 import type { AgentMode } from './permissions';
-import type { ModelEvent } from './providers/openai-compatible';
+import type { AgentToolCall, ModelEvent } from './providers/openai-compatible';
 import { ToolExecutionPipeline, type PipelineHooks, type ToolDefinition, type ToolPipelineEvent } from './tool-execution-pipeline';
 
 export interface AgentMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   toolCallId?: string;
+  /** assistant 消息携带的工具调用；与后续 tool 消息的 toolCallId 一一配对 */
+  toolCalls?: AgentToolCall[];
 }
 
 export interface ApprovedToolCall {
@@ -78,6 +80,9 @@ export class AgentExecutor {
       ...history
     ];
     const pipeline = this.createPipeline(runtime);
+    // 先补回发起这次调用的 assistant tool_calls 消息，再执行工具：
+    // 严格校验的 Provider（Moonshot、Anthropic）会拒绝没有配对 tool_calls 的孤儿 tool 消息。
+    messages.push({ role: 'assistant', content: '', toolCalls: [{ id: approved.id, name: approved.tool, arguments: approved.arguments }] });
     const outcome = await pipeline.executeApproved(approved);
     if (outcome.state !== 'completed') throw new Error('Approved tool execution unexpectedly requested approval');
     messages.push({ role: 'tool', content: outcome.content, toolCallId: approved.id });
@@ -100,26 +105,36 @@ export class AgentExecutor {
 
     try {
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
-        let invokedTool = false;
+        const pendingCalls: ToolCallEvent[] = [];
+        let turnText = '';
         for await (const event of this.options.model.stream(buildContext(messages, this.options.contextBudget ?? DEFAULT_CONTEXT_BUDGET))) {
           if (event.type === 'text_delta') {
             text += event.text;
+            turnText += event.text;
             emit({ type: 'assistant_text', text: event.text });
             continue;
           }
-          invokedTool = true;
-          const outcome = await pipeline.execute({ id: event.id, tool: event.name, arguments: event.arguments });
-          if (outcome.state === 'awaitingApproval') {
-            messages.push({ role: 'tool', content: JSON.stringify({ ok: false, code: 'APPROVAL_REQUIRED' }), toolCallId: event.id });
-            return { text, runtime, messages, status: runtime.state.status, pendingApproval: outcome.pending };
-          }
-          messages.push({ role: 'tool', content: outcome.content, toolCallId: event.id });
+          pendingCalls.push(event);
         }
-        if (!invokedTool) {
+        if (pendingCalls.length === 0) {
           runtime.complete();
           emit({ type: 'completed', text });
-          if (text) messages.push({ role: 'assistant', content: text });
+          if (turnText) messages.push({ role: 'assistant', content: turnText });
           return { text, runtime, messages, status: runtime.state.status };
+        }
+        // 协议纪律：assistant 的 tool_calls 必须先于对应 tool 结果进入历史。
+        messages.push({
+          role: 'assistant',
+          content: turnText,
+          toolCalls: pendingCalls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments }))
+        });
+        for (const call of pendingCalls) {
+          const outcome = await pipeline.execute({ id: call.id, tool: call.name, arguments: call.arguments });
+          if (outcome.state === 'awaitingApproval') {
+            messages.push({ role: 'tool', content: JSON.stringify({ ok: false, code: 'APPROVAL_REQUIRED' }), toolCallId: call.id });
+            return { text, runtime, messages, status: runtime.state.status, pendingApproval: outcome.pending };
+          }
+          messages.push({ role: 'tool', content: outcome.content, toolCallId: call.id });
         }
       }
       throw new Error(`Agent exceeded ${this.maxTurns} tool turns`);

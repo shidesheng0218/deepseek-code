@@ -27,6 +27,31 @@ function summarizeToolOutput(content: string): string {
   return `${head}\n…[已压缩 ${content.length - 2_500} 字符，完整输出保留在 Evidence]…\n${tail}`;
 }
 
+/**
+ * 丢弃失去配对的工具消息。预算裁剪可能切断 assistant 的 toolCalls 与对应
+ * tool 结果消息，孤儿 tool 消息会被严格 Provider（Moonshot、Anthropic）拒绝。
+ * 旧格式历史（没有任何 assistant toolCalls，例如事件日志重建的对话）原样保留。
+ */
+function dropOrphanToolMessages(messages: AgentMessage[]): AgentMessage[] {
+  const declared = new Set<string>();
+  const answered = new Set<string>();
+  for (const message of messages) {
+    if (message.role === 'assistant') for (const call of message.toolCalls ?? []) declared.add(call.id);
+    if (message.role === 'tool' && message.toolCallId) answered.add(message.toolCallId);
+  }
+  if (declared.size === 0) return messages;
+  return messages.flatMap((message) => {
+    if (message.role === 'tool') return message.toolCallId && declared.has(message.toolCallId) ? [message] : [];
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      const calls = message.toolCalls.filter((call) => answered.has(call.id));
+      if (calls.length === message.toolCalls.length) return [message];
+      if (calls.length === 0) return message.content ? [{ role: 'assistant' as const, content: message.content }] : [];
+      return [{ ...message, toolCalls: calls }];
+    }
+    return [message];
+  });
+}
+
 export function buildContext(messages: AgentMessage[], budget: ContextBudget = DEFAULT_CONTEXT_BUDGET): AgentMessage[] {
   const system = messages.filter((message) => message.role === 'system');
   const rest = messages.filter((message) => message.role !== 'system');
@@ -51,5 +76,5 @@ export function buildContext(messages: AgentMessage[], budget: ContextBudget = D
     total += message.content.length;
     kept.unshift(message);
   }
-  return [...system, ...kept];
+  return [...system, ...dropOrphanToolMessages(kept)];
 }

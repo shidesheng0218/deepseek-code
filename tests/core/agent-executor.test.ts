@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { AgentExecutor } from '../../src/core/agent-executor';
+import { AgentExecutor, type AgentMessage } from '../../src/core/agent-executor';
 
 describe('agent executor', () => {
   test('emits an auditable event for each tool and completes after the model responds', async () => {
@@ -141,5 +141,55 @@ describe('agent executor', () => {
       { role: 'user', content: '之前的问题' },
       { role: 'user', content: '继续' }
     ]);
+  });
+
+  test('pairs assistant tool_calls with tool results for strict providers (Moonshot/Anthropic)', async () => {
+    let secondRequest: AgentMessage[] = [];
+    let call = 0;
+    const executor = new AgentExecutor({
+      mode: 'accept_edits',
+      model: {
+        stream: async function* (messages) {
+          call += 1;
+          if (call === 1) {
+            yield { type: 'tool_call', id: 'read-1', name: 'read_file', arguments: { path: 'README.md' } } as const;
+            yield { type: 'tool_call', id: 'read-2', name: 'read_file', arguments: { path: 'package.json' } } as const;
+          } else {
+            secondRequest = [...messages];
+            yield { type: 'text_delta', text: '完成' } as const;
+          }
+        }
+      },
+      tools: { read_file: async () => 'content' }
+    });
+
+    await executor.run('s1', '读取两个文件');
+
+    const assistantIndex = secondRequest.findIndex((message) => message.role === 'assistant' && message.toolCalls?.length);
+    expect(assistantIndex).toBeGreaterThanOrEqual(0);
+    expect(secondRequest[assistantIndex]?.toolCalls).toEqual([
+      { id: 'read-1', name: 'read_file', arguments: { path: 'README.md' } },
+      { id: 'read-2', name: 'read_file', arguments: { path: 'package.json' } }
+    ]);
+    const results = secondRequest.slice(assistantIndex + 1).filter((message) => message.role === 'tool');
+    expect(results.map((message) => message.toolCallId)).toEqual(['read-1', 'read-2']);
+  });
+
+  test('resume backfills the assistant tool_calls message before the approved tool result', async () => {
+    let received: AgentMessage[] = [];
+    const executor = new AgentExecutor({
+      mode: 'manual',
+      model: { stream: async function* (messages) { received = [...messages]; yield { type: 'text_delta', text: '已确认' } as const; } },
+      tools: { apply_patch: async () => 'changed' }
+    });
+
+    await executor.resume('s1', [{ role: 'user', content: '修改 README' }], {
+      id: 'patch-1', tool: 'apply_patch', arguments: { changes: [{ path: 'README.md', content: 'next' }] }
+    });
+
+    const assistantIndex = received.findIndex((message) => message.role === 'assistant' && message.toolCalls?.length);
+    expect(assistantIndex).toBeGreaterThanOrEqual(0);
+    expect(received[assistantIndex]?.toolCalls).toEqual([{ id: 'patch-1', name: 'apply_patch', arguments: { changes: [{ path: 'README.md', content: 'next' }] } }]);
+    expect(received[assistantIndex + 1]).toMatchObject({ role: 'tool', toolCallId: 'patch-1' });
   });
 });

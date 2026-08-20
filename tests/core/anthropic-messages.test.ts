@@ -22,6 +22,25 @@ describe('Anthropic Messages provider', () => {
     expect(request.tools).toEqual([{ name: 'read_file', description: 'Read a file', input_schema: { type: 'object' } }]);
   });
 
+  test('emits assistant tool_use blocks before their tool_result counterparts', () => {
+    const request = buildAnthropicMessagesRequest({
+      model: 'claude-sonnet',
+      feature: 'main_agent',
+      messages: [
+        { role: 'user', content: 'Read README.' },
+        { role: 'assistant', content: '先读取。', toolCalls: [{ id: 'toolu_1', name: 'read_file', arguments: { path: 'README.md' } }] },
+        { role: 'tool', toolCallId: 'toolu_1', content: '{"ok":true}' }
+      ],
+      tools: []
+    });
+
+    expect(request.messages).toEqual([
+      { role: 'user', content: 'Read README.' },
+      { role: 'assistant', content: [{ type: 'text', text: '先读取。' }, { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'README.md' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '{"ok":true}' }] }
+    ]);
+  });
+
   test('parses streaming text, tool input deltas and token usage', async () => {
     const source = [
       'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":4}}}\n\n',
