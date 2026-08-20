@@ -61,16 +61,25 @@ Claude Code 永远只能用 Claude，Codex 永远只能用 OpenAI。
 > harvest 汇总与 Markdown/JSON 报告（可 minisign 签名），`--check-corpus` 与
 > `--self-test` 离线自检全绿。下一步：真实 issue 语料扩到 ≥60 题 + 接入 CI 周跑。
 >
-> **首跑实证（kimi-k2.7-code 同模型，16 题 × 1 轮，2026-08-20）**：deepseek **16/16（100%）**、
-> 均摊 8.5K tok/成功、0 审批、中位 16s；claude-code 15/16（94%）、15.0K tok/成功、
-> 平均 2.6 次审批、中位 47s。唯一失败（vs-016）为 retry 次数语义 off-by-one，
-> 且 claude-code 在 headless 下无法运行 npm test 自验、带错交付——被隔离 verify 判死；
-> 同一失效模式在 4 题预跑（vs-003）已出现过一次，构成可复现的对照信号。
-> 同模型下 token 成本约为对手 57%、耗时约 1/3、审批打断为 0——
-> 与成本战线（≤1/3 目标）和低打断目标（≤60%）方向一致。
-> 首跑还抓出并修复了一个核心协议缺陷：历史上下文缺 assistant tool_calls 配对消息
-> （DeepSeek 宽容、Moonshot/Anthropic 严格拒绝），修复后 163 项测试全绿。
-> 样本仍小，结论待 ≥60 题语料与多轮复核确认。
+> **首跑实证（16 题 × 1 轮 × 两个模型族，2026-08-20）**：
+>
+> | 模型 | deepseek | claude-code |
+> | --- | --- | --- |
+> | kimi-k2.7-code | **16/16**，8.5K tok/成功，0 审批，16s | 15/16，15.0K tok，2.6 审批，47s |
+> | deepseek-v4-pro | 15/16*，13.3K tok/成功，0 审批，17s | **16/16**，26.5K tok，4.0 审批，38s |
+>
+> \*vs-013 实为 harness 侧 turn 预算（8）过紧导致工作完成后被中断，非模型能力问题；
+> 已修复为 16 并复跑通过。claude-code 在 kimi 上的唯一失败（vs-016）是 retry 语义
+> off-by-one 且 headless 下无法自验、带错交付——同一失效模式连续两轮复现。
+>
+> **跨模型族稳定成立的信号**：token 成本为对手 50–57%、耗时约 1/2.5、审批打断 0 vs 2.6–4.0——
+> 与成本战线（≤1/3 目标）和低打断目标（≤60%）方向一致；成功率双方互有单次失手，
+> 需 ≥60 题语料与多轮复核才能下结论。首跑还抓出并修复了两个 harness 级缺陷：
+> assistant tool_calls 配对（Moonshot/Anthropic 严格校验）与 turn 预算过紧。
+>
+> **Phase 0 地基已落地（2026-08-20）**：`src/core/session-projection.ts` 投影层
+> （bun:sqlite / node:sqlite 双后端、随写随更、可整体重建），sidecar 启动初始化，
+> Rust `list_sessions` / `usage_stats` 优先读投影、缺失自动退回 JSONL 扫描。
 
 唯一诚实的度量台。技术方案：
 
