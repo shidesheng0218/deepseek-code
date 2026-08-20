@@ -71,6 +71,14 @@ flowchart TB
 
 > 差异化最大、工程量中等、且是所有后续支柱的地基。**先做。**
 
+> **实施状态（2026-08-20）**：投影层、分叉、回放校验已落地（Phase 0/1 提前合流）——
+> `src/core/session-projection.ts`（events/sessions/usage 三表 + 分叉血缘列，
+> 模式演进自动清空重建）、sidecar 启动引导与随写随更、Rust 双源读取（投影优先、
+> JSONL 兜底）；`session.fork` / `session.branches` / `session.replay` IPC 与
+> CLI（`deepseek session fork/branches/replay`）；分叉会话首轮运行继承源历史的
+> 端到端测试已验证（mock Provider 断言上下文注入顺序）。
+> 待办：模型级回放（model_stream_recorded 录制 + RecordingProvider 重放）与 UI 时间线分叉按钮。
+
 ### 1.1 现状
 
 - 事件写入：[apps/deepseek-agent-runtime/src/main.ts](apps/deepseek-agent-runtime/src/main.ts) 的

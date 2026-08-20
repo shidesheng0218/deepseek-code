@@ -57,11 +57,15 @@ type ProviderProtocol = "openai-compatible" | "anthropic-messages"
 
 type Request = {
   id: string
-  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover"
+  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover" | "session.fork" | "session.branches" | "session.replay"
   params?: Partial<AgentRunParams> & {
     text?: string
     approvalID?: string
     decision?: "allow" | "deny"
+    baseSequence?: number
+    untilSequence?: number
+    reason?: string
+    newSessionID?: string
   }
 }
 
@@ -182,7 +186,8 @@ async function initProjection(): Promise<void> {
     const dbPath = join(sessionRoot(), "projection.db")
     const exists = await readFile(dbPath).then(() => true, () => false)
     const next = await openProjection(dbPath)
-    if (!exists) await next.rebuildFromJsonl(sessionRoot())
+    // DB 缺失或模式迁移后被清空时，从 JSONL 真源全量重建。
+    if (!exists || next.listSessions().length === 0) await next.rebuildFromJsonl(sessionRoot())
     projection = next
   } catch (error) {
     projection = null
@@ -291,24 +296,31 @@ class JsonlEventStore {
   }
 
   async loadConversation(sessionID: string): Promise<AgentMessage[]> {
+    const entries = await this.readEntries(sessionID)
+    // 分叉会话：首个事件是 session_forked 标记，先按分叉点从源会话继承对话，再接上自己的。
+    if (entries[0]?.type === "session_forked") {
+      const payload = entries[0].payload ?? {}
+      const source = typeof payload.sourceSessionID === "string" ? payload.sourceSessionID : ""
+      const baseSequence = typeof payload.baseSequence === "number" ? payload.baseSequence : 0
+      const inherited = source ? await this.loadConversationUpTo(source, baseSequence) : []
+      const own = conversationFromEntries(entries.slice(1))
+      return [...inherited, ...own].slice(-24)
+    }
+    return conversationFromEntries(entries).slice(-24)
+  }
+
+  async loadConversationUpTo(sessionID: string, throughSequence: number): Promise<AgentMessage[]> {
+    const entries = (await this.readEntries(sessionID)).filter((entry) => typeof entry.sequence === "number" && entry.sequence <= throughSequence)
+    return conversationFromEntries(entries)
+  }
+
+  private async readEntries(sessionID: string): Promise<Array<{ sequence?: number; type?: string; payload?: Record<string, unknown> }>> {
     const file = join(sessionRoot(), `${sessionID}.jsonl`)
-    let entries: Array<{ type?: string; payload?: Record<string, unknown> }> = []
     try {
-      entries = (await readFile(file, "utf8")).split("\n").filter(Boolean).flatMap((line) => {
-        try { return [JSON.parse(line) as { type?: string; payload?: Record<string, unknown> }] } catch { return [] }
+      return (await readFile(file, "utf8")).split("\n").filter(Boolean).flatMap((line) => {
+        try { return [JSON.parse(line) as { sequence?: number; type?: string; payload?: Record<string, unknown> }] } catch { return [] }
       })
     } catch { return [] }
-    const messages: AgentMessage[] = []
-    let assistant = ""
-    for (const entry of entries) {
-      if (entry.type === "turn_started" && typeof entry.payload?.prompt === "string") messages.push({ role: "user", content: entry.payload.prompt })
-      if (entry.type === "assistant_text" && typeof entry.payload?.text === "string") assistant += entry.payload.text
-      if (entry.type === "turn_ended") {
-        if (assistant) messages.push({ role: "assistant", content: assistant })
-        assistant = ""
-      }
-    }
-    return messages.slice(-24)
   }
 
   async loadPendingApproval(sessionID: string, approvalID: string): Promise<PendingApproval | undefined> {
@@ -332,9 +344,15 @@ class JsonlEventStore {
     return undefined
   }
 
-  async loadEvents(sessionID: string): Promise<Array<{ type: string; payload?: Record<string, unknown> }>> {
-    try { return (await readFile(join(sessionRoot(), `${sessionID}.jsonl`), "utf8")).split("\n").filter(Boolean).flatMap((line) => { try { return [JSON.parse(line) as { type: string; payload?: Record<string, unknown> }] } catch { return [] } }) }
-    catch { return [] }
+  async loadEvents(sessionID: string): Promise<Array<{ type: string; sequence?: number; payload?: Record<string, unknown> }>> {
+    try {
+      return (await readFile(join(sessionRoot(), `${sessionID}.jsonl`), "utf8")).split("\n").filter(Boolean).flatMap((line) => {
+        try {
+          const parsed = JSON.parse(line) as { type?: string; sequence?: number; payload?: Record<string, unknown> }
+          return typeof parsed.type === "string" ? [{ type: parsed.type, ...(typeof parsed.sequence === "number" ? { sequence: parsed.sequence } : {}), ...(parsed.payload ? { payload: parsed.payload } : {}) }] : []
+        } catch { return [] }
+      })
+    } catch { return [] }
   }
 
   async loadRepairLineage(sessionID: string): Promise<CIRepairLineage | undefined> {
@@ -354,6 +372,20 @@ class JsonlEventStore {
     }
     return undefined
   }
+}
+
+function conversationFromEntries(entries: Array<{ type?: string; payload?: Record<string, unknown> }>): AgentMessage[] {
+  const messages: AgentMessage[] = []
+  let assistant = ""
+  for (const entry of entries) {
+    if (entry.type === "turn_started" && typeof entry.payload?.prompt === "string") messages.push({ role: "user", content: entry.payload.prompt })
+    if (entry.type === "assistant_text" && typeof entry.payload?.text === "string") assistant += entry.payload.text
+    if (entry.type === "turn_ended") {
+      if (assistant) messages.push({ role: "assistant", content: assistant })
+      assistant = ""
+    }
+  }
+  return messages
 }
 
 const eventStore = new JsonlEventStore()
@@ -1112,9 +1144,84 @@ async function enqueue(request: Request): Promise<Response> {
   return { id: request.id, type: "response", ok: true, result: { queued: queue.length, sessionID } }
 }
 
+/** 从任意事件水位分叉会话：新会话首行写 session_forked 标记（copy-on-write），
+ *  对话历史经 loadConversation 回溯源会话到 baseSequence 重建。 */
+async function forkSession(request: Request): Promise<Response> {
+  const params = request.params
+  const source = params?.sessionID?.trim()
+  if (!source) return { id: request.id, type: "response", ok: false, error: "session.fork requires sessionID" }
+  const sourceText = await readFile(join(sessionRoot(), `${source}.jsonl`), "utf8").catch(() => "")
+  if (!sourceText) return { id: request.id, type: "response", ok: false, error: `Source session not found: ${source}` }
+  const lineCount = sourceText.split("\n").filter(Boolean).length
+  const requested = params?.baseSequence
+  const baseSequence = typeof requested === "number" && Number.isInteger(requested) && requested >= 1 ? Math.min(requested, lineCount) : lineCount
+  const forkID = params?.newSessionID?.trim() || `fork-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
+  if (!/^[A-Za-z0-9._-]+$/.test(forkID)) return { id: request.id, type: "response", ok: false, error: "Invalid fork session ID" }
+  await eventStore.append(forkID, "session_forked", {
+    sourceSessionID: source,
+    baseSequence,
+    ...(params?.reason ? { reason: params.reason } : {})
+  })
+  const inherited = await eventStore.loadConversation(forkID)
+  return { id: request.id, type: "response", ok: true, sessionID: forkID, result: { sessionID: forkID, sourceSessionID: source, baseSequence, inheritedMessages: inherited.length } }
+}
+
+async function listBranches(request: Request): Promise<Response> {
+  const source = request.params?.sessionID?.trim()
+  if (!source) return { id: request.id, type: "response", ok: false, error: "session.branches requires sessionID" }
+  if (projection) {
+    return { id: request.id, type: "response", ok: true, sessionID: source, result: { branches: projection.forksOf(source) } }
+  }
+  // 投影不可用时的回退：扫描各日志首行找 session_forked 标记
+  const branches: Array<{ sessionID: string; baseSequence: number }> = []
+  try {
+    for (const file of await readdir(sessionRoot())) {
+      if (!file.endsWith(".jsonl")) continue
+      const firstLine = (await readFile(join(sessionRoot(), file), "utf8")).split("\n")[0] ?? ""
+      try {
+        const event = JSON.parse(firstLine) as { type?: string; payload?: Record<string, unknown> }
+        if (event.type === "session_forked" && event.payload?.sourceSessionID === source) {
+          branches.push({ sessionID: file.slice(0, -".jsonl".length), baseSequence: typeof event.payload.baseSequence === "number" ? event.payload.baseSequence : 0 })
+        }
+      } catch { /* 首行不完整则跳过 */ }
+    }
+  } catch { /* 会话目录不存在时返回空分支 */ }
+  return { id: request.id, type: "response", ok: true, sessionID: source, result: { branches } }
+}
+
+/** 回放校验：从事件日志确定性重建交付门禁与对话，与记录在案的状态比对。
+ *  模型级回放（录制流重放）属于下一阶段；此模式不调用模型。 */
+async function replaySession(request: Request): Promise<Response> {
+  const sessionID = request.params?.sessionID?.trim()
+  if (!sessionID) return { id: request.id, type: "response", ok: false, error: "session.replay requires sessionID" }
+  const until = request.params?.untilSequence
+  const all = await eventStore.loadEvents(sessionID)
+  if (all.length === 0) return { id: request.id, type: "response", ok: false, error: `Session not found: ${sessionID}` }
+  const bounded = typeof until === "number" && Number.isInteger(until) && until >= 1
+  const events = bounded ? all.filter((event) => (event.sequence ?? 0) <= (until as number)) : all
+  const gate = evaluateDeliveryGate(events)
+  const recorded = [...all].reverse().find((event) => event.type === "delivery_evaluated")
+  const recordedState = typeof recorded?.payload?.state === "string" ? recorded.payload.state : undefined
+  const turns = bounded ? (await eventStore.loadConversationUpTo(sessionID, until as number)).length : (await eventStore.loadConversation(sessionID)).length
+  const matched = !bounded && recordedState !== undefined ? gate.state === recordedState : null
+  return { id: request.id, type: "response", ok: true, sessionID, result: { mode: "verify", matched, gateState: gate.state, reasons: gate.reasons, ...(recordedState ? { recordedState } : {}), turns, eventCount: events.length } }
+}
+
 async function handle(request: Request): Promise<void> {
   if (request.method === "health") {
     respond({ id: request.id, type: "response", ok: true, result: { version: "deepseek-agent-runtime/0.2.0" } })
+    return
+  }
+  if (request.method === "session.fork") {
+    respond(await forkSession(request))
+    return
+  }
+  if (request.method === "session.branches") {
+    respond(await listBranches(request))
+    return
+  }
+  if (request.method === "session.replay") {
+    respond(await replaySession(request))
     return
   }
   if (request.method === "session.recover") {

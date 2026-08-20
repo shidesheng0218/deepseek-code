@@ -61,6 +61,8 @@ export interface Projection {
   conversationAt(sessionID: string, throughSequence?: number): AgentMessage[];
   eventsOf(sessionID: string): ProjectedEventInput[];
   sessionEventCount(sessionID: string): number;
+  /** 从某个源会话分叉出的全部会话及其分叉点水位 */
+  forksOf(sessionID: string): Array<{ sessionID: string; baseSequence: number }>;
   /** 从 JSONL 目录全量重建（或追平单个会话）；返回重建的会话与事件数 */
   rebuildFromJsonl(root: string): Promise<{ sessions: number; events: number }>;
   close(): void;
@@ -104,6 +106,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   title TEXT,
   project_path TEXT,
+  forked_from TEXT,
+  fork_base_sequence INTEGER,
   created_at TEXT,
   updated_at TEXT,
   event_count INTEGER NOT NULL DEFAULT 0
@@ -150,6 +154,12 @@ export async function openProjection(dbPath: string): Promise<Projection> {
   if (dbPath !== ':memory:') await mkdir(dirname(dbPath), { recursive: true });
   const db = await openDatabase(dbPath);
   db.exec(SCHEMA);
+  // 模式演进：投影是可丢弃缓存，列缺失时直接清空重建（调用方负责从 JSONL 补数据）。
+  const columns = db.prepare("PRAGMA table_info(sessions)").all().map((row) => asString(row.name));
+  if (!columns.includes('forked_from')) {
+    db.exec('DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS usage; DROP TABLE IF EXISTS sessions;');
+    db.exec(SCHEMA);
+  }
 
   const insertEvent = db.prepare('INSERT OR REPLACE INTO events (session_id, sequence, event_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)');
   const upsertSession = db.prepare(`
@@ -163,11 +173,15 @@ export async function openProjection(dbPath: string): Promise<Projection> {
       project_path = COALESCE(project_path, ?)
     WHERE session_id = ?
   `);
+  const setSessionFork = db.prepare('UPDATE sessions SET forked_from = ?, fork_base_sequence = ? WHERE session_id = ?');
   const insertUsage = db.prepare('INSERT OR REPLACE INTO usage (session_id, sequence, model, input_tokens, cached_input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
 
   function recordEvent(event: ProjectedEventInput): void {
     insertEvent.run(event.sessionID, event.sequence, event.eventID ?? '', event.type, JSON.stringify(event.payload ?? {}), event.createdAt);
     upsertSession.run(event.sessionID, event.createdAt, event.createdAt);
+    if (event.type === 'session_forked') {
+      setSessionFork.run(asString(event.payload.sourceSessionID), asNumber(event.payload.baseSequence), event.sessionID);
+    }
     if (event.type === 'turn_started') {
       const prompt = asString(event.payload.prompt);
       const title = prompt.length > 56 ? `${[...prompt].slice(0, 56).join('')}…` : prompt;
@@ -309,6 +323,12 @@ export async function openProjection(dbPath: string): Promise<Projection> {
     sessionEventCount(sessionID: string): number {
       const row = db.prepare('SELECT COUNT(*) AS count FROM events WHERE session_id = ?').get(sessionID);
       return asNumber(row?.count);
+    },
+
+    forksOf(sessionID: string): Array<{ sessionID: string; baseSequence: number }> {
+      return db.prepare('SELECT session_id, fork_base_sequence FROM sessions WHERE forked_from = ? ORDER BY created_at')
+        .all(sessionID)
+        .map((row) => ({ sessionID: asString(row.session_id), baseSequence: asNumber(row.fork_base_sequence) }));
     },
 
     async rebuildFromJsonl(root: string): Promise<{ sessions: number; events: number }> {

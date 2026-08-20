@@ -107,4 +107,34 @@ describe('session projection（SQLite 物化视图）', () => {
     projection.recordEvent(event);
     expect(projection.sessionEventCount('s1')).toBe(1);
   });
+
+  test('session_forked 事件记录分叉血缘，forksOf 可查询', async () => {
+    const projection = await openMemory();
+    projection.recordEvent({ sessionID: 'src', sequence: 1, type: 'turn_started', payload: { prompt: '源问题' }, createdAt: at(0) });
+    projection.recordEvent({ sessionID: 'fork-1', sequence: 1, type: 'session_forked', payload: { sourceSessionID: 'src', baseSequence: 1, reason: '换模型重跑' }, createdAt: at(0, 11) });
+    projection.recordEvent({ sessionID: 'fork-2', sequence: 1, type: 'session_forked', payload: { sourceSessionID: 'src', baseSequence: 1 }, createdAt: at(0, 12) });
+
+    expect(projection.forksOf('src')).toEqual([
+      { sessionID: 'fork-1', baseSequence: 1 },
+      { sessionID: 'fork-2', baseSequence: 1 }
+    ]);
+    expect(projection.forksOf('fork-1')).toEqual([]);
+  });
+
+  test('旧版投影缺分叉列时自动清空重建（可丢弃缓存纪律）', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'deepseek-projection-migrate-'));
+    cleanups.push(async () => rm(root, { recursive: true, force: true }));
+    // 先用旧模式（无 forked_from 列）手工建库
+    const { DatabaseSync } = await import('node:sqlite');
+    const legacy = new DatabaseSync(join(root, 'projection.db'));
+    legacy.exec("CREATE TABLE sessions (session_id TEXT PRIMARY KEY, title TEXT, project_path TEXT, created_at TEXT, updated_at TEXT, event_count INTEGER NOT NULL DEFAULT 0)");
+    legacy.exec("INSERT INTO sessions (session_id, title) VALUES ('legacy', '旧库')");
+    legacy.close();
+
+    const projection = await openProjection(join(root, 'projection.db'));
+    cleanups.push(async () => projection.close());
+    expect(projection.listSessions()).toEqual([]);
+    projection.recordEvent({ sessionID: 'f', sequence: 1, type: 'session_forked', payload: { sourceSessionID: 'src', baseSequence: 3 }, createdAt: at(0) });
+    expect(projection.forksOf('src')).toEqual([{ sessionID: 'f', baseSequence: 3 }]);
+  });
 });

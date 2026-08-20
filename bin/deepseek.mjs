@@ -9,8 +9,83 @@ const runtime = process.env.DEEPSEEK_RUNTIME_BINARY || join(root, 'apps/deepseek
 const sessionsRoot = process.env.DEEPSEEK_SESSION_ROOT || join(process.env.HOME || '.', 'Library/Application Support/DeepSeekCode/sessions');
 
 function usage() {
-  process.stderr.write('Usage: deepseek doctor | ask <prompt> | run <prompt> | session list | session attach <id> | session resume <id>\n');
+  process.stderr.write('Usage: deepseek doctor | ask <prompt> | run <prompt> | session list | session attach <id> | session resume <id> | session fork <id> [--at N] [--reason text] | session branches <id> | session replay <id> [--at N]\n');
   process.exit(2);
+}
+
+/** 向 sidecar 发送单个请求并等待对应响应帧。 */
+function requestSidecar(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = `cli-${method}-${Date.now()}`;
+    const child = spawn(runtime, ['--stdio'], { cwd: root, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let buffer = '';
+    let stderr = '';
+    const timeout = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Sidecar request timed out')); }, 30_000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split('\n'); buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let frame; try { frame = JSON.parse(line); } catch { continue; }
+        if (frame.type === 'response' && frame.id === id) {
+          clearTimeout(timeout);
+          child.kill('SIGTERM');
+          resolve(frame);
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', (error) => { clearTimeout(timeout); reject(error); });
+    child.once('exit', () => { clearTimeout(timeout); reject(new Error(`Sidecar exited before responding${stderr ? `: ${stderr.slice(-200)}` : ''}`)); });
+    child.stdin.end(`${JSON.stringify({ id, method, params })}\n`);
+  });
+}
+
+function parseForkArgs(args) {
+  const options = { sessionID: args[0], baseSequence: undefined, reason: undefined, untilSequence: undefined };
+  for (let index = 1; index < args.length; index += 1) {
+    if (args[index] === '--at') { options.baseSequence = Number.parseInt(args[index + 1], 10) || undefined; options.untilSequence = options.baseSequence; index += 1; }
+    else if (args[index] === '--reason') { options.reason = args[index + 1]; index += 1; }
+    else usage();
+  }
+  return options;
+}
+
+async function forkSessionCommand(args) {
+  const options = parseForkArgs(args);
+  if (!options.sessionID) usage();
+  const response = await requestSidecar('session.fork', {
+    sessionID: safeSessionID(options.sessionID),
+    ...(options.baseSequence ? { baseSequence: options.baseSequence } : {}),
+    ...(options.reason ? { reason: options.reason } : {})
+  });
+  if (!response.ok) { process.stderr.write(`${response.error ?? 'fork failed'}\n`); process.exit(1); }
+  const result = response.result;
+  process.stdout.write(`${result.sessionID}\t分叉自 ${result.sourceSessionID}@${result.baseSequence}（继承 ${result.inheritedMessages} 条消息）\n`);
+}
+
+async function branchesCommand(sessionID) {
+  const response = await requestSidecar('session.branches', { sessionID: safeSessionID(sessionID) });
+  if (!response.ok) { process.stderr.write(`${response.error ?? 'branches failed'}\n`); process.exit(1); }
+  const branches = response.result.branches ?? [];
+  if (branches.length === 0) { process.stdout.write('（无分叉）\n'); return; }
+  for (const branch of branches) process.stdout.write(`${branch.sessionID}\t@${branch.baseSequence}\n`);
+}
+
+async function replayCommand(args) {
+  const options = parseForkArgs(args);
+  if (!options.sessionID) usage();
+  const response = await requestSidecar('session.replay', {
+    sessionID: safeSessionID(options.sessionID),
+    ...(options.untilSequence ? { untilSequence: options.untilSequence } : {})
+  });
+  if (!response.ok) { process.stderr.write(`${response.error ?? 'replay failed'}\n`); process.exit(1); }
+  const result = response.result;
+  const verdict = result.matched === null ? '（部分回放，无比对）' : result.matched ? '一致 ✓' : '不一致 ✗';
+  process.stdout.write(`回放校验：${verdict}\n门禁重算：${result.gateState}${result.recordedState ? `（记录：${result.recordedState}）` : ''}\n事件 ${result.eventCount} 条 · 对话 ${result.turns} 条\n`);
+  if (result.matched === false) process.exitCode = 1;
 }
 
 function runProcess(args, input) {
@@ -134,6 +209,9 @@ try {
   else if (command === 'session' && args[0] === 'list') await listSessions();
   else if (command === 'session' && args[0] === 'attach' && args[1]) await attachSession(args[1]);
   else if (command === 'session' && args[0] === 'resume' && args[1]) await resumeSession(args[1]);
+  else if (command === 'session' && args[0] === 'fork' && args[1]) await forkSessionCommand(args.slice(1));
+  else if (command === 'session' && args[0] === 'branches' && args[1]) await branchesCommand(args[1]);
+  else if (command === 'session' && args[0] === 'replay' && args[1]) await replayCommand(args.slice(1));
   else usage();
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

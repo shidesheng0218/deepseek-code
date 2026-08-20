@@ -56,10 +56,10 @@ Claude Code 永远只能用 Claude，Codex 永远只能用 OpenAI。
 ### A1 同模型对照基准台（`bench:versus`，最高优先级）
 
 > **实施状态（2026-08-20）**：骨架已落地于 [benchmarks/versus/](benchmarks/versus/README.md)——
-> 四个驱动器（deepseek / claude-code / codex / opencode）、16 题语料（bug_fix 12 /
-> feature_add 2 / refactor 2，全部零外部依赖、命令可验证、双向校验"原始必挂/修复必过"）、
+> 四个驱动器（deepseek / claude-code / codex / opencode）、**60 题语料**（bug_fix / feature_add /
+> refactor 三大类六小类，全部零外部依赖、命令可验证、双向校验"原始必挂/修复必过"）、
 > harvest 汇总与 Markdown/JSON 报告（可 minisign 签名），`--check-corpus` 与
-> `--self-test` 离线自检全绿。下一步：真实 issue 语料扩到 ≥60 题 + 接入 CI 周跑。
+> `--self-test` 离线自检全绿。下一步：CI 周跑接入。
 >
 > **首跑实证（16 题 × 1 轮 × 两个模型族，2026-08-20）**：
 >
