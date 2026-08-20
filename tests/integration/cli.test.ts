@@ -35,4 +35,30 @@ describe('DeepSeek Code CLI', () => {
     expect(attach.stdout).toContain('修复 CLI 会话');
     expect(attach.stdout).toContain('已完成。');
   });
+
+  test('session fork and branches work through the bundled sidecar', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'deepseek-cli-fork-')); roots.push(root);
+    const events = [
+      { type: 'turn_started', payload: { prompt: '源问题', projectPath: '/tmp/demo' } },
+      { type: 'assistant_text', payload: { text: '源回答。' } },
+      { type: 'turn_ended', payload: { status: 'completed' } }
+    ];
+    const lines = events.map((event, index) => JSON.stringify({ schemaVersion: 1, eventID: `e${index}`, sessionID: 'cli-src', sequence: index + 1, ...event, createdAt: new Date().toISOString() }));
+    await writeFile(join(root, 'cli-src.jsonl'), `${lines.join('\n')}\n`);
+    const env = { DEEPSEEK_RUNTIME_BINARY: join(process.cwd(), 'apps/deepseek-agent-runtime/dist/deepseek-agent-runtime'), DEEPSEEK_SESSION_ROOT: root };
+
+    const fork = await runCLI(['session', 'fork', 'cli-src', '--reason', 'CLI 验证'], env);
+    expect(fork.code).toBe(0);
+    const match = /^(fork-[a-z0-9-]+)\t/m.exec(fork.stdout);
+    expect(match?.[1]).toBeTruthy();
+    expect(fork.stdout).toContain('继承 2 条消息');
+
+    const branches = await runCLI(['session', 'branches', 'cli-src'], env);
+    expect(branches.code).toBe(0);
+    expect(branches.stdout).toContain(match?.[1] ?? '');
+
+    const replay = await runCLI(['session', 'replay', 'cli-src'], env);
+    expect(replay.code).toBe(0);
+    expect(replay.stdout).toContain('回放校验');
+  });
 });

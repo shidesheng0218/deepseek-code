@@ -192,4 +192,29 @@ describe('agent executor', () => {
     expect(received[assistantIndex]?.toolCalls).toEqual([{ id: 'patch-1', name: 'apply_patch', arguments: { changes: [{ path: 'README.md', content: 'next' }] } }]);
     expect(received[assistantIndex + 1]).toMatchObject({ role: 'tool', toolCallId: 'patch-1' });
   });
+
+  test('nudges once when the provider returns an empty answer after tool work', async () => {
+    let call = 0;
+    const seen: Array<Array<{ role: string; content: string }>> = [];
+    const executor = new AgentExecutor({
+      mode: 'accept_edits',
+      model: {
+        stream: async function* (messages) {
+          seen.push(messages.map((message) => ({ role: message.role, content: message.content })));
+          call += 1;
+          if (call === 1) yield { type: 'tool_call', id: 'read-1', name: 'read_file', arguments: { path: 'a.ts' } } as const;
+          else if (call === 2) return; // 空完成：Provider 偶发行为
+          else yield { type: 'text_delta', text: '修复完成' } as const;
+        }
+      },
+      tools: { read_file: async () => '内容' }
+    });
+
+    const result = await executor.run('s1', '读取并修复');
+
+    expect(result.status).toBe('completed');
+    expect(result.text).toBe('修复完成');
+    const nudge = seen[2]?.find((message) => message.role === 'user' && message.content.includes('上一次回答为空'));
+    expect(nudge).toBeTruthy();
+  });
 });

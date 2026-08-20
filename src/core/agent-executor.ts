@@ -107,6 +107,8 @@ export class AgentExecutor {
     const emit = (event: AgentExecutorEvent): void => this.options.onEvent?.(event);
 
     try {
+      let invokedToolEarlier = false;
+      let nudgedEmptyAnswer = false;
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
         const pendingCalls: ToolCallEvent[] = [];
         let turnText = '';
@@ -120,12 +122,20 @@ export class AgentExecutor {
           pendingCalls.push(event);
         }
         if (pendingCalls.length === 0) {
+          // Provider 偶发返回空完成（实测 deepseek-v4-pro 出现过一次）：
+          // 已经做过工具调用却交白卷时，推送一次追问再放弃，避免把工作沉默地丢掉。
+          if (!turnText.trim() && invokedToolEarlier && !nudgedEmptyAnswer) {
+            nudgedEmptyAnswer = true;
+            messages.push({ role: 'user', content: '（系统提示：你的上一次回答为空。请继续完成任务，或明确说明受阻原因。）' });
+            continue;
+          }
           runtime.complete();
           emit({ type: 'completed', text });
           if (turnText) messages.push({ role: 'assistant', content: turnText });
           return { text, runtime, messages, status: runtime.state.status };
         }
         // 协议纪律：assistant 的 tool_calls 必须先于对应 tool 结果进入历史。
+        invokedToolEarlier = true;
         messages.push({
           role: 'assistant',
           content: turnText,
