@@ -1,0 +1,10 @@
+{
+  "id": "vs-046-unify-errors",
+  "title": "统一两处模块的字符串抛错",
+  "category": "refactor",
+  "project": "projects/unify-errors",
+  "prompt": "src/auth.js 和 src/store.js 现在直接 throw 字符串，上层无法 catch 分辨。请新增共享的 AppError（code+message），两处模块统一使用，错误消息文案不变。完成后运行 npm test 与 node scripts/check.mjs。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

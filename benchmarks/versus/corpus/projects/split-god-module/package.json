@@ -1,0 +1,6 @@
+{
+  "name": "split-god-module",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

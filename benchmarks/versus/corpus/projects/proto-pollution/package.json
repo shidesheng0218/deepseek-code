@@ -1,0 +1,6 @@
+{
+  "name": "proto-pollution",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

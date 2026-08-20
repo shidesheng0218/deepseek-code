@@ -1,0 +1,10 @@
+{
+  "id": "vs-052-env-parse",
+  "title": "env 文件解析处理不了引号和注释",
+  "category": "bug_fix",
+  "project": "projects/env-parse",
+  "prompt": "部署脚本报错：.env 里带引号的值和行内注释解析错了。请修复 src/parseEnv.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-030-mask-leak",
+  "title": "证件号脱敏泄漏中间位",
+  "category": "bug_fix",
+  "project": "projects/mask-leak",
+  "prompt": "合规扫描发现证件号脱敏函数把中间 12 位明文显示了。规则是保留前 4 位和后 4 位、中间全部用星号替换。请修复 src/mask.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

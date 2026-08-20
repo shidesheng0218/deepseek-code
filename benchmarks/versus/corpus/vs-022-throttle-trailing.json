@@ -1,0 +1,10 @@
+{
+  "id": "vs-022-throttle-trailing",
+  "title": "节流实现丢失尾随调用",
+  "category": "bug_fix",
+  "project": "projects/throttle-trailing",
+  "prompt": "输入联想在快速连续输入后显示的往往不是最后一次输入的结果。请修复 src/throttle.js，保证窗口结束后的尾随调用用最新参数执行，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

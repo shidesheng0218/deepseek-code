@@ -1,0 +1,10 @@
+{
+  "id": "vs-059-next-run",
+  "title": "下次运行时间跨日计算错误",
+  "category": "bug_fix",
+  "project": "projects/next-run",
+  "prompt": "定时任务在深夜会排到错误的时间：23:50 计算每天 06:00 的任务时算成了当天（已经过去的时间）。请修复 src/nextRun.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

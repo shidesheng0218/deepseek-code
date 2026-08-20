@@ -1,0 +1,10 @@
+{
+  "id": "vs-049-proto-pollution",
+  "title": "合并函数存在原型污染",
+  "category": "bug_fix",
+  "project": "projects/proto-pollution",
+  "prompt": "安全扫描发现 merge 函数会把 __proto__ 键合进对象，存在原型污染风险。请修复 src/merge.js，跳过 __proto__/constructor/prototype 危险键，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

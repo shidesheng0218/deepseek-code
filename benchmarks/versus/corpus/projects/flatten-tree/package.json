@@ -1,0 +1,6 @@
+{
+  "name": "flatten-tree",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

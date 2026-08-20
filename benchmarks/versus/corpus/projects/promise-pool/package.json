@@ -1,0 +1,6 @@
+{
+  "name": "promise-pool",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

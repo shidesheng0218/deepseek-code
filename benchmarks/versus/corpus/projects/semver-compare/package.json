@@ -1,0 +1,6 @@
+{
+  "name": "semver-compare",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

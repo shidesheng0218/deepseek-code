@@ -1,0 +1,10 @@
+{
+  "id": "vs-029-markdown-links",
+  "title": "Markdown 链接提取漏掉含括号的 URL",
+  "category": "bug_fix",
+  "project": "projects/markdown-links",
+  "prompt": "文档站爬虫提取链接时，像 /wiki/Foo_(bar) 这种带括号的 URL 被截断了。请修复 src/links.js 的正则，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

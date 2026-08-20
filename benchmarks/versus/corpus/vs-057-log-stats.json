@@ -1,0 +1,10 @@
+{
+  "id": "vs-057-log-stats",
+  "title": "按测试规格实现日志统计",
+  "category": "feature_add",
+  "project": "projects/log-stats",
+  "prompt": "test/logStats.test.js 描述了日志统计的完整规格，但 src/logStats.js 还不存在。请按规格实现并导出 summarizeLog，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

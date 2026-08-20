@@ -1,0 +1,6 @@
+{
+  "name": "throttle-trailing",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

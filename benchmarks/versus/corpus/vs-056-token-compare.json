@@ -1,0 +1,10 @@
+{
+  "id": "vs-056-token-compare",
+  "title": "令牌比较存在前缀误判",
+  "category": "bug_fix",
+  "project": "projects/token-compare",
+  "prompt": "鉴权模块发现严重漏洞：只要令牌前缀正确就能通过（比如正确令牌是 abc12345，传 abc 也能过）。请修复 src/compareToken.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-042-rename-config-key",
+  "title": "跨文件重命名配置键",
+  "category": "refactor",
+  "project": "projects/rename-config-key",
+  "prompt": "配置键 retryCount 要统一更名为 maxRetries：src/ 下所有引用都要改、默认值 3 不变、对外行为与测试不变。完成后运行 npm test 与 node scripts/check.mjs。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-019-state-machine",
+  "title": "状态机允许非法迁移",
+  "category": "bug_fix",
+  "project": "projects/state-machine",
+  "prompt": "工单能从 pending 直接跳到 archived，绕过了必须的 active 阶段。请修复 src/machine.js 的迁移校验，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

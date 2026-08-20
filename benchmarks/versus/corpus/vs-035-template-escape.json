@@ -1,0 +1,10 @@
+{
+  "id": "vs-035-template-escape",
+  "title": "按测试规格实现模板渲染（默认转义）",
+  "category": "feature_add",
+  "project": "projects/template-escape",
+  "prompt": "test/render.test.js 描述了模板渲染的完整规格，但 src/render.js 还不存在。请按规格实现并导出 render，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-040-top-k-words",
+  "title": "按测试规格实现高频词统计",
+  "category": "feature_add",
+  "project": "projects/top-k-words",
+  "prompt": "test/topWords.test.js 描述了高频词统计的完整规格，但 src/topWords.js 还不存在。请按规格实现并导出 topWords，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-055-filename-sanitize",
+  "title": "文件名清洗只处理了正斜杠",
+  "category": "bug_fix",
+  "project": "projects/filename-sanitize",
+  "prompt": "用户用标题保存文件时在 Windows 上失败了：清洗函数只替换正斜杠，反斜杠、冒号、星号等都漏了。请修复 src/sanitize.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-054-null-safe-chain",
+  "title": "深层取值遇到中间空值抛异常",
+  "category": "bug_fix",
+  "project": "projects/null-safe-chain",
+  "prompt": "页面白屏：getDeep 在中间属性为 null 时直接抛 TypeError。约定：路径任何一段缺失都返回 undefined。请修复 src/getDeep.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

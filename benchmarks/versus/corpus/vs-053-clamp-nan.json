@@ -1,0 +1,10 @@
+{
+  "id": "vs-053-clamp-nan",
+  "title": "钳制函数对 NaN 与倒置区间行为错误",
+  "category": "bug_fix",
+  "project": "projects/clamp-nan",
+  "prompt": "表单数值钳制遇到空输入得到 NaN 直接透传到了后端。约定：NaN 按最小值处理；min 大于 max 时按合法区间互换。请修复 src/clamp.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

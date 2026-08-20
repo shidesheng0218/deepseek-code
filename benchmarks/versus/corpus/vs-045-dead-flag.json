@@ -1,0 +1,10 @@
+{
+  "id": "vs-045-dead-flag",
+  "title": "删除已下线特性的死代码",
+  "category": "refactor",
+  "project": "projects/dead-flag",
+  "prompt": "LEGACY_MODE 特性已永久下线，请删除 src/ 下所有 LEGACY_MODE 分支与相关死代码，保持现有行为（LEGACY_MODE 关闭时的路径）与测试不变。完成后运行 npm test 与 node scripts/check.mjs。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

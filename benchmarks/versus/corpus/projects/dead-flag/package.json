@@ -1,0 +1,6 @@
+{
+  "name": "dead-flag",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

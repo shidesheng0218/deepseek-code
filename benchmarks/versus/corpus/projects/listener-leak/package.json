@@ -1,0 +1,6 @@
+{
+  "name": "listener-leak",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

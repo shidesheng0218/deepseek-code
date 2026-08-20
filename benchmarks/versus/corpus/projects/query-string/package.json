@@ -1,0 +1,6 @@
+{
+  "name": "query-string",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

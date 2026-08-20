@@ -1,0 +1,10 @@
+{
+  "id": "vs-034-deep-merge",
+  "title": "按测试规格实现深合并",
+  "category": "feature_add",
+  "project": "projects/deep-merge",
+  "prompt": "test/deepMerge.test.js 描述了 deepMerge 的完整规格，但 src/deepMerge.js 还不存在。请按规格实现并导出 deepMerge，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

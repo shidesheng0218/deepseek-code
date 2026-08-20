@@ -1,0 +1,10 @@
+{
+  "id": "vs-058-config-cascade",
+  "title": "配置级联优先级反了",
+  "category": "bug_fix",
+  "project": "projects/config-cascade",
+  "prompt": "约定是 环境变量 > 配置文件 > 默认值，但现在配置文件把环境变量覆盖了，线上配置一直不生效。请修复 src/configCascade.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

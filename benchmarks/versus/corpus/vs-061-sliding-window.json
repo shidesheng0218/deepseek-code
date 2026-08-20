@@ -1,0 +1,10 @@
+{
+  "id": "vs-061-sliding-window",
+  "title": "按测试规格实现滑动窗口计数器",
+  "category": "feature_add",
+  "project": "projects/sliding-window",
+  "prompt": "test/window.test.js 描述了滑动窗口计数器的完整规格，但 src/window.js 还不存在。请按规格实现并导出 createWindow，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

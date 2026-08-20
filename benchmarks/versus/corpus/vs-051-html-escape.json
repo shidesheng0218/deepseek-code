@@ -1,0 +1,10 @@
+{
+  "id": "vs-051-html-escape",
+  "title": "评论渲染存在 XSS",
+  "category": "bug_fix",
+  "project": "projects/html-escape",
+  "prompt": "评论区渲染直接把用户输入插进 HTML，输入脚本会被执行。请修复 src/render.js，对 & < > 双引号单引号全部转义，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

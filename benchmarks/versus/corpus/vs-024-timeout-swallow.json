@@ -1,0 +1,10 @@
+{
+  "id": "vs-024-timeout-swallow",
+  "title": "超时包装把失败变成了 undefined",
+  "category": "bug_fix",
+  "project": "projects/timeout-swallow",
+  "prompt": "接口超时后调用方拿到的是 undefined 而不是明确的超时错误，上游把空结果当成了正常数据。请修复 src/withTimeout.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

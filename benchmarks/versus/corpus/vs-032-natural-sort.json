@@ -1,0 +1,10 @@
+{
+  "id": "vs-032-natural-sort",
+  "title": "文件名排序 file10 排在 file2 前面",
+  "category": "bug_fix",
+  "project": "projects/natural-sort",
+  "prompt": "版本列表排序结果不符合直觉：file10 排在了 file2 前面。请实现自然排序（数字段按数值比较），运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

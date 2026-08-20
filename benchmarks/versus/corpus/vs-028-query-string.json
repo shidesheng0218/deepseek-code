@@ -1,0 +1,10 @@
+{
+  "id": "vs-028-query-string",
+  "title": "查询串拼接丢数组、不转义",
+  "category": "bug_fix",
+  "project": "projects/query-string",
+  "prompt": "生成的 URL 查询串里数组参数只剩最后一个值，含空格的搜索词也没转义导致 400。请修复 src/query.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

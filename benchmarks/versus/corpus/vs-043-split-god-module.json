@@ -1,0 +1,10 @@
+{
+  "id": "vs-043-split-god-module",
+  "title": "拆分巨型模块",
+  "category": "refactor",
+  "project": "projects/split-god-module",
+  "prompt": "src/god.js 同时承担解析与格式化两类职责。请把解析函数（parseBool、parseNumber）拆到 src/parse.js，god.js 改为复用，保持对外导出与测试不变。完成后运行 npm test 与 node scripts/check.mjs。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

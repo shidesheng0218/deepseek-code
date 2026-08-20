@@ -1,0 +1,10 @@
+{
+  "id": "vs-018-listener-leak",
+  "title": "事件监听器移除不干净",
+  "category": "bug_fix",
+  "project": "projects/listener-leak",
+  "prompt": "模块卸载后事件还在触发，排查发现 off 没有移除对应的监听器。请修复 src/emitter.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-027-deep-equal",
+  "title": "深比较对键顺序敏感",
+  "category": "bug_fix",
+  "project": "projects/deep-equal",
+  "prompt": "配置比对把内容相同、只是键顺序不同的两个对象判为不相等，触发了一堆误报变更。请修复 src/deepEqual.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-039-flatten-tree",
+  "title": "按测试规格实现树扁平化",
+  "category": "feature_add",
+  "project": "projects/flatten-tree",
+  "prompt": "test/flatten.test.js 描述了树扁平化的完整规格，但 src/flatten.js 还不存在。请按规格实现并导出 flattenTree，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

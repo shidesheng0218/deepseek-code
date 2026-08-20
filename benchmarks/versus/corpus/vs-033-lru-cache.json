@@ -1,0 +1,10 @@
+{
+  "id": "vs-033-lru-cache",
+  "title": "按测试规格实现 LRU 缓存",
+  "category": "feature_add",
+  "project": "projects/lru-cache",
+  "prompt": "test/lru.test.js 描述了一个 LRU 缓存的完整规格，但 src/lru.js 还不存在。请按规格实现并导出 createLru，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

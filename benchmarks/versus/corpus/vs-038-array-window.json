@@ -1,0 +1,10 @@
+{
+  "id": "vs-038-array-window",
+  "title": "按测试规格实现滑动窗口",
+  "category": "feature_add",
+  "project": "projects/array-window",
+  "prompt": "test/windowed.test.js 描述了滑动窗口的完整规格，但 src/windowed.js 还不存在。请按规格实现并导出 windowed，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

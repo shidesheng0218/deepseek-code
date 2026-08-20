@@ -1,0 +1,10 @@
+{
+  "id": "vs-060-idempotency-store",
+  "title": "幂等键存储从不过期",
+  "category": "bug_fix",
+  "project": "projects/idempotency-store",
+  "prompt": "幂等键存储只进不出，内存一周涨了十倍。约定：超过 TTL 的键视为不存在并可被清理。请修复 src/idempotency.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

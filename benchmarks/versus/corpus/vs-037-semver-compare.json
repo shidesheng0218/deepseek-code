@@ -1,0 +1,10 @@
+{
+  "id": "vs-037-semver-compare",
+  "title": "按测试规格实现版本号比较",
+  "category": "feature_add",
+  "project": "projects/semver-compare",
+  "prompt": "test/compare.test.js 描述了版本号比较的完整规格，但 src/compare.js 还不存在。请按规格实现并导出 compareVersions，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

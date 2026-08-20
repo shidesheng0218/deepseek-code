@@ -1,0 +1,10 @@
+{
+  "id": "vs-036-parse-duration",
+  "title": "按测试规格实现时长解析",
+  "category": "feature_add",
+  "project": "projects/parse-duration",
+  "prompt": "test/parseDuration.test.js 描述了时长解析的完整规格，但 src/parseDuration.js 还不存在。请按规格实现并导出 parseDuration，运行 npm test 直到全部通过。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

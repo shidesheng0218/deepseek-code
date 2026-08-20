@@ -1,0 +1,6 @@
+{
+  "name": "html-escape",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

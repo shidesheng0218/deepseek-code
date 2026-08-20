@@ -1,0 +1,10 @@
+{
+  "id": "vs-020-queue-order",
+  "title": "FIFO 队列变成了后进先出",
+  "category": "bug_fix",
+  "project": "projects/queue-order",
+  "prompt": "打印任务队列顺序错乱：后提交的任务反而先执行。请修复 src/queue.js 的出队逻辑，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

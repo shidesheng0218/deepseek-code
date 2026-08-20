@@ -1,0 +1,10 @@
+{
+  "id": "vs-026-date-diff",
+  "title": "日期差计算跨边界出错",
+  "category": "bug_fix",
+  "project": "projects/date-diff",
+  "prompt": "统计两个日期相差天数时，月底和跨年经常算错一天。dayDiff 应该只按日历日计算、与时刻无关。请修复 src/dateDiff.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

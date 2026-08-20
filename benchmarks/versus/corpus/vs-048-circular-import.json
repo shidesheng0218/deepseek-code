@@ -1,0 +1,10 @@
+{
+  "id": "vs-048-circular-import",
+  "title": "解除模块循环依赖",
+  "category": "refactor",
+  "project": "projects/circular-import",
+  "prompt": "src/a.js 与 src/b.js 互相 import，目前靠函数提升侥幸可用，打包器经常报循环依赖警告。请把共享函数 normalize 移到第三个模块、打断循环，保持行为与测试不变。完成后运行 npm test 与 node scripts/check.mjs。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

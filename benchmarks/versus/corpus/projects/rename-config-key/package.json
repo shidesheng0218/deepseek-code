@@ -1,0 +1,6 @@
+{
+  "name": "rename-config-key",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

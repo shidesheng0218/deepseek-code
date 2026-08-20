@@ -1,0 +1,10 @@
+{
+  "id": "vs-050-redos-validator",
+  "title": "校验正则有灾难性回溯",
+  "category": "bug_fix",
+  "project": "projects/redos-validator",
+  "prompt": "线上接口被一串恶意输入打满 CPU：邮箱校验正则在特定输入下灾难性回溯。请修复 src/validate.js，让恶意输入在毫秒级返回 false，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-025-money-float",
+  "title": "金额合计出现浮点误差",
+  "category": "bug_fix",
+  "project": "projects/money-float",
+  "prompt": "对账系统发现 0.1+0.2 算成了 0.30000000000000004，月底报表差了几分。请修复 src/money.js，以分为最小单位保证精确，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-047-constants-config",
+  "title": "把重复的硬编码地址收敛进配置",
+  "category": "refactor",
+  "project": "projects/constants-config",
+  "prompt": "内部 API 地址 https://api.internal.example 在 src/ 下硬编码了 3 处，环境迁移时要改三个地方。请收敛为单一配置来源、保持行为与测试不变，完成后运行 npm test 与 node scripts/check.mjs。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

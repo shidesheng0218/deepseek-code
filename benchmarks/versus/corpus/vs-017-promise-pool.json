@@ -1,0 +1,10 @@
+{
+  "id": "vs-017-promise-pool",
+  "title": "并发池没有限制并发数",
+  "category": "bug_fix",
+  "project": "projects/promise-pool",
+  "prompt": "任务队列要求最多 3 个并发，但高峰期监控发现同时有几十个在跑。请修复 src/pool.js 的并发限制，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

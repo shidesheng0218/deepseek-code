@@ -1,0 +1,10 @@
+{
+  "id": "vs-041-extract-formatter",
+  "title": "抽取重复的两位补零格式化",
+  "category": "refactor",
+  "project": "projects/extract-formatter",
+  "prompt": "src/invoice.js 和 src/report.js 里有一份完全重复的两位补零格式化逻辑。请抽取为共享模块、消除重复，保持行为与测试不变，完成后运行 npm test 与 node scripts/check.mjs。",
+  "verify": { "command": "npm test && node scripts/check.mjs", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

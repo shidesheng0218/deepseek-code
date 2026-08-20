@@ -1,0 +1,10 @@
+{
+  "id": "vs-031-percent-zero",
+  "title": "百分比计算除零得 NaN",
+  "category": "bug_fix",
+  "project": "projects/percent-zero",
+  "prompt": "日报里出现了 NaN%：总量为 0 时百分比计算没有兜底，约定总量为 0 时返回 0。请修复 src/percent.js，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

@@ -1,0 +1,10 @@
+{
+  "id": "vs-023-memoize-key",
+  "title": "缓存键序列化不了一致",
+  "category": "bug_fix",
+  "project": "projects/memoize-key",
+  "prompt": "同一组参数（只是对象键顺序不同）被缓存成两份，命中率远低于预期。请修复 src/memoize.js 的键序列化，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}

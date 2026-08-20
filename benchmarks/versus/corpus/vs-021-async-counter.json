@@ -1,0 +1,10 @@
+{
+  "id": "vs-021-async-counter",
+  "title": "并发递增计数丢失",
+  "category": "bug_fix",
+  "project": "projects/async-counter",
+  "prompt": "统计接口在并发下计数明显偏少，单测能稳定复现 10 次并发只记上一半。请修复 src/counter.js 的读-改-写竞态，运行 npm test 验证。",
+  "verify": { "command": "npm test", "expectExitCode": 0 },
+  "expect": { "pristineFails": true },
+  "timeoutMs": 300000
+}
