@@ -1242,7 +1242,26 @@ async function replaySession(request: Request): Promise<Response> {
 
 async function handle(request: Request): Promise<void> {
   if (request.method === "health") {
-    respond({ id: request.id, type: "response", ok: true, result: { version: "deepseek-agent-runtime/0.2.0" } })
+    const PROTOCOL_VERSION = "deepseek-agent-runtime/0.2.0"
+    // Capability list lets old CLIs detect which methods this sidecar supports
+    // and degrade gracefully rather than sending an unrecognised method.
+    const capabilities = {
+      version: PROTOCOL_VERSION,
+      protocolVersion: 2,
+      methods: [
+        "health",
+        "session.run",
+        "session.enqueue",
+        "session.recover",
+        "session.resolveApproval",
+        "session.cancel",
+        "session.fork",
+        "session.branches",
+        "session.replay",
+      ],
+      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection"],
+    }
+    respond({ id: request.id, type: "response", ok: true, result: capabilities })
     return
   }
   if (request.method === "session.fork") {
@@ -1289,6 +1308,13 @@ async function handle(request: Request): Promise<void> {
       respond({ id: request.id, type: "response", ok: true, result: { sessionID, cancelling: true, pending: true } })
     } else if (!controller) respond({ id: request.id, type: "response", ok: false, error: "No cancellable operation is active for this session" })
     else { controller.abort(); respond({ id: request.id, type: "response", ok: true, result: { sessionID, cancelling: true } }) }
+    return
+  }
+  // Only run/enqueue reach here; any other method is unknown to this protocol
+  // version. Reply with an explicit error (naming the method) so an old or
+  // mismatched client degrades cleanly instead of hanging on a silent enqueue.
+  if (request.method !== "session.run" && request.method !== "session.enqueue") {
+    respond({ id: request.id, type: "response", ok: false, error: `Unsupported method: ${request.method} (call \"health\" for the capability list)` })
     return
   }
   // A run request receives exactly one terminal response after the turn;
