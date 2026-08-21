@@ -34,6 +34,8 @@ import { createCIRepairSession, type CIRepairSession } from "../../../src/core/c
 import { CIRepairQueue } from "../../../src/core/ci-repair-queue"
 import { TournamentOrchestrator, type Tournament, type Hypothesis, type JudgeInput } from "../../../src/core/arena"
 import { codeGraph, type ImpactAnalysis } from "../../../src/core/code-graph"
+import { taintTracker } from "../../../src/core/taint-tracking"
+import { PolicyEngine, defaultPolicy } from "../../../src/core/exec-policy"
 import { openProjection, type Projection } from "../../../src/core/session-projection"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
@@ -90,6 +92,7 @@ type RuntimeEvent =
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
   | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string }
   | { type: "model_stream_recorded"; turnSequence: number; model: string; deltas: Array<{ type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown>; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number }> }
+  | { type: "taint_detected"; toolName: string; taintedParams: Array<{ param: string; source: string; origin: string }>; riskLevel: string; decision: string }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
@@ -630,6 +633,47 @@ function terminalFor(sessionID: string, projectPath: string): PersistentTerminal
 async function runPersistentCommand(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
   const command = typeof input.command === "string" ? input.command.trim() : ""
   if (!command) throw new Error("run_command requires command")
+
+  // Phase 3：污点检查 + Exec Policy
+  const commandTokens = command.split(/\s+/)
+  const policyEngine = new PolicyEngine(defaultPolicy)
+
+  // 1. Exec Policy 检查
+  const policyResult = policyEngine.checkCommand(commandTokens)
+
+  // 2. 污点检查（Phase 3 完整版）
+  const taintAnalysis = taintTracker.analyzeToolCall('run_command', { command }, { previousToolCalls: [] })
+
+  // 3. 决策升级：污点 + Policy
+  let finalDecision = policyResult.decision
+  if (taintAnalysis.hasTaint) {
+    // 污点升级规则
+    if (taintAnalysis.riskLevel === 'high') {
+      finalDecision = 'forbidden' // prompt injection 直接禁止
+    } else if (taintAnalysis.riskLevel === 'medium' && finalDecision === 'allow') {
+      finalDecision = 'prompt' // 外部 API 数据降级为需要审批
+    }
+  }
+
+  // 4. 拦截或执行
+  if (finalDecision === 'forbidden') {
+    const reason = taintAnalysis.taintedParams.length > 0
+      ? `命令包含污染参数（${taintAnalysis.taintedParams[0].source}）`
+      : policyResult.justification ?? '策略禁止'
+    throw new Error(`命令被拦截: ${reason}`)
+  }
+
+  // 记录污点事件（如果有）
+  if (taintAnalysis.hasTaint) {
+    await emitSessionEvent(sessionID, {
+      type: "taint_detected",
+      toolName: "run_command",
+      taintedParams: taintAnalysis.taintedParams,
+      riskLevel: taintAnalysis.riskLevel,
+      decision: finalDecision
+    })
+  }
+
   const timeoutMs = typeof input.timeoutMs === "number" ? Math.min(Math.max(input.timeoutMs, 1_000), 600_000) : 120_000
   const entry = await terminalFor(sessionID, projectPath).exec(command, timeoutMs)
   await emitSessionEvent(sessionID, { type: "terminal_completed", ...entry })
