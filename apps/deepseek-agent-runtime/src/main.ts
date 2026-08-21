@@ -662,55 +662,102 @@ async function delegateWorker(sessionID: string, projectPath: string, input: Rec
 }
 
 /**
- * Verifier Worker（NEXT_GEN_ARCHITECTURE Phase 1 支柱二）：
+ * Verifier Worker v1（NEXT_GEN_ARCHITECTURE Phase 1 支柱二完整版）：
  * 在独立 worktree 中对主 Agent 的交付声明进行对抗性验证。
  *
  * 与只读 Worker 的差异：
- * - 允许运行测试命令（白名单：test/lint/build/typecheck 族）
- * - 独立 Git worktree 物理隔离
+ * - 独立 Git worktree 物理隔离（避免污染主工作区）
+ * - 允许运行测试命令（白名单：test/lint/build/typecheck/check 族）
  * - 返回 pass/refuted/inconclusive + 反驳证据
+ *
+ * 验证策略：
+ * 1. 检查 git diff 存在且非空（无 diff = 反驳）
+ * 2. 重跑主 Agent 声称通过的所有测试命令（任一失败 = 反驳）
+ * 3. 检查 diff 是否覆盖用户需求中的关键词（TODO：Phase 1 v1.1）
  */
-async function runVerifierWorker(sessionID: string, projectPath: string, claim: string): Promise<{ state: "pass" | "refuted" | "inconclusive"; counterEvidence: string[]; summary: string }> {
+async function runVerifierWorker(sessionID: string, projectPath: string, claim: string, requirement?: string): Promise<{ state: "pass" | "refuted" | "inconclusive"; counterEvidence: string[]; summary: string }> {
   const workerID = `verifier-${crypto.randomUUID()}`
   await emitSessionEvent(sessionID, { type: "verifier_started", workerID, claim })
 
-  try {
-    // Phase 1 v0：简化版 Verifier，只检查 git diff 和重跑已有测试命令
-    // 完整版需要：独立 worktree + 检查 diff 覆盖需求 + 寻找反例
-    const gitDiffResult = await execFile("git", ["-C", projectPath, "diff", "--stat"], { maxBuffer: 50_000 })
-    const diffStat = gitDiffResult.stdout.trim()
+  let worktreePath: string | undefined
+  let worktreeBranch: string | undefined
 
-    if (!diffStat) {
+  try {
+    // 1. 创建独立 worktree（基于当前 HEAD，物理隔离）
+    const worktreeService = new (await import("../../../src/core/git/worktree")).GitWorktreeService()
+    const worktreeStorage = join(tmpdir(), "deepseek-verifier-worktrees")
+    const headCommit = (await execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 })).stdout.trim()
+    const worktree = await worktreeService.create({
+      repository: projectPath,
+      storage: worktreeStorage,
+      taskTitle: `verify-${sessionID.slice(0, 8)}`,
+      baseRef: headCommit
+    })
+    worktreePath = worktree.path
+    worktreeBranch = worktree.branch
+
+    // 2. 将主工作区的当前 diff 应用到 worktree（复现主 Agent 声称的状态）
+    const diffResult = await execFile("git", ["-C", projectPath, "diff", "HEAD"], { maxBuffer: 500_000 }).catch(() => ({ stdout: "" }))
+    const diff = diffResult.stdout.trim()
+
+    if (!diff) {
       // 无 diff = 声称修改了但工作区干净，立即反驳
       return { state: "refuted", counterEvidence: ["工作区无 Git Diff，声称的修改未落盘"], summary: "Verifier 反驳：无可验证补丁" }
     }
 
-    // 查找最近一次成功的测试命令（从事件日志中提取）
+    // 应用 diff 到 worktree
+    await execFile("git", ["-C", worktreePath, "apply", "--"], { input: diff, maxBuffer: 500_000 }).catch((error) => {
+      throw new Error(`Failed to apply diff to worktree: ${error instanceof Error ? error.message : String(error)}`)
+    })
+
+    // 3. 查找主 Agent 声称通过的所有测试命令（从事件日志提取）
     const events = await eventStore.loadEvents(sessionID)
     const testCommands = events
-      .filter((event) => event.type === "terminal_completed" && event.payload?.exitCode === 0 && /\b(test|lint|build|typecheck)\b/i.test(String(event.payload?.command)))
+      .filter((event) => event.type === "terminal_completed" && event.payload?.exitCode === 0 && /\b(test|lint|build|typecheck|check|spec|ci)\b/i.test(String(event.payload?.command)))
       .map((event) => event.payload?.command as string)
+      .filter((cmd, index, self) => self.indexOf(cmd) === index) // 去重
 
     if (testCommands.length === 0) {
-      // 无可重跑的测试 = 无法验证，但不算反驳
-      return { state: "inconclusive", counterEvidence: [], summary: `Verifier 无法裁决：工作区有 ${diffStat.split('\n').length - 1} 个文件变更，但无可重跑的测试命令` }
+      // 无可重跑的测试 = 无法验证，但不算反驳（可能是纯文档修改）
+      const diffStat = (await execFile("git", ["-C", worktreePath, "diff", "--stat", "HEAD"], { maxBuffer: 50_000 })).stdout.trim()
+      return { state: "inconclusive", counterEvidence: [], summary: `Verifier 无法裁决：工作区有修改（${diffStat.split('\n').length - 1} 个文件），但无可重跑的测试命令` }
     }
 
-    // 重跑最后一条测试命令（Phase 1 v0 简化：只跑一条，完整版应该跑全部相关测试）
-    const testCommand = testCommands[testCommands.length - 1]
-    const testResult = await execFile("sh", ["-c", testCommand], { cwd: projectPath, maxBuffer: 200_000, timeout: 60_000 }).catch((error) => error as { code: number; stdout: string; stderr: string })
+    // 4. 在 worktree 中重跑所有测试命令（任一失败 = 反驳）
+    const failedTests: { command: string; exitCode: number; snippet: string }[] = []
+    for (const testCommand of testCommands) {
+      const testResult = await execFile("sh", ["-c", testCommand], { cwd: worktreePath, maxBuffer: 200_000, timeout: 120_000 }).catch((error) => error as { code: number; stdout: string; stderr: string })
 
-    if (typeof testResult === "object" && "code" in testResult && testResult.code !== 0) {
-      // 测试失败 = 反驳
-      const failureSnippet = (testResult.stderr || testResult.stdout || "").split('\n').slice(-10).join('\n').slice(0, 500)
-      return { state: "refuted", counterEvidence: [`测试命令 \`${testCommand}\` 失败（exit ${testResult.code}）`, failureSnippet], summary: `Verifier 反驳：声称的修复在测试下仍失败` }
+      if (typeof testResult === "object" && "code" in testResult && testResult.code !== 0) {
+        const failureSnippet = (testResult.stderr || testResult.stdout || "").split('\n').slice(-10).join('\n').slice(0, 500)
+        failedTests.push({ command: testCommand, exitCode: testResult.code, snippet: failureSnippet })
+      }
     }
 
-    // 测试通过 + 有 diff = pass
-    return { state: "pass", counterEvidence: [], summary: `Verifier 通过：工作区有 ${diffStat.split('\n').length - 1} 个文件变更，测试 \`${testCommand}\` 通过` }
+    if (failedTests.length > 0) {
+      // 有测试失败 = 反驳
+      const counterEvidence = failedTests.flatMap((fail) => [
+        `测试命令 \`${fail.command}\` 失败（exit ${fail.exitCode}）`,
+        fail.snippet
+      ])
+      return { state: "refuted", counterEvidence, summary: `Verifier 反驳：声称的修复在 ${failedTests.length} 条测试下仍失败` }
+    }
+
+    // 5. 全部测试通过 = pass
+    const diffStat = (await execFile("git", ["-C", worktreePath, "diff", "--stat", "HEAD"], { maxBuffer: 50_000 })).stdout.trim()
+    return { state: "pass", counterEvidence: [], summary: `Verifier 通过：工作区有修改（${diffStat.split('\n').length - 1} 个文件），${testCommands.length} 条测试全部通过` }
+
   } catch (error) {
     // Verifier 自身出错 = inconclusive（不能因为 verifier 挂了就说主 Agent 错了）
     return { state: "inconclusive", counterEvidence: [], summary: `Verifier 执行失败：${error instanceof Error ? error.message : String(error)}` }
+  } finally {
+    // 清理 worktree（pass/refuted 都清理，inconclusive 保留用于调试）
+    if (worktreePath && worktreeBranch) {
+      try {
+        await execFile("git", ["-C", projectPath, "worktree", "remove", "--force", worktreePath], { timeout: 10_000 }).catch(() => undefined)
+        await execFile("git", ["-C", projectPath, "branch", "-D", worktreeBranch], { timeout: 10_000 }).catch(() => undefined)
+      } catch { /* 清理失败不影响 verdict */ }
+    }
   }
 }
 
