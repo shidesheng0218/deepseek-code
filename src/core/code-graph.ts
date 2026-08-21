@@ -47,31 +47,181 @@ export interface ModuleMap {
 }
 
 /**
- * 代码图谱服务（Phase 2 v1 占位实现）
+ * 代码图谱服务（Phase 2 v2 简化实现）
+ *
+ * 不依赖 tree-sitter，用正则提取 TS/JS 符号（生产环境可升级为 AST 解析）
  */
 export class CodeGraphService {
   private symbols: Map<string, SymbolCard> = new Map();
   private callGraph: CallGraphEdge[] = [];
+  private indexedFiles: Set<string> = new Set();
 
   /**
    * 索引工作区（首次或刷新）
-   * Phase 2 v1：占位实现，返回空图谱
-   * Phase 2 v2：tree-sitter 解析 + 增量更新
+   * Phase 2 v2：正则提取符号（函数、类、接口、类型）
    */
   async indexWorkspace(projectPath: string): Promise<{ symbolCount: number; files: number }> {
-    // TODO: tree-sitter 解析所有 .ts/.js 文件
-    // 1. 找到所有源文件（排除 node_modules）
-    // 2. 解析每个文件的 AST
-    // 3. 提取函数/类/接口定义 → SymbolCard
-    // 4. 提取调用关系 → CallGraphEdge
-    return { symbolCount: 0, files: 0 };
+    const { readdir, readFile, stat } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+
+    // 1. 递归找到所有 .ts/.tsx/.js/.jsx 文件（排除 node_modules、dist、build）
+    const sourceFiles: string[] = [];
+    const excludeDirs = new Set(['node_modules', 'dist', 'build', '.git', 'coverage']);
+
+    const walk = async (dir: string) => {
+      try {
+        const entries = await readdir(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            if (!excludeDirs.has(entry.name)) {
+              await walk(join(dir, entry.name));
+            }
+          } else if (/\.(ts|tsx|js|jsx)$/.test(entry.name)) {
+            sourceFiles.push(join(dir, entry.name));
+          }
+        }
+      } catch {
+        // 目录不可读则跳过
+      }
+    };
+
+    await walk(projectPath);
+
+    // 2. 解析每个文件
+    for (const filePath of sourceFiles.slice(0, 500)) {
+      // 限制 500 个文件避免超时
+      await this.updateFile(filePath, projectPath);
+    }
+
+    return { symbolCount: this.symbols.size, files: this.indexedFiles.size };
   }
 
   /**
    * 增量更新（文件变更时）
    */
-  async updateFile(filePath: string): Promise<void> {
-    // TODO: 重新解析单个文件，更新 symbols 和 callGraph
+  async updateFile(filePath: string, projectPath?: string): Promise<void> {
+    const { readFile } = await import('node:fs/promises');
+    const { relative } = await import('node:path');
+
+    try {
+      const content = await readFile(filePath, 'utf8');
+      const relativePath = projectPath ? relative(projectPath, filePath) : filePath;
+
+      // 移除该文件的旧符号
+      for (const [name, card] of this.symbols.entries()) {
+        if (card.filePath === relativePath) {
+          this.symbols.delete(name);
+        }
+      }
+
+      // 提取新符号
+      this.extractSymbols(content, relativePath);
+      this.indexedFiles.add(relativePath);
+    } catch {
+      // 文件不可读则跳过
+    }
+  }
+
+  /**
+   * 正则提取符号（简化版，生产环境用 AST）
+   */
+  private extractSymbols(content: string, filePath: string): void {
+    const lines = content.split('\n');
+
+    // 提取函数定义
+    const functionPattern = /^export\s+(?:async\s+)?function\s+(\w+)\s*\(/;
+    const arrowFunctionPattern = /^export\s+const\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>/;
+
+    // 提取类定义
+    const classPattern = /^export\s+(?:abstract\s+)?class\s+(\w+)/;
+
+    // 提取接口定义
+    const interfacePattern = /^export\s+interface\s+(\w+)/;
+
+    // 提取类型定义
+    const typePattern = /^export\s+type\s+(\w+)/;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+      const trimmed = line.trim();
+      const lineNumber = i + 1;
+
+      // 函数
+      let match = trimmed.match(functionPattern) || trimmed.match(arrowFunctionPattern);
+      if (match && match[1]) {
+        const name = match[1];
+        this.symbols.set(name, {
+          name,
+          kind: 'function',
+          filePath,
+          line: lineNumber,
+          signature: trimmed.slice(0, 100),
+          references: 0,
+          relatedTests: [],
+          exports: true
+        });
+        continue;
+      }
+
+      // 类
+      match = trimmed.match(classPattern);
+      if (match && match[1]) {
+        const name = match[1];
+        this.symbols.set(name, {
+          name,
+          kind: 'class',
+          filePath,
+          line: lineNumber,
+          signature: trimmed.slice(0, 100),
+          references: 0,
+          relatedTests: [],
+          exports: true
+        });
+        continue;
+      }
+
+      // 接口
+      match = trimmed.match(interfacePattern);
+      if (match && match[1]) {
+        const name = match[1];
+        this.symbols.set(name, {
+          name,
+          kind: 'interface',
+          filePath,
+          line: lineNumber,
+          signature: trimmed.slice(0, 100),
+          references: 0,
+          relatedTests: [],
+          exports: true
+        });
+        continue;
+      }
+
+      // 类型
+      match = trimmed.match(typePattern);
+      if (match && match[1]) {
+        const name = match[1];
+        this.symbols.set(name, {
+          name,
+          kind: 'type',
+          filePath,
+          line: lineNumber,
+          signature: trimmed.slice(0, 100),
+          references: 0,
+          relatedTests: [],
+          exports: true
+        });
+      }
+    }
+
+    // 提取调用关系（简化版：只找 import 语句）
+    const importPattern = /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
+    let importMatch;
+    while ((importMatch = importPattern.exec(content)) !== null) {
+      const symbols = importMatch[1]?.split(',').map((s) => s.trim()) ?? [];
+      // TODO: 构建 CallGraphEdge（需要跨文件解析）
+    }
   }
 
   /**

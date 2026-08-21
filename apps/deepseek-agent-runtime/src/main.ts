@@ -637,6 +637,68 @@ async function runPersistentCommand(sessionID: string, projectPath: string, inpu
   return { ok: entry.exitCode === 0, sequence: entry.sequence, stdout: entry.stdout.slice(0, 50_000), stderr: entry.stderr.slice(0, 20_000), exitCode: entry.exitCode }
 }
 
+async function graphSymbolCard(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const symbolName = typeof input.name === "string" ? input.name : undefined
+  if (!symbolName) throw new Error("graph_symbol_card requires name parameter")
+
+  const card = codeGraph.getSymbolCard(symbolName)
+  if (!card) return { found: false, message: `Symbol "${symbolName}" not found in code graph` }
+
+  return {
+    found: true,
+    name: card.name,
+    kind: card.kind,
+    filePath: card.filePath,
+    line: card.line,
+    signature: card.signature?.slice(0, 200),
+    references: card.references,
+    relatedTests: card.relatedTests.slice(0, 5)
+  }
+}
+
+async function graphWhoCalls(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const symbolName = typeof input.name === "string" ? input.name : undefined
+  const depth = typeof input.depth === "number" ? input.depth : 1
+  if (!symbolName) throw new Error("graph_who_calls requires name parameter")
+
+  const callers = codeGraph.getCallers(symbolName, depth)
+  return {
+    symbol: symbolName,
+    callers: callers.slice(0, 20), // 限制 20 个避免上下文溢出
+    depth,
+    total: callers.length
+  }
+}
+
+async function graphChangeImpact(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const changedFiles = Array.isArray(input.files) ? input.files.filter((f): f is string => typeof f === "string") : []
+  if (changedFiles.length === 0) throw new Error("graph_change_impact requires files parameter")
+
+  const impact = codeGraph.analyzeImpact(changedFiles)
+  return {
+    changedSymbols: impact.changedSymbols.slice(0, 10),
+    affectedSymbols: impact.affectedSymbols.slice(0, 20),
+    suggestedTests: impact.suggestedTests.slice(0, 10),
+    riskLevel: impact.riskLevel,
+    total: {
+      changed: impact.changedSymbols.length,
+      affected: impact.affectedSymbols.length,
+      tests: impact.suggestedTests.length
+    }
+  }
+}
+
+async function graphModuleMap(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const directory = typeof input.directory === "string" ? input.directory : "."
+  const moduleMap = codeGraph.getModuleMap(directory)
+  return {
+    directory: moduleMap.directory,
+    exports: moduleMap.exports.slice(0, 20),
+    imports: moduleMap.imports.slice(0, 20),
+    testCoverage: moduleMap.testCoverage
+  }
+}
+
 async function delegateWorker(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
   const type = input.type
   if (type !== "explore" && type !== "review" && type !== "research" && type !== "ci") throw new Error("delegate_worker requires type explore, review, research or ci")
@@ -1138,6 +1200,10 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       web_search: webTools.web_search,
       web_fetch: webTools.web_fetch,
       delegate_worker: (input) => delegateWorker(sessionID, projectPath, input),
+      graph_symbol_card: (input) => graphSymbolCard(sessionID, projectPath, input),
+      graph_who_calls: (input) => graphWhoCalls(sessionID, projectPath, input),
+      graph_change_impact: (input) => graphChangeImpact(sessionID, projectPath, input),
+      graph_module_map: (input) => graphModuleMap(sessionID, projectPath, input),
       github_ci_status: () => githubCIStatus(sessionID, projectPath),
       github_ci_failure_log: (input) => githubCIFailureLog(sessionID, projectPath, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !request.repair),
       browser_evidence: (input) => browserEvidence(sessionID, input),
