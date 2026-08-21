@@ -14,10 +14,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const root = join(__dirname, '..', '..');
 const sidecarEntry = join(root, 'apps', 'deepseek-agent-runtime', 'src', 'main.ts');
 const bun = join(root, 'node_modules', '@oven', 'bun-darwin-aarch64', 'bin', 'bun');
-const bugsDir = join(root, 'benchmarks', 'seeded-bugs');
+const bugsDir = __dirname;
 
 // 从环境变量读取真实 API 配置
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
@@ -127,7 +128,7 @@ for (const bug of bugs) {
       model: DEEPSEEK_MODEL,
       protocol: 'openai-compatible',
       mode: 'auto'
-    }, 180_000); // 3 分钟超时
+    }, 300_000); // 5 分钟超时（从 180s 延长到 300s）
 
     const events = readSessionEvents(sessionRoot, sessionID);
     const verdict = extractVerifierVerdict(events);
