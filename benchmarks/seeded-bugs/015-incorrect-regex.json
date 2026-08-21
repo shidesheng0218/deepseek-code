@@ -1,0 +1,11 @@
+{
+  "id": "015-incorrect-regex",
+  "description": "正则表达式错误：邮箱验证不完整",
+  "file": "email.js",
+  "buggyCode": "function isValidEmail(email) {\n  return /^[^@]+@[^@]+$/.test(email);\n}\nmodule.exports = { isValidEmail };",
+  "testFile": "email.test.js",
+  "testCode": "const { isValidEmail } = require('./email');\nconst assert = require('assert');\nassert.strictEqual(isValidEmail('user@example.com'), true);\nassert.strictEqual(isValidEmail('user@'), false);\nassert.strictEqual(isValidEmail('@example.com'), false);\nassert.strictEqual(isValidEmail('user @example.com'), false);\nconsole.log('All tests passed');",
+  "testCommand": "node email.test.js",
+  "fixPrompt": "Fix email validation regex - reject emails with spaces and require domain",
+  "goldenTruth": "buggy"
+}

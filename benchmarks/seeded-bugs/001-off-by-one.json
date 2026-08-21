@@ -1,0 +1,11 @@
+{
+  "id": "001-off-by-one",
+  "description": "Off-by-one 错误：数组索引越界",
+  "file": "sum.js",
+  "buggyCode": "function sumArray(arr) {\n  let sum = 0;\n  for (let i = 0; i <= arr.length; i++) {\n    sum += arr[i];\n  }\n  return sum;\n}\nmodule.exports = { sumArray };",
+  "testFile": "sum.test.js",
+  "testCode": "const { sumArray } = require('./sum');\nconst assert = require('assert');\nassert.strictEqual(sumArray([1, 2, 3]), 6);\nassert.strictEqual(sumArray([]), 0);\nassert.strictEqual(sumArray([5]), 5);\nconsole.log('All tests passed');",
+  "testCommand": "node sum.test.js",
+  "fixPrompt": "Fix the off-by-one error in sum.js - the loop goes one index too far",
+  "goldenTruth": "buggy"
+}

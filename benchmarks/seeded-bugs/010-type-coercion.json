@@ -1,0 +1,11 @@
+{
+  "id": "010-type-coercion",
+  "description": "类型强制转换导致意外行为",
+  "file": "compare.js",
+  "buggyCode": "function isEqual(a, b) {\n  return a == b;\n}\nmodule.exports = { isEqual };",
+  "testFile": "compare.test.js",
+  "testCode": "const { isEqual } = require('./compare');\nconst assert = require('assert');\nassert.strictEqual(isEqual(1, 1), true);\nassert.strictEqual(isEqual(1, '1'), false);\nassert.strictEqual(isEqual(null, undefined), false);\nassert.strictEqual(isEqual(0, false), false);\nconsole.log('All tests passed');",
+  "testCommand": "node compare.test.js",
+  "fixPrompt": "Fix isEqual to use strict equality (===) instead of loose equality (==)",
+  "goldenTruth": "buggy"
+}

@@ -1,0 +1,11 @@
+{
+  "id": "013-path-traversal",
+  "description": "路径遍历漏洞：未验证文件路径",
+  "file": "file-server.js",
+  "buggyCode": "const fs = require('fs');\nconst path = require('path');\nfunction readUserFile(filename) {\n  const filePath = path.join(__dirname, 'uploads', filename);\n  return fs.readFileSync(filePath, 'utf8');\n}\nmodule.exports = { readUserFile };",
+  "testFile": "file-server.test.js",
+  "testCode": "const { readUserFile } = require('./file-server');\nconst assert = require('assert');\ntry {\n  readUserFile('../../../etc/passwd');\n  throw new Error('Path traversal vulnerability detected');\n} catch (e) {\n  if (e.code === 'ENOENT' || e.message.includes('Path traversal')) {\n    console.log('All tests passed');\n  } else throw e;\n}",
+  "testCommand": "node file-server.test.js",
+  "fixPrompt": "Fix path traversal vulnerability - validate filename doesn't contain .. or absolute paths",
+  "goldenTruth": "buggy"
+}

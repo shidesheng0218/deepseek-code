@@ -1,0 +1,11 @@
+{
+  "id": "016-timezone-bug",
+  "description": "时区处理错误：Date 对象本地化问题",
+  "file": "date.js",
+  "buggyCode": "function formatDate(timestamp) {\n  const date = new Date(timestamp);\n  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;\n}\nmodule.exports = { formatDate };",
+  "testFile": "date.test.js",
+  "testCode": "const { formatDate } = require('./date');\nconst assert = require('assert');\nconst result = formatDate(1609459200000);\nassert(result.includes('2021'), 'Year should be 2021');\nassert(result.includes('-1-'), 'Month should be padded');\nconsole.log('All tests passed');",
+  "testCommand": "node date.test.js",
+  "fixPrompt": "Fix date formatting - pad month and day with zeros to get YYYY-MM-DD format",
+  "goldenTruth": "buggy"
+}

@@ -1,0 +1,11 @@
+{
+  "id": "018-case-sensitive-compare",
+  "description": "大小写敏感比较导致误判",
+  "file": "auth.js",
+  "buggyCode": "function checkUsername(input, expected) {\n  return input === expected;\n}\nmodule.exports = { checkUsername };",
+  "testFile": "auth.test.js",
+  "testCode": "const { checkUsername } = require('./auth');\nconst assert = require('assert');\nassert.strictEqual(checkUsername('Alice', 'Alice'), true);\nassert.strictEqual(checkUsername('alice', 'Alice'), true);\nassert.strictEqual(checkUsername('ALICE', 'Alice'), true);\nconsole.log('All tests passed');",
+  "testCommand": "node auth.test.js",
+  "fixPrompt": "Fix username comparison to be case-insensitive",
+  "goldenTruth": "buggy"
+}

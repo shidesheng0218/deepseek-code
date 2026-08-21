@@ -110,7 +110,25 @@ function assertLogInvariants(sessionRoot, sessionID) {
   }
   const ends = events.filter((event) => event.type === 'turn_ended' || (event.payload && event.payload.type === 'turn_ended'));
   check(ends.length > 0, `${sessionID}: 缺少 turn_ended（会话悬挂）`);
-  return events;
+
+  // Phase 1 不变量：确定性回放一致性
+  const recordedTurns = events.filter((event) => event.type === 'model_stream_recorded');
+  return { events, recordedTurns };
+}
+
+async function assertReplayInvariant(sidecar, sessionRoot, sessionID) {
+  const { recordedTurns } = assertLogInvariants(sessionRoot, sessionID);
+  if (recordedTurns.length === 0) return; // 崩溃会话可能无录制
+
+  // 回放验证：mode=model 应成功构造 RecordingProvider
+  try {
+    const replay = await sidecar.send('session.replay', { sessionID, mode: 'model' }, 10_000);
+    check(replay.ok === true, `${sessionID}: replay mode=model 失败`);
+    check(replay.result?.mode === 'model', `${sessionID}: replay 未返回 model 模式结果`);
+    check(replay.result?.recordedTurns === recordedTurns.length, `${sessionID}: replay 录制 turn 数不匹配（期望 ${recordedTurns.length}，实际 ${replay.result?.recordedTurns ?? 0}）`);
+  } catch (error) {
+    failures.push(`${sessionID}: replay 不变量检查失败 - ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 const sessionRoot = mkdtempSync(join(tmpdir(), 'deepseek-soak-'));
@@ -138,6 +156,7 @@ const provider = await startFlakyProvider();
       failures.push(`${sessionID}: ${error instanceof Error ? error.message : String(error)}`);
     }
     assertLogInvariants(sessionRoot, sessionID);
+    await assertReplayInvariant(sidecar, sessionRoot, sessionID);
   }
   sidecar.child.kill('SIGKILL');
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));

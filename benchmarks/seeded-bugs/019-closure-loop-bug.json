@@ -1,0 +1,11 @@
+{
+  "id": "019-closure-loop-bug",
+  "description": "闭包循环变量捕获错误",
+  "file": "timer.js",
+  "buggyCode": "function createTimers(count) {\n  const timers = [];\n  for (var i = 0; i < count; i++) {\n    timers.push(() => i);\n  }\n  return timers;\n}\nmodule.exports = { createTimers };",
+  "testFile": "timer.test.js",
+  "testCode": "const { createTimers } = require('./timer');\nconst assert = require('assert');\nconst timers = createTimers(3);\nassert.strictEqual(timers[0](), 0);\nassert.strictEqual(timers[1](), 1);\nassert.strictEqual(timers[2](), 2);\nconsole.log('All tests passed');",
+  "testCommand": "node timer.test.js",
+  "fixPrompt": "Fix closure bug - use let instead of var in the loop",
+  "goldenTruth": "buggy"
+}

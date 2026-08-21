@@ -1,0 +1,11 @@
+{
+  "id": "007-buffer-overflow",
+  "description": "字符串截断未考虑多字节字符",
+  "file": "truncate.js",
+  "buggyCode": "function truncate(str, maxBytes) {\n  return str.slice(0, maxBytes);\n}\nmodule.exports = { truncate };",
+  "testFile": "truncate.test.js",
+  "testCode": "const { truncate } = require('./truncate');\nconst assert = require('assert');\nconst emoji = '👍';\nassert.strictEqual(Buffer.byteLength(truncate(emoji, 2)), 2);\nassert.strictEqual(truncate('hello', 3), 'hel');\nconsole.log('All tests passed');",
+  "testCommand": "node truncate.test.js",
+  "fixPrompt": "Fix truncate to handle UTF-8 multibyte characters correctly - use Buffer.byteLength",
+  "goldenTruth": "buggy"
+}

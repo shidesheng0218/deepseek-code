@@ -1,0 +1,11 @@
+{
+  "id": "006-unhandled-promise-rejection",
+  "description": "未处理的 Promise rejection",
+  "file": "db.js",
+  "buggyCode": "async function saveUser(user) {\n  if (!user.name) {\n    throw new Error('Name is required');\n  }\n  return { id: 1, ...user };\n}\nfunction createUser(name) {\n  saveUser({ name });\n  return 'User created';\n}\nmodule.exports = { createUser };",
+  "testFile": "db.test.js",
+  "testCode": "const { createUser } = require('./db');\nconst assert = require('assert');\ntry {\n  createUser('');\n  setTimeout(() => { throw new Error('Should have thrown'); }, 100);\n} catch (e) {\n  console.log('All tests passed');\n}",
+  "testCommand": "node db.test.js",
+  "fixPrompt": "Fix createUser to properly await the saveUser promise",
+  "goldenTruth": "buggy"
+}

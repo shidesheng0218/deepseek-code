@@ -1,0 +1,11 @@
+{
+  "id": "002-null-check-missing",
+  "description": "缺少 null 检查导致运行时错误",
+  "file": "user.js",
+  "buggyCode": "function getUserName(user) {\n  return user.name.toUpperCase();\n}\nmodule.exports = { getUserName };",
+  "testFile": "user.test.js",
+  "testCode": "const { getUserName } = require('./user');\nconst assert = require('assert');\nassert.strictEqual(getUserName({ name: 'alice' }), 'ALICE');\nassert.throws(() => getUserName(null), /Cannot read/);\nassert.throws(() => getUserName({ name: null }), /Cannot read/);\nconsole.log('All tests passed');",
+  "testCommand": "node user.test.js",
+  "fixPrompt": "Fix getUserName to handle null user and null user.name safely",
+  "goldenTruth": "buggy"
+}

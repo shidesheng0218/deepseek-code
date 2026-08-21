@@ -1,0 +1,11 @@
+{
+  "id": "017-infinite-recursion",
+  "description": "无限递归：缺少基础情况",
+  "file": "factorial.js",
+  "buggyCode": "function factorial(n) {\n  if (n <= 0) return 1;\n  return n * factorial(n - 1);\n}\nmodule.exports = { factorial };",
+  "testFile": "factorial.test.js",
+  "testCode": "const { factorial } = require('./factorial');\nconst assert = require('assert');\nassert.strictEqual(factorial(5), 120);\nassert.strictEqual(factorial(-1), 1);\ntry {\n  factorial(1.5);\n  throw new Error('Should handle non-integer');\n} catch (e) {\n  if (e.message === 'Should handle non-integer') throw e;\n  console.log('All tests passed');\n}",
+  "testCommand": "node factorial.test.js",
+  "fixPrompt": "Fix factorial to handle non-integer inputs - add validation or floor the input",
+  "goldenTruth": "buggy"
+}

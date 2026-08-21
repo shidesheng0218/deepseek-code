@@ -1,0 +1,11 @@
+{
+  "id": "008-division-by-zero",
+  "description": "除零错误未处理",
+  "file": "average.js",
+  "buggyCode": "function average(numbers) {\n  const sum = numbers.reduce((a, b) => a + b, 0);\n  return sum / numbers.length;\n}\nmodule.exports = { average };",
+  "testFile": "average.test.js",
+  "testCode": "const { average } = require('./average');\nconst assert = require('assert');\nassert.strictEqual(average([1, 2, 3]), 2);\nassert.strictEqual(average([]), 0);\nassert.strictEqual(average([5]), 5);\nconsole.log('All tests passed');",
+  "testCommand": "node average.test.js",
+  "fixPrompt": "Fix average function to handle empty array - return 0 instead of NaN",
+  "goldenTruth": "buggy"
+}

@@ -1,0 +1,11 @@
+{
+  "id": "020-json-parse-unsafe",
+  "description": "JSON.parse 未处理异常",
+  "file": "config.js",
+  "buggyCode": "function loadConfig(jsonString) {\n  return JSON.parse(jsonString);\n}\nmodule.exports = { loadConfig };",
+  "testFile": "config.test.js",
+  "testCode": "const { loadConfig } = require('./config');\nconst assert = require('assert');\nconst valid = loadConfig('{\"key\": \"value\"}');\nassert.strictEqual(valid.key, 'value');\nconst invalid = loadConfig('invalid json');\nassert.strictEqual(invalid, null);\nconsole.log('All tests passed');",
+  "testCommand": "node config.test.js",
+  "fixPrompt": "Fix loadConfig to catch JSON.parse errors and return null for invalid input",
+  "goldenTruth": "buggy"
+}

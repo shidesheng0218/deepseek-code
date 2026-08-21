@@ -1,0 +1,11 @@
+{
+  "id": "014-race-condition-counter",
+  "description": "并发计数器竞态条件",
+  "file": "counter.js",
+  "buggyCode": "class Counter {\n  constructor() {\n    this.value = 0;\n  }\n  async increment() {\n    const current = this.value;\n    await new Promise(r => setTimeout(r, 1));\n    this.value = current + 1;\n  }\n  getValue() {\n    return this.value;\n  }\n}\nmodule.exports = { Counter };",
+  "testFile": "counter.test.js",
+  "testCode": "const { Counter } = require('./counter');\nconst counter = new Counter();\nPromise.all([counter.increment(), counter.increment(), counter.increment()]).then(() => {\n  if (counter.getValue() === 3) console.log('All tests passed');\n  else throw new Error(`Expected 3, got ${counter.getValue()}`);\n}).catch(e => { console.error(e); process.exit(1); });",
+  "testCommand": "node counter.test.js",
+  "fixPrompt": "Fix race condition in Counter - increment should be atomic",
+  "goldenTruth": "buggy"
+}

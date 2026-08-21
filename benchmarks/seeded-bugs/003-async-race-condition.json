@@ -1,0 +1,11 @@
+{
+  "id": "003-async-race-condition",
+  "description": "异步竞态条件：未正确等待 Promise",
+  "file": "fetch.js",
+  "buggyCode": "async function fetchUserData(userId) {\n  const response = fetch(`https://api.example.com/users/${userId}`);\n  return response.json();\n}\nmodule.exports = { fetchUserData };",
+  "testFile": "fetch.test.js",
+  "testCode": "const { fetchUserData } = require('./fetch');\nglobal.fetch = async (url) => ({ json: async () => ({ id: 1, name: 'test' }) });\nfetchUserData(1).then(data => {\n  if (data && data.name === 'test') console.log('All tests passed');\n  else throw new Error('Failed to fetch user data');\n}).catch(err => { console.error(err); process.exit(1); });",
+  "testCommand": "node fetch.test.js",
+  "fixPrompt": "Fix the async function - missing await on the fetch call",
+  "goldenTruth": "buggy"
+}

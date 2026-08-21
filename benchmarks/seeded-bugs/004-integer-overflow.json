@@ -1,0 +1,11 @@
+{
+  "id": "004-integer-overflow",
+  "description": "整数溢出：计算金额时精度丢失",
+  "file": "money.js",
+  "buggyCode": "function calculateTotal(prices) {\n  return prices.reduce((sum, price) => sum + price, 0);\n}\nmodule.exports = { calculateTotal };",
+  "testFile": "money.test.js",
+  "testCode": "const { calculateTotal } = require('./money');\nconst assert = require('assert');\nassert.strictEqual(calculateTotal([0.1, 0.2]), 0.3);\nassert.strictEqual(calculateTotal([10.5, 20.3, 5.2]), 36.0);\nconsole.log('All tests passed');",
+  "testCommand": "node money.test.js",
+  "fixPrompt": "Fix floating point precision issue in money calculation - use integer cents instead",
+  "goldenTruth": "buggy"
+}

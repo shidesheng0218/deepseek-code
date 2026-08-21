@@ -1,0 +1,11 @@
+{
+  "id": "005-logic-inversion",
+  "description": "逻辑反转：isEmpty 实现错误",
+  "file": "validator.js",
+  "buggyCode": "function isEmpty(str) {\n  return str && str.trim().length > 0;\n}\nmodule.exports = { isEmpty };",
+  "testFile": "validator.test.js",
+  "testCode": "const { isEmpty } = require('./validator');\nconst assert = require('assert');\nassert.strictEqual(isEmpty(''), true);\nassert.strictEqual(isEmpty('  '), true);\nassert.strictEqual(isEmpty('hello'), false);\nassert.strictEqual(isEmpty(null), true);\nconsole.log('All tests passed');",
+  "testCommand": "node validator.test.js",
+  "fixPrompt": "Fix isEmpty function - it's returning the opposite of what it should",
+  "goldenTruth": "buggy"
+}

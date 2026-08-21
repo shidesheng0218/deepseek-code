@@ -1,0 +1,11 @@
+{
+  "id": "009-memory-leak",
+  "description": "事件监听器未移除导致内存泄漏",
+  "file": "events.js",
+  "buggyCode": "class DataStream {\n  constructor() {\n    this.listeners = [];\n  }\n  on(event, callback) {\n    this.listeners.push({ event, callback });\n  }\n  emit(event, data) {\n    this.listeners.forEach(l => {\n      if (l.event === event) l.callback(data);\n    });\n  }\n}\nmodule.exports = { DataStream };",
+  "testFile": "events.test.js",
+  "testCode": "const { DataStream } = require('./events');\nconst stream = new DataStream();\nlet count = 0;\nconst handler = () => { count++; };\nstream.on('data', handler);\nstream.emit('data', {});\nif (count !== 1) throw new Error('Handler not called');\nconsole.log('All tests passed');",
+  "testCommand": "node events.test.js",
+  "fixPrompt": "Add a removeListener method to DataStream to prevent memory leaks",
+  "goldenTruth": "buggy"
+}

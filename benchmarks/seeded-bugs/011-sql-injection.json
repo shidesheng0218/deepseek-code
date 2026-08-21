@@ -1,0 +1,11 @@
+{
+  "id": "011-sql-injection",
+  "description": "SQL 注入漏洞：未使用参数化查询",
+  "file": "query.js",
+  "buggyCode": "function getUserById(db, userId) {\n  const sql = `SELECT * FROM users WHERE id = ${userId}`;\n  return db.query(sql);\n}\nmodule.exports = { getUserById };",
+  "testFile": "query.test.js",
+  "testCode": "const { getUserById } = require('./query');\nconst db = { query: (sql) => {\n  if (sql.includes('DROP')) throw new Error('SQL injection detected');\n  return [{ id: 1, name: 'alice' }];\n}};\ntry {\n  getUserById(db, '1 OR 1=1; DROP TABLE users');\n  throw new Error('Should have detected SQL injection');\n} catch (e) {\n  if (e.message.includes('SQL injection')) console.log('All tests passed');\n  else throw e;\n}",
+  "testCommand": "node query.test.js",
+  "fixPrompt": "Fix SQL injection vulnerability - use parameterized queries instead of string concatenation",
+  "goldenTruth": "buggy"
+}
