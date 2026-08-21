@@ -32,7 +32,8 @@ import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
 import { classifyCIFailureLog } from "../../../src/core/ci-log-classifier"
 import { createCIRepairSession, type CIRepairSession } from "../../../src/core/ci-repair-session"
 import { CIRepairQueue } from "../../../src/core/ci-repair-queue"
-import { redactSecrets } from "../../../src/core/secret-redactor"
+import { TournamentOrchestrator, type Tournament, type Hypothesis, type JudgeInput } from "../../../src/core/arena"
+import { codeGraph, type ImpactAnalysis } from "../../../src/core/code-graph"
 import { openProjection, type Projection } from "../../../src/core/session-projection"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
@@ -1280,7 +1281,174 @@ async function issueReceipt(sessionID: string, projectPath: string, delivery: { 
   }
 }
 
-async function drain(sessionID: string): Promise<void> {
+/** 锦标赛执行（Phase 2 v2）：多假设并行竞争 + Judge 裁决
+ *  触发条件：session.arena 或自动检测到高影响面代码变更 */
+async function executeTournament(request: Request): Promise<Response> {
+  const params = request.params
+  const parentSessionID = params?.sessionID?.trim()
+  const prompt = params?.prompt?.trim()
+  if (!parentSessionID || !prompt) return { id: request.id, type: "response", ok: false, error: "session.arena requires sessionID and prompt" }
+
+  const tournamentID = `arena-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
+  const orchestrator = new TournamentOrchestrator()
+
+  // 1. 生成假设（Phase 2 v1：模板，v2：调用规划模型）
+  const approaches = orchestrator.generateHypotheses(prompt, {})
+  const hypotheses: Hypothesis[] = []
+
+  // 2. 为每个假设分叉会话 + 创建 worktree
+  const worktreeService = new (await import("../../../src/core/git/worktree")).GitWorktreeService()
+  const projectPath = params?.projectPath ?? sessionRoot()
+
+  for (let i = 0; i < approaches.length; i++) {
+    const approach = approaches[i]
+    const hypothesisID = `${tournamentID}-h${i}`
+    const forkSessionID = `${parentSessionID}-fork-h${i}`
+
+    // 分叉会话
+    await eventStore.append(forkSessionID, "session_forked", {
+      sourceSessionID: parentSessionID,
+      baseSequence: (await eventStore.loadEvents(parentSessionID)).length,
+      reason: `锦标赛假设 ${i + 1}: ${approach}`
+    })
+
+    // 创建独立 worktree
+    const worktree = await worktreeService.create({
+      repository: projectPath,
+      storage: join(tmpdir(), "deepseek-arena-worktrees"),
+      taskTitle: hypothesisID,
+      baseRef: "HEAD"
+    })
+
+    hypotheses.push({
+      id: hypothesisID,
+      approach,
+      forkedSessionID: forkSessionID,
+      worktreePath: worktree.path,
+      branch: worktree.branch
+    })
+  }
+
+  // 3. 并行执行所有假设（每个在独立 worktree 中运行）
+  const results = await Promise.all(
+    hypotheses.map(async (h) => {
+      try {
+        // 在分叉会话中执行修复任务
+        const runResult = await executeRun({
+          id: `${tournamentID}-${h.id}`,
+          params: {
+            sessionID: h.forkedSessionID,
+            projectPath: h.worktreePath,
+            prompt,
+            baseURL: params?.baseURL,
+            apiKey: params?.apiKey,
+            model: params?.model,
+            protocol: params?.protocol,
+            mode: params?.mode
+          }
+        })
+
+        // 收集结果：diff、测试、交付状态
+        const events = await eventStore.loadEvents(h.forkedSessionID)
+        const testEvents = events.filter((e) => e.type === "terminal_completed" && /\b(test|spec)\b/i.test(String(e.payload?.command)))
+        const lastTest = testEvents[testEvents.length - 1]
+        const testExitCode = typeof lastTest?.payload?.exitCode === "number" ? lastTest.payload.exitCode : -1
+
+        const diffResult = await execFile("git", ["-C", h.worktreePath, "diff", "--stat", "HEAD"], { maxBuffer: 50_000 }).catch(() => ({ stdout: "" }))
+        const diffStat = diffResult.stdout.trim()
+
+        const patchResult = await execFile("git", ["-C", h.worktreePath, "diff", "HEAD"], { maxBuffer: 500_000 }).catch(() => ({ stdout: "" }))
+        const patchHash = createHash("sha256").update(patchResult.stdout).digest("hex").slice(0, 16)
+
+        const delivery = evaluateDeliveryGate(events)
+
+        return {
+          hypothesis: h,
+          result: {
+            patchHash,
+            testExitCode,
+            diffStat,
+            tokensUsed: events.filter((e) => e.type === "usage_recorded").reduce((sum, e) => sum + (typeof e.payload?.outputTokens === "number" ? e.payload.outputTokens : 0), 0),
+            deliveryState: delivery.state
+          },
+          diff: patchResult.stdout.slice(0, 10_000) // 裁判只看前 10k 字符
+        }
+      } catch (error) {
+        return {
+          hypothesis: h,
+          result: {
+            patchHash: "",
+            testExitCode: -1,
+            diffStat: "execution failed",
+            tokensUsed: 0,
+            deliveryState: "needsAttention"
+          },
+          diff: "",
+          error: error instanceof Error ? error.message : String(error)
+        }
+      }
+    })
+  )
+
+  // 4. 裁决
+  const judgeInput: JudgeInput = {
+    requirement: prompt,
+    hypotheses: results.map((r) => ({
+      id: r.hypothesis.id,
+      approach: r.hypothesis.approach,
+      diff: r.diff,
+      testExitCode: r.result.testExitCode,
+      diffStat: r.result.diffStat,
+      deliveryState: r.result.deliveryState
+    }))
+  }
+
+  const verdict = orchestrator.judge(judgeInput)
+
+  // 5. 记录负证据
+  const negativeEvidence = results
+    .filter((r) => r.hypothesis.id !== verdict.winner)
+    .map((r) => ({
+      hypothesisID: r.hypothesis.id,
+      approach: r.hypothesis.approach,
+      reason: r.error ?? (r.result.testExitCode !== 0 ? "测试失败" : "Diff 更大或交付状态更差")
+    }))
+
+  // 6. 清理失败假设的 worktree，保留胜者
+  for (const r of results) {
+    if (r.hypothesis.id !== verdict.winner && r.hypothesis.worktreePath && r.hypothesis.branch) {
+      await execFile("git", ["-C", projectPath, "worktree", "remove", "--force", r.hypothesis.worktreePath], { timeout: 10_000 }).catch(() => undefined)
+      await execFile("git", ["-C", projectPath, "branch", "-D", r.hypothesis.branch], { timeout: 10_000 }).catch(() => undefined)
+    }
+  }
+
+  const tournament: Tournament = {
+    tournamentID,
+    parentSessionID,
+    prompt,
+    hypotheses,
+    status: "merged",
+    winner: verdict.winner,
+    judgeReasoning: verdict.reasoning,
+    negativeEvidence,
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  }
+
+  return {
+    id: request.id,
+    type: "response",
+    ok: true,
+    result: {
+      tournamentID,
+      winner: verdict.winner,
+      reasoning: verdict.reasoning,
+      negativeEvidence,
+      hypothesesCount: hypotheses.length
+    }
+  }
+}
+
   if (activeSessions.has(sessionID)) return
   activeSessions.add(sessionID)
   let completedParentTurn = false
@@ -1428,8 +1596,9 @@ async function handle(request: Request): Promise<void> {
         "session.fork",
         "session.branches",
         "session.replay",
+        "session.arena",
       ],
-      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection"],
+      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection", "tournament"],
     }
     respond({ id: request.id, type: "response", ok: true, result: capabilities })
     return
@@ -1444,6 +1613,10 @@ async function handle(request: Request): Promise<void> {
   }
   if (request.method === "session.replay") {
     respond(await replaySession(request))
+    return
+  }
+  if (request.method === "session.arena") {
+    respond(await executeTournament(request))
     return
   }
   if (request.method === "session.recover") {
