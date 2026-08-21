@@ -90,6 +90,8 @@ type RuntimeEvent =
   | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
+  | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
+  | { type: "verifier_verdict"; workerID: string; state: "pass" | "refuted" | "inconclusive"; counterEvidence: string[]; summary: string }
   | { type: "ci_status"; commit: string; currentRunCount: number; staleRunCount: number; passed: boolean }
   | { type: "verification_passed"; kind: string; command: string }
   | { type: "delivery_evaluated"; state: string; reasons: string[] }
@@ -659,6 +661,60 @@ async function delegateWorker(sessionID: string, projectPath: string, input: Rec
   return result
 }
 
+/**
+ * Verifier Worker（NEXT_GEN_ARCHITECTURE Phase 1 支柱二）：
+ * 在独立 worktree 中对主 Agent 的交付声明进行对抗性验证。
+ *
+ * 与只读 Worker 的差异：
+ * - 允许运行测试命令（白名单：test/lint/build/typecheck 族）
+ * - 独立 Git worktree 物理隔离
+ * - 返回 pass/refuted/inconclusive + 反驳证据
+ */
+async function runVerifierWorker(sessionID: string, projectPath: string, claim: string): Promise<{ state: "pass" | "refuted" | "inconclusive"; counterEvidence: string[]; summary: string }> {
+  const workerID = `verifier-${crypto.randomUUID()}`
+  await emitSessionEvent(sessionID, { type: "verifier_started", workerID, claim })
+
+  try {
+    // Phase 1 v0：简化版 Verifier，只检查 git diff 和重跑已有测试命令
+    // 完整版需要：独立 worktree + 检查 diff 覆盖需求 + 寻找反例
+    const gitDiffResult = await execFile("git", ["-C", projectPath, "diff", "--stat"], { maxBuffer: 50_000 })
+    const diffStat = gitDiffResult.stdout.trim()
+
+    if (!diffStat) {
+      // 无 diff = 声称修改了但工作区干净，立即反驳
+      return { state: "refuted", counterEvidence: ["工作区无 Git Diff，声称的修改未落盘"], summary: "Verifier 反驳：无可验证补丁" }
+    }
+
+    // 查找最近一次成功的测试命令（从事件日志中提取）
+    const events = await eventStore.loadEvents(sessionID)
+    const testCommands = events
+      .filter((event) => event.type === "terminal_completed" && event.payload?.exitCode === 0 && /\b(test|lint|build|typecheck)\b/i.test(String(event.payload?.command)))
+      .map((event) => event.payload?.command as string)
+
+    if (testCommands.length === 0) {
+      // 无可重跑的测试 = 无法验证，但不算反驳
+      return { state: "inconclusive", counterEvidence: [], summary: `Verifier 无法裁决：工作区有 ${diffStat.split('\n').length - 1} 个文件变更，但无可重跑的测试命令` }
+    }
+
+    // 重跑最后一条测试命令（Phase 1 v0 简化：只跑一条，完整版应该跑全部相关测试）
+    const testCommand = testCommands[testCommands.length - 1]
+    const testResult = await execFile("sh", ["-c", testCommand], { cwd: projectPath, maxBuffer: 200_000, timeout: 60_000 }).catch((error) => error as { code: number; stdout: string; stderr: string })
+
+    if (typeof testResult === "object" && "code" in testResult && testResult.code !== 0) {
+      // 测试失败 = 反驳
+      const failureSnippet = (testResult.stderr || testResult.stdout || "").split('\n').slice(-10).join('\n').slice(0, 500)
+      return { state: "refuted", counterEvidence: [`测试命令 \`${testCommand}\` 失败（exit ${testResult.code}）`, failureSnippet], summary: `Verifier 反驳：声称的修复在测试下仍失败` }
+    }
+
+    // 测试通过 + 有 diff = pass
+    return { state: "pass", counterEvidence: [], summary: `Verifier 通过：工作区有 ${diffStat.split('\n').length - 1} 个文件变更，测试 \`${testCommand}\` 通过` }
+  } catch (error) {
+    // Verifier 自身出错 = inconclusive（不能因为 verifier 挂了就说主 Agent 错了）
+    return { state: "inconclusive", counterEvidence: [], summary: `Verifier 执行失败：${error instanceof Error ? error.message : String(error)}` }
+  }
+}
+
+
 async function githubCIStatus(sessionID: string, projectPath: string): Promise<unknown> {
   const commit = (await execFile("git", ["-C", projectPath, "rev-parse", "HEAD"], { maxBuffer: 10_000 })).stdout.trim()
   const result = await getGitHubCIStatus(projectPath, commit, async (args) => (await execFile("gh", args, { cwd: projectPath, maxBuffer: 200_000 })).stdout)
@@ -1043,6 +1099,25 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       reason: result.status === "waiting_approval" ? "awaiting_approval" : "completed",
       status: result.status
     })
+
+    // Phase 1：turn 完成后、gate 评估前运行 Verifier Worker（对抗验证）
+    // 触发条件：turn 成功完成 + 有 apply_patch 或 terminal_completed(exitCode=0) 事件
+    if (result.status === "completed") {
+      const events = await eventStore.loadEvents(sessionID)
+      const hasModification = events.some((event) => event.type === "tool_completed" && event.payload?.tool === "apply_patch")
+      const hasPassedTests = events.some((event) => event.type === "terminal_completed" && event.payload?.exitCode === 0)
+      if (hasModification || hasPassedTests) {
+        try {
+          const claim = result.text.slice(0, 500) // 主 Agent 的最终文本作为声明
+          const verdict = await runVerifierWorker(sessionID, projectPath, claim)
+          await emitSessionEvent(sessionID, { type: "verifier_verdict", workerID: `verifier-${sessionID}`, state: verdict.state, counterEvidence: verdict.counterEvidence, summary: verdict.summary })
+        } catch (error) {
+          // Verifier 失败不影响主流程，只记录 inconclusive
+          await emitSessionEvent(sessionID, { type: "verifier_verdict", workerID: `verifier-error`, state: "inconclusive", counterEvidence: [], summary: `Verifier 异常：${error instanceof Error ? error.message : String(error)}` })
+        }
+      }
+    }
+
     const delivery = evaluateDeliveryGate(await eventStore.loadEvents(sessionID))
     await emitSessionEvent(sessionID, { type: "delivery_evaluated", state: delivery.state, reasons: delivery.reasons })
     if (delivery.state === "delivered") await issueReceipt(sessionID, projectPath, delivery)

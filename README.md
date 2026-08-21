@@ -71,18 +71,19 @@ brew install --cask shidesheng0218/tap/deepseek-code
 
 ## 当前产品真源
 
-正式产品是 **DeepSeek Code.app**：由 **Tauri 2 + 本地 Agent Sidecar** 组成的轻量 macOS 桌面应用。`npm run dev`、构建脚本和 GitHub Release 都只启动或打包 DeepSeek Code，不要求最终用户安装 Node、Bun 或 Swift。
+正式产品只有 **DeepSeek Code.app**：一个由 **Tauri 2 + 本地 Agent Sidecar** 组成的 macOS 桌面应用。
 
-- `apps/deepseek-code-desktop`：Tauri 2 桌面壳、自有 React 界面、应用权限和 DMG 打包配置。
-- `apps/deepseek-agent-runtime`：随应用分发的本地 Agent Sidecar；负责会话、模型和工具协议，最终用户不需要安装 Bun。
-- `macos/DeepSeekCode`：旧 SwiftUI 版本和迁移参考；在 Tauri 版完成能力迁移前保留为开发回退。
-- `src/`：更早的 Electron/React 实现，仅保留作迁移与兼容参考。
+- `apps/deepseek-code-desktop` 是用户启动、开发和打包的桌面端：React UI、Rust IPC、Tauri 权限声明、应用资源与 DMG 配置都在这里。
+- `apps/deepseek-agent-runtime` 是随 App 分发的本地 sidecar：它串行处理 Session 输入，调用模型和工具，并把事件写入 JSONL 日志。
+- `src/core` 是 sidecar 的生产共享核心，包含 Agent 执行、权限、工具、会话投影、证据、Provider、MCP、SSH 与浏览器能力；它不是历史代码或备用运行时。
+- `bin/deepseek.mjs` 是连接同一 sidecar 和 Session 日志的轻量 CLI，不维护第二套 Agent Loop。
+
+对用户而言，安装包内已经包含运行时和浏览器验收所需资源；不需要自行安装 Node、Bun 或 Rust。Node、Rust 与 Chromium 只在本地开发、构建或发布时需要。
 
 ## 当前实现
 
 - Tauri 轻量工作区：Session、Conversation、Workspace 与 Runtime 状态。
 - Tauri 启动时恢复最近会话列表与已提交的用户/助手对话；工具中断不会伪装成完整回复。
-- SwiftUI 旧版仍保留完整的三栏工作区，作为能力迁移和旧数据验证参考。
 - 中文优先的 Session、计划、工具活动、Diff、Browser 和 Review 界面。
 - Plan / Manual / Accept Edits / Auto 四种权限模式。
 - 细粒度命令风险分类和审批决策。
@@ -115,7 +116,6 @@ brew install --cask shidesheng0218/tap/deepseek-code
 - 自动更新：Release 构建在存在签名密钥时产出 minisign 签名的 updater 包与 `latest.json`，App 内检查更新后下载安装、重启生效；密钥只保存在本地 `~/.tauri/` 或 CI Secrets，不进入仓库。
 - 基准评测：`npm run bench` 用内置 mock Provider 确定性地验证路由、工具约束与交付门禁；`npm run bench:real` 使用真实 BYOK Provider 跑同题语料，`benchmarks/score.mjs` 汇总成功率、审批次数与 Token 成本，用于与 Claude Code 同题对照。
 - 同模型对照基准台：`npm run bench:versus` 把同一批可验证任务交给 DeepSeek Code 与竞品 harness（Claude Code / Codex / OpenCode）同题同机运行，成功判定只看隔离工作区里的 verify 命令；语料、驱动器与指标口径见 [benchmarks/versus/README.md](benchmarks/versus/README.md)。
-- 旧版 `DeepSeekCodeCore` 仍是 Swift 迁移参考与兼容验证工具，不是 Tauri 用户下载版的运行时。
 
 ## 一次任务如何完成
 
@@ -156,21 +156,31 @@ Delivery Gate → delivered / handoffReady / needsRepair / needsAttention
 
 Tauri 版目前只有一个用户运行时：**Rust IPC Bridge → Bundled Agent Sidecar**。Sidecar 串行消费同一 Session 的输入，写入 JSONL 事件，并通过同一进程协议把流式回答、审批、工具、Worker、Browser 与 CI 事件回传给界面。
 
-`macos/DeepSeekCode` 中的 `deepseekd`、CLI、SQLite Projection 与 Runtime 3.0 架构仍保留为迁移参考和兼容测试；它们不能被描述为当前 Tauri 下载版的第二个真源。
-
 ## 本地开发
 
-默认开发入口启动新的 DeepSeek Code Tauri 轻量桌面版：
+开发环境与用户安装包不同：需要 macOS、Apple Silicon、Node 22、Rust stable，以及用于 Browser Evidence 打包的 Chromium。CI 使用相同的 Node 22 与 Rust stable 组合。
+
+首次准备依赖：
+
+```bash
+npm ci
+npm ci --prefix apps/deepseek-code-desktop
+npx playwright install chromium
+```
+
+根目录的依赖包含 Bun 编译器，构建 sidecar 时由脚本直接使用；无需另行全局安装 Bun。
+
+启动桌面开发环境：`npm run dev`。
 
 ```bash
 npm run dev
 ```
 
-`npm run dev:swift` 仍可启动旧 SwiftUI 版本，便于验证旧数据迁移；它不是默认产品入口。
+该命令会先编译 sidecar，再启动 Tauri 开发窗口。默认开发入口、构建入口和 Release 打包入口都指向这一套 Tauri 产品，仓库不维护第二个桌面运行时。
 
 ### Tauri Sidecar CLI（共享同一个会话日志）
 
-仓库提供一个轻量 CLI，不复制 Agent Loop，只连接当前 Bundled Sidecar：
+仓库提供一个轻量 CLI，不复制 Agent Loop，只连接当前 Bundled Sidecar。先用 `node bin/deepseek.mjs doctor` 检查 sidecar 是否可用：
 
 ```bash
 node bin/deepseek.mjs doctor
@@ -181,19 +191,19 @@ node bin/deepseek.mjs session attach <session-id>
 
 它通过 `DEEPSEEK_RUNTIME_BINARY` 指向打包后的 Sidecar，默认读取仓库中的 `apps/deepseek-agent-runtime/dist/deepseek-agent-runtime`；会话仍使用与桌面 App 相同的 JSONL Event Log。可用环境变量包括 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_PROJECT`、`DEEPSEEK_PROTOCOL` 和 `DEEPSEEK_SESSION_ROOT`。
 
-生成新的 Tauri macOS `.app` 和 DMG：
+生成本地 `.app` 与 DMG：`npm run build`。
 
 ```bash
 npm run build
 ```
 
-构建产物位于 `apps/deepseek-code-desktop/src-tauri/target/release/bundle/`。打包 GitHub Release 工件：
+构建产物位于 `apps/deepseek-code-desktop/src-tauri/target/release/bundle/`。要生成可上传的 Release 工件、校验和与元数据，运行 `npm run release:package`：
 
 ```bash
 npm run release:package
 ```
 
-它会生成 `dist/DeepSeek-Code-<version>-arm64.dmg`、`SHA256SUMS.txt`、`release-metadata.json`、签名的 updater 包和 `latest.json`。当前为 ad-hoc 社区构建；Developer ID 签名和公证将在发布硬化阶段接入 Tauri 产物。
+它会生成 `dist/DeepSeek-Code-<version>-arm64.dmg`、`SHA256SUMS.txt` 和 `release-metadata.json`。配置 `TAURI_SIGNING_PRIVATE_KEY`（CI Secret 或本机密钥文件）时，还会生成签名的 updater 包和 `latest.json`；没有该密钥时仍会生成 DMG，但不会发布自动更新清单。当前为 ad-hoc 社区构建；Developer ID 签名与公证仍在发布硬化范围内。
 
 GitHub Actions 在推送 `v*.*.*` 标签时自动执行测试、Tauri DMG 打包、updater 签名包生成和 GitHub Release 上传。`TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 只以 GitHub Secrets 保存，不要提交到仓库。Developer ID 签名与 Apple 公证是后续发布硬化的可选增强项。
 
@@ -267,30 +277,41 @@ flowchart LR
 
 ## 验证
 
-当前测试覆盖权限策略、使用量计费、Session 事件回放、JSONL 会话事件日志、DeepSeek/OpenAI-compatible SSE、工作区隔离、Agent 审批状态机、Git Worktree 和关键 UI 交互。
+当前测试覆盖权限策略、使用量计费、Session 事件回放、JSONL 会话事件日志、DeepSeek/OpenAI-compatible SSE、工作区隔离、Agent 审批状态机、Git Worktree 和 sidecar 关键链路。Browser Evidence 的 fixture 端到端测试单独通过 Playwright 运行。
 
-建议在改动 Runtime 前至少运行：
+修改 TypeScript/Rust 运行时前，至少运行：
 
 ```bash
-npx vitest run tests
-npm run test:sidecar
-npm run lint
+npm test
 npm run typecheck
+npm run lint
+npm run test:e2e
+cargo test --manifest-path apps/deepseek-code-desktop/src-tauri/Cargo.toml
+```
+
+改动产品入口、Tauri 配置或打包脚本时，再运行：
+
+```bash
+bash scripts/test-product-entrypoints.sh
+bash scripts/test-tauri-product.sh
+npm run build
+npm run release:verify
 ```
 
 ## 仓库结构
 
 ```text
 .
-├── macos/DeepSeekCode/
-│   ├── Sources/DeepSeekCodeApp/      # SwiftUI 迁移版
-│   ├── Sources/DeepSeekCodeCore/     # 迁移参考 Runtime、Provider、Pipeline
-│   ├── Sources/DeepSeekCodeDaemon/   # deepseekd
-│   ├── Sources/DeepSeekCodeCLI/      # deepseek CLI
-│   └── Tests/                        # Core、Runtime、Harness、Daemon、Worker、CLI
-├── scripts/                          # App、DMG 与 Release 验证脚本
-├── .github/workflows/macos.yml       # GitHub Release workflow
-└── src/                              # 历史 Electron / React 迁移参考（非正式运行时）
+├── apps/
+│   ├── deepseek-code-desktop/        # Tauri 2：React UI、Rust IPC、权限、资源与打包
+│   └── deepseek-agent-runtime/       # Bun 编译的本地 Agent sidecar 入口
+├── src/core/                         # sidecar 的生产共享核心
+├── bin/deepseek.mjs                  # 复用 sidecar 协议的 CLI
+├── tests/                            # Core、集成与 UI 策略测试
+├── e2e/                              # Playwright Browser Evidence fixture
+├── benchmarks/                       # 确定性 fixture 与同模型对照编排
+├── scripts/                          # sidecar、浏览器、DMG 与 Release 验证脚本
+└── .github/workflows/macos.yml       # macOS Release workflow
 ```
 
 ## 贡献与许可

@@ -33,6 +33,14 @@ assert.strictEqual(manifest.scripts["release:test"], undefined, "legacy release 
 assert.strictEqual(manifest.scripts["refresh:macos"], undefined, "legacy Swift install refresh entry must stay removed")
 assert.strictEqual(manifest.scripts["dev:cli"], undefined)
 assert(readme.includes("Tauri 2 + 本地 Agent Sidecar"))
+assert(readme.includes("`npm run dev`"), "README must document the default Tauri development entrypoint")
+assert(readme.includes("`npm run build`"), "README must document the default Tauri build entrypoint")
+assert(readme.includes("`npm run release:package`"), "README must document the release packaging entrypoint")
+assert(readme.includes("`node bin/deepseek.mjs doctor`"), "README must document the sidecar CLI health check")
+assert(!readme.includes("macos/DeepSeekCode"), "README must not describe the removed Swift runtime")
+assert(!readme.includes("DeepSeekCodeCore"), "README must not describe the removed Swift core")
+assert(!readme.includes("Electron / React"), "README must not describe a removed Electron runtime")
+assert(!readme.includes("dev:swift"), "README must not document a removed Swift command")
 NODE
 
 echo "DeepSeek Code product entrypoint checks passed"

@@ -2,8 +2,9 @@ import { readFile, readdir, realpath } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 
-export type WorkerType = 'explore' | 'review' | 'research' | 'ci';
+export type WorkerType = 'explore' | 'review' | 'research' | 'ci' | 'verify';
 
 export interface WorkerContract {
   workerID: string;
@@ -84,11 +85,16 @@ export async function runReadOnlyWorker(contract: WorkerContract): Promise<Worke
     if (contract.type === 'research') {
       const query = contract.query?.trim() ?? '';
       const matches = await findWorkspaceMatches(root, evidence, query);
-      return { workerID: contract.workerID, type: contract.type, state: 'completed', summary: `Research 在工作区中为“${query || '项目文档'}”找到 ${matches.length} 条只读证据：${matches.slice(0, 12).map((item) => item.path).join(', ') || '无匹配文件'}`, evidence: matches, warnings: ['Worker 未联网、未修改文件；外部研究由主 Session 的 Web 工具执行。'] };
+      return { workerID: contract.workerID, type: contract.type, state: 'completed', summary: `Research 在工作区中为”${query || '项目文档'}”找到 ${matches.length} 条只读证据：${matches.slice(0, 12).map((item) => item.path).join(', ') || '无匹配文件'}`, evidence: matches, warnings: ['Worker 未联网、未修改文件；外部研究由主 Session 的 Web 工具执行。'] };
     }
     if (contract.type === 'ci') {
       const ciEvidence = files.filter((item) => isCIConfiguration(item.path));
       return { workerID: contract.workerID, type: contract.type, state: 'completed', summary: `CI Worker 找到 ${ciEvidence.length} 个工作流或构建配置文件：${ciEvidence.slice(0, 12).map((item) => item.path).join(', ') || '无 CI 配置'}`, evidence: ciEvidence, warnings: ['Worker 未触发 CI、未修改文件；失败日志与 GitHub 状态由主 Session 工具读取。'] };
+    }
+    if (contract.type === 'verify') {
+      // Verifier Worker 不在这里实现——它需要独立 worktree + 允许运行测试命令，
+      // 与只读 Worker 的沙箱模型不兼容。Verifier 由 main.ts 的 runVerifierWorker() 直接调度。
+      return { workerID: contract.workerID, type: contract.type, state: 'failed', summary: 'verify worker must be invoked through runVerifierWorker(), not the read-only worker subprocess', evidence: [], warnings: [] };
     }
     return { workerID: contract.workerID, type: contract.type, state: 'completed', summary: `Explore 已找到 ${files.length} 个文件和 ${directories.length} 个目录：${files.slice(0, 12).map((item) => item.path).join(', ') || '空工作区'}`, evidence, warnings: [] };
   } catch (error) {

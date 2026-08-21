@@ -1,6 +1,12 @@
 export interface DeliveryEvent { type: string; payload?: Record<string, unknown> }
 export type DeliveryState = 'delivered' | 'handoffReady' | 'needsRepair' | 'needsAttention';
 
+/**
+ * 交付门禁 v2（NEXT_GEN_ARCHITECTURE Phase 1）。
+ *
+ * v2 新增规则：delivered 要求 verifier_verdict(state=pass) 且 receipt_issued。
+ * 旧会话（无 verifier_verdict 事件）按 v1 规则兼容评估。
+ */
 export function evaluateDeliveryGate(events: DeliveryEvent[]): { state: DeliveryState; reasons: string[] } {
   const resolved = new Set(events.filter((event) => event.type === 'approval_resolved' && typeof event.payload?.approvalID === 'string').map((event) => event.payload?.approvalID as string));
   const pending = events.filter((event) => event.type === 'approval_pending' && typeof event.payload?.approvalID === 'string' && !resolved.has(event.payload?.approvalID as string));
@@ -22,6 +28,23 @@ export function evaluateDeliveryGate(events: DeliveryEvent[]): { state: Delivery
   if (ciState === 'failed') return { state: 'needsRepair', reasons: ['当前 Commit 的 GitHub Actions 仍存在失败。'] };
   if (events.some((event) => event.type === 'terminal_completed' && event.payload?.exitCode !== 0)) return { state: 'needsRepair', reasons: ['存在失败的终端验证。'] };
   if (events.some((event) => event.type === 'tool_failed' || event.type === 'tool_completed' && event.payload?.ok === false)) return { state: 'needsRepair', reasons: ['存在失败的工具调用。'] };
+
+  // Gate v2：delivered 要求 verifier_verdict(pass) 且 receipt_issued（v1 兼容：无 verifier_verdict 时按旧规则）
+  const verifierVerdicts = events.filter((event) => event.type === 'verifier_verdict');
+  if (verifierVerdicts.length > 0) {
+    const latestVerdict = verifierVerdicts[verifierVerdicts.length - 1];
+    if (!latestVerdict) return { state: 'handoffReady', reasons: ['Verifier 裁决缺失。'] };
+    const verdictState = latestVerdict.payload?.state as string | undefined;
+    if (verdictState === 'refuted') return { state: 'needsRepair', reasons: ['Verifier 反驳了交付声明。'] };
+    if (verdictState === 'inconclusive') return { state: 'handoffReady', reasons: ['Verifier 无法给出明确裁决。'] };
+    if (verdictState === 'pass') {
+      const hasReceipt = events.some((event) => event.type === 'receipt_issued');
+      if (hasReceipt) return { state: 'delivered', reasons: [] };
+      return { state: 'handoffReady', reasons: ['Verifier 通过但回执尚未签发。'] };
+    }
+  }
+
+  // v1 兼容路径：无 verifier_verdict 时，verification_passed 足够
   if (events.some((event) => event.type === 'verification_passed')) return { state: 'delivered', reasons: [] };
   return { state: 'handoffReady', reasons: ['尚无明确验证通过证据。'] };
 }
