@@ -88,6 +88,7 @@ type RuntimeEvent =
   | { type: "turn_started"; prompt: string; projectPath?: string }
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
   | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string }
+  | { type: "model_stream_recorded"; turnSequence: number; model: string; deltas: Array<{ type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown>; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number }> }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
@@ -1044,9 +1045,20 @@ function createProviderClient(params: Pick<AgentRunParams, "baseURL" | "apiKey" 
 
 function streamModel(sessionID: string, client: StreamingProvider, model: string, messages: AgentMessage[], schemas: ToolSchema[]): AsyncIterable<Extract<ModelEvent, { type: "text_delta" | "tool_call" }>> {
   return (async function* () {
+    // Phase 1：录制所有模型事件用于确定性回放（NEXT_GEN_ARCHITECTURE 支柱一）
+    const recordedDeltas: Array<{ type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown>; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number }> = []
+    let turnSequence = 0 // TODO: 从事件日志获取当前 turn 序号
+
     for await (const event of client.stream({ model, messages, feature: "main_agent", tools: schemas })) {
-      if (event.type === "text_delta" || event.type === "tool_call") yield event
-      if (event.type === "usage") {
+      // 录制所有事件类型（text_delta/tool_call/usage/done）
+      if (event.type === "text_delta") {
+        recordedDeltas.push({ type: "text_delta", text: event.text })
+        yield event
+      } else if (event.type === "tool_call") {
+        recordedDeltas.push({ type: "tool_call", id: event.id, name: event.name, arguments: event.arguments })
+        yield event
+      } else if (event.type === "usage") {
+        recordedDeltas.push({ type: "usage", inputTokens: event.inputTokens, outputTokens: event.outputTokens, cachedInputTokens: event.cachedInputTokens })
         await emitSessionEvent(sessionID, {
           type: "usage_recorded",
           inputTokens: event.inputTokens,
@@ -1054,7 +1066,19 @@ function streamModel(sessionID: string, client: StreamingProvider, model: string
           outputTokens: event.outputTokens,
           model
         })
+      } else if (event.type === "done") {
+        recordedDeltas.push({ type: "done" })
       }
+    }
+
+    // turn 结束后写入 model_stream_recorded 事件（用于回放）
+    if (recordedDeltas.length > 0) {
+      await emitSessionEvent(sessionID, {
+        type: "model_stream_recorded",
+        turnSequence,
+        model,
+        deltas: recordedDeltas
+      })
     }
   })()
 }
