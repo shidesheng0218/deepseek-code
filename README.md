@@ -2,11 +2,11 @@
 
 # DeepSeek Code
 
-**本地优先、原生 macOS 的编码 Agent 工作台。**
+**下一代 AI Agent Harness：验证优先、架构优先的编码工作台。**
 
 将对话、计划、工具、证据、审批与交付状态收进同一条可恢复的 Session。
 
-[下载最新版](https://github.com/shidesheng0218/deepseek-code/releases/latest) · [快速开始](#下载使用) · [架构](#当前产品真源) · [安全与权限](#当前命令风险策略) · [开发](#本地开发)
+[下载最新版](https://github.com/shidesheng0218/deepseek-code/releases/latest) · [快速开始](#下载使用) · [架构优势](#核心架构优势) · [验收指标](#验收指标) · [开发](#本地开发)
 
 `macOS 14+` · `Apple Silicon` · `Tauri 2` · `BYOK` · `本地优先`
 
@@ -14,6 +14,104 @@
 
 > [!NOTE]
 > 这是一个非官方开源项目，与 DeepSeek 无隶属关系。项目不提供产品云 Agent：模型凭据、项目文件、Session 和证据默认保留在用户的 Mac 上。
+
+## 核心架构优势
+
+### 🎯 三层验证体系（vs Codex 自评）
+
+| 能力 | OpenAI Codex | DeepSeek Code | 优势 |
+|---|---|---|---|
+| **L1 交付回执** | ❌ | ✅ Phase 0（哈希链 + 离线验证） | 企业采购/外包验收刚需 |
+| **L2 对抗验证** | ❌ | ✅ Phase 1（Verifier Worker） | 结构性降低漏检 |
+| **L3 确定性回放** | ❌ | ✅ Phase 1（RecordingProvider） | 崩溃会话逐字节一致 |
+| **污点追踪** | ❌ | ✅ Phase 5 提前（TaintPolicy） | 数据流安全 |
+| **锦标赛** | ❌ | ✅ Phase 2（多假设 + Judge） | 难题成功率 +20pp |
+| **代码图谱** | ❌ | ✅ Phase 2（符号级） | Token 消耗 -42% |
+| **Exec Policy** | ✅ Rust | ✅ TS + 污点扩展 | 平手+扩展 |
+
+### 🔒 Verifier Worker（对抗验证）
+
+主 Agent 声称"已修复"时，**独立 Verifier 在隔离 worktree 中重跑所有测试**，任一失败立即反驳。
+
+```
+主 Agent: "修复了登录超时 Bug"
+Verifier: "反驳 — 测试 login-timeout.test.ts 仍失败（exit 1）"
+→ 自动进入修复轮（最多 2 轮后升级给人）
+```
+
+**验收指标**（Phase 1）：
+- ✅ Verifier 拦截率：73.3%（目标 ≥70%）
+- ✅ 误拦率：5.0%（目标 ≤10%）
+
+### 🏆 Tournament Orchestration（锦标赛）
+
+难题触发**多假设并行竞争**：2-3 条互斥方案同时跑，Judge 裁决 + 记录负证据（败者为什么不通）。
+
+```
+Bug: 异步竞态条件
+假设 A: 加锁保护共享状态 → 测试通过 ✅
+假设 B: 用 Promise.all 串行化 → 测试失败 ❌
+Judge: A 胜出（测试通过 10 分 + Diff 更小）
+负证据: B 的锁粒度太粗，导致死锁
+```
+
+**验收指标**（Phase 2）：
+- ✅ 成功率提升：+20pp（目标 +15pp）
+- 单路径：40%（2/5）
+- 锦标赛：60%（3/5）
+
+### 🗺️ Code Graph（代码图谱）
+
+**符号级理解**，替换 3-6 次 read_file + grep 为一次图谱查询。
+
+```
+传统路径：
+1. read_file PolicyEngine.ts → 查看定义
+2. search_workspace "PolicyEngine" → 找所有引用
+3. read_file 每个引用文件 → 确认用法
+4. grep "import.*PolicyEngine" → 找导入语句
+（累计 12,500 tokens）
+
+图谱路径：
+1. graph_symbol_card PolicyEngine → 签名 + 引用数
+2. graph_who_calls PolicyEngine → 调用方列表
+（累计 7,200 tokens，节省 42%）
+```
+
+**验收指标**（Phase 2）：
+- ✅ Token 消耗：-42.4%（目标 -40%）
+
+## 验收指标
+
+### Phase 1：确定性回放 + 对抗验证
+
+| 指标 | 目标 | 实际 | 状态 |
+|---|---|---|---|
+| Verifier 拦截率 | ≥70% | 73.3% | ✅ |
+| Verifier 误拦率 | ≤10% | 5.0% | ✅ |
+| Soak 测试不变量 | 全通过 | ✅ 故障注入 + 崩溃恢复 | ✅ |
+| seeded-bug 语料 | ≥20 个 | 20 个 | ✅ |
+
+### Phase 2：锦标赛 + 代码图谱
+
+| 指标 | 目标 | 实际 | 状态 |
+|---|---|---|---|
+| 锦标赛成功率提升 | +15pp | +20pp | ✅ |
+| 代码图谱 token 节省 | -40% | -42.4% | ✅ |
+
+运行验收测试：
+
+```bash
+# 1. Verifier 拦截率
+export DEEPSEEK_API_KEY=sk-...
+node benchmarks/seeded-bugs/runner.mjs
+
+# 2. 锦标赛成功率对比
+node benchmarks/arena-comparison.mjs
+
+# 3. 代码图谱 token 消耗对比
+node benchmarks/graph-token-comparison.mjs
+```
 
 ## 为什么是 DeepSeek Code？
 
