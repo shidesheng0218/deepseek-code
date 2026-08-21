@@ -36,6 +36,7 @@ import { TournamentOrchestrator, type Tournament, type Hypothesis, type JudgeInp
 import { codeGraph, type ImpactAnalysis } from "../../../src/core/code-graph"
 import { taintTracker } from "../../../src/core/taint-tracking"
 import { PolicyEngine, defaultPolicy } from "../../../src/core/exec-policy"
+import { shadowEvaluator, ShadowEvaluator } from "../../../src/core/shadow-eval"
 import { openProjection, type Projection } from "../../../src/core/session-projection"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
@@ -1559,6 +1560,50 @@ async function executeTournament(request: Request): Promise<Response> {
   }
 }
 
+/** Shadow Eval（Phase 4）：离线策略对比
+ *  用 RecordingProvider 重跑录制会话，对比不同策略的 token 消耗和成功率 */
+async function shadowEvalSession(request: Request): Promise<Response> {
+  const sessionID = request.params?.sessionID?.trim()
+  if (!sessionID) return { id: request.id, type: "response", ok: false, error: "session.shadowEval requires sessionID" }
+
+  const all = await eventStore.loadEvents(sessionID)
+  if (all.length === 0) return { id: request.id, type: "response", ok: false, error: `Session not found: ${sessionID}` }
+
+  // 提取录制的 turn
+  const recordedTurns = ShadowEvaluator.extractRecordedTurns(all)
+  if (recordedTurns.length === 0) {
+    return { id: request.id, type: "response", ok: false, error: "No recorded model streams found (session may predate Phase 1 recording)" }
+  }
+
+  // 使用预定义策略变体
+  const variants = request.params?.variants ?? ShadowEvaluator.commonVariants()
+
+  // 运行 Shadow Eval
+  const comparison = await shadowEvaluator.evaluate({
+    sessionID,
+    recordedTurns,
+    variants
+  })
+
+  return {
+    id: request.id,
+    type: "response",
+    ok: true,
+    sessionID,
+    result: {
+      winner: comparison.winner,
+      reasoning: comparison.reasoning,
+      variants: comparison.variants.map((v) => ({
+        name: v.variantName,
+        tokenUsage: v.tokenUsage.total,
+        toolCalls: v.toolCallCount,
+        success: v.success
+      }))
+    }
+  }
+}
+
+async function drain(sessionID: string): Promise<void> {
   if (activeSessions.has(sessionID)) return
   activeSessions.add(sessionID)
   let completedParentTurn = false
@@ -1707,8 +1752,9 @@ async function handle(request: Request): Promise<void> {
         "session.branches",
         "session.replay",
         "session.arena",
+        "session.shadowEval",
       ],
-      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection", "tournament"],
+      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection", "tournament", "shadow-eval"],
     }
     respond({ id: request.id, type: "response", ok: true, result: capabilities })
     return
@@ -1727,6 +1773,10 @@ async function handle(request: Request): Promise<void> {
   }
   if (request.method === "session.arena") {
     respond(await executeTournament(request))
+    return
+  }
+  if (request.method === "session.shadowEval") {
+    respond(await shadowEvalSession(request))
     return
   }
   if (request.method === "session.recover") {
