@@ -37,6 +37,7 @@ import { codeGraph, type ImpactAnalysis } from "../../../src/core/code-graph"
 import { taintTracker } from "../../../src/core/taint-tracking"
 import { PolicyEngine, defaultPolicy } from "../../../src/core/exec-policy"
 import { shadowEvaluator, ShadowEvaluator } from "../../../src/core/shadow-eval"
+import { sandboxService } from "../../../src/core/sandbox"
 import { openProjection, type Projection } from "../../../src/core/session-projection"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
@@ -94,6 +95,8 @@ type RuntimeEvent =
   | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string }
   | { type: "model_stream_recorded"; turnSequence: number; model: string; deltas: Array<{ type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown>; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number }> }
   | { type: "taint_detected"; toolName: string; taintedParams: Array<{ param: string; source: string; origin: string }>; riskLevel: string; decision: string }
+  | { type: "sandbox_executed"; command: string; exitCode: number; sandboxed: boolean; violations: Array<{ type: string; path?: string; host?: string; operation: string }> }
+  | { type: "sandbox_violation"; violations: Array<{ type: string; path?: string; host?: string; operation: string }>; command: string }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
@@ -682,6 +685,48 @@ async function runPersistentCommand(sessionID: string, projectPath: string, inpu
   return { ok: entry.exitCode === 0, sequence: entry.sequence, stdout: entry.stdout.slice(0, 50_000), stderr: entry.stderr.slice(0, 20_000), exitCode: entry.exitCode }
 }
 
+async function runSandboxedCommand(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
+  const command = typeof input.command === "string" ? input.command.trim() : ""
+  if (!command) throw new Error("run_sandboxed_command requires command")
+
+  const allowNetwork = typeof input.allowNetwork === "boolean" ? input.allowNetwork : false
+  const timeoutMs = typeof input.timeoutMs === "number" ? Math.min(Math.max(input.timeoutMs, 1_000), 600_000) : 120_000
+
+  // Phase 5: 沙箱执行
+  const result = await sandboxService.executeSandboxed(command, {
+    allowedPaths: [projectPath, tmpdir()],
+    allowNetwork,
+    timeoutMs
+  })
+
+  // 记录沙箱事件
+  await emitSessionEvent(sessionID, {
+    type: "sandbox_executed",
+    command,
+    exitCode: result.exitCode,
+    sandboxed: result.sandboxed,
+    violations: result.violations
+  })
+
+  // 如果有违规，记录到 taint tracker
+  if (result.violations.length > 0) {
+    await emitSessionEvent(sessionID, {
+      type: "sandbox_violation",
+      violations: result.violations,
+      command
+    })
+  }
+
+  return {
+    ok: result.ok,
+    exitCode: result.exitCode,
+    stdout: result.stdout.slice(0, 50_000),
+    stderr: result.stderr.slice(0, 20_000),
+    sandboxed: result.sandboxed,
+    violations: result.violations
+  }
+}
+
 async function graphSymbolCard(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
   const symbolName = typeof input.name === "string" ? input.name : undefined
   if (!symbolName) throw new Error("graph_symbol_card requires name parameter")
@@ -1242,6 +1287,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       apply_patch: tools.apply_patch,
       inspect_git: tools.inspect_git,
       run_command: (input) => runPersistentCommand(sessionID, projectPath, input),
+      run_sandboxed_command: (input) => runSandboxedCommand(sessionID, projectPath, input),
       web_search: webTools.web_search,
       web_fetch: webTools.web_fetch,
       delegate_worker: (input) => delegateWorker(sessionID, projectPath, input),
