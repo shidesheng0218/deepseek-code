@@ -7,7 +7,7 @@
  * 度量来源：
  *   approvals = approval_required 事件数；tokens = usage_recorded 事件求和。
  */
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { repoRoot, which } from './util.mjs';
@@ -15,24 +15,35 @@ import { repoRoot, which } from './util.mjs';
 const sidecarEntry = join(repoRoot, 'apps', 'deepseek-agent-runtime', 'src', 'main.ts');
 const bundledBun = join(repoRoot, 'node_modules', '@oven', 'bun-darwin-aarch64', 'bin', 'bun');
 
+/** 运行对象：默认从源码跑；VS_DEEPSEEK_BINARY 指向编译产物时用冻结二进制
+ * （长对照运行期间源码可继续开发，且测的就是随包分发的真实工件）。 */
+function resolveRuntime() {
+  const binary = process.env.VS_DEEPSEEK_BINARY;
+  if (binary && existsSync(binary)) return { command: binary, args: ['--stdio'] };
+  return null;
+}
+
 export default {
   name: 'deepseek',
 
   async detect(model) {
     if (!model?.baseURL || !model?.model || !model?.apiKeyEnv) return { ok: false, reason: 'versus.config.json 缺少 deepseek.baseURL/model/apiKeyEnv' };
     if (!process.env[model.apiKeyEnv]) return { ok: false, reason: `环境变量 ${model.apiKeyEnv} 未设置` };
+    if (resolveRuntime()) return { ok: true };
     const bun = await resolveBun();
     if (!bun) return { ok: false, reason: '找不到 bun（仓库内 @oven/bun-darwin-aarch64 或 PATH）' };
     return { ok: true };
   },
 
   async run({ task, workDir, model, env, timeoutMs, transcriptFile }) {
-    const bun = await resolveBun();
+    const frozen = resolveRuntime();
+    const command = frozen?.command ?? await resolveBun();
+    const args = frozen?.args ?? [sidecarEntry, '--stdio'];
     const sessionRoot = mkdtempSync(join(tmpdir(), 'deepseek-versus-sessions-'));
     const sessionID = `versus-${task.id}`;
     const frames = [];
     let responseFrame = null;
-    const child = await import('node:child_process').then(({ spawn }) => spawn(bun, [sidecarEntry, '--stdio'], {
+    const child = await import('node:child_process').then(({ spawn }) => spawn(command, args, {
       cwd: repoRoot,
       env: { ...(env ?? process.env), DEEPSEEK_SESSION_ROOT: sessionRoot },
       stdio: ['pipe', 'pipe', 'pipe']
@@ -99,9 +110,6 @@ export default {
 };
 
 async function resolveBun() {
-  try {
-    const { existsSync } = await import('node:fs');
-    if (existsSync(bundledBun)) return bundledBun;
-  } catch { /* fall through to PATH lookup */ }
+  if (existsSync(bundledBun)) return bundledBun;
   return which('bun') ? 'bun' : null;
 }

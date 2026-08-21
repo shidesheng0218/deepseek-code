@@ -28,11 +28,12 @@ const DRIVERS = { deepseek, 'claude-code': claudeCode, codex, opencode, echo };
 const resultsRoot = join(versusDir, '..', 'results', 'versus');
 
 function parseArgs(argv) {
-  const options = { harness: null, task: null, runs: 1, checkCorpus: false, selfTest: false, sign: false };
+  const options = { harness: null, task: null, runs: 1, checkCorpus: false, selfTest: false, sign: false, resume: null };
   for (const arg of argv) {
     if (arg.startsWith('--harness=')) options.harness = arg.slice('--harness='.length).split(',').filter(Boolean);
     else if (arg.startsWith('--task=')) options.task = arg.slice('--task='.length).split(',').filter(Boolean);
     else if (arg.startsWith('--runs=')) options.runs = Math.max(1, Number.parseInt(arg.slice('--runs='.length), 10) || 1);
+    else if (arg.startsWith('--resume=')) options.resume = arg.slice('--resume='.length);
     else if (arg === '--check-corpus') options.checkCorpus = true;
     else if (arg === '--self-test') options.selfTest = true;
     else if (arg === '--sign') options.sign = true;
@@ -43,7 +44,7 @@ function parseArgs(argv) {
 }
 
 function printUsage() {
-  console.log(`用法：node benchmarks/versus/run.mjs [--harness=a,b] [--task=id1,id2] [--runs=N] [--check-corpus] [--self-test] [--sign]`);
+  console.log(`用法：node benchmarks/versus/run.mjs [--harness=a,b] [--task=id1,id2] [--runs=N] [--resume=timestamp] [--check-corpus] [--self-test] [--sign]`);
 }
 
 function loadCorpus() {
@@ -93,6 +94,26 @@ async function checkCorpus(tasks) {
 
 async function runMatrix({ tasks, harnessNames, config, runs, runDir }) {
   ensureDir(join(runDir, 'transcripts'));
+
+  // Check existing transcripts to avoid reruns (only valid ones with content)
+  const existingTranscripts = new Set();
+  const transcriptsDir = join(runDir, 'transcripts');
+  if (existsSync(transcriptsDir)) {
+    const files = readdirSync(transcriptsDir);
+    for (const file of files) {
+      if (file.endsWith('.json')) {
+        try {
+          const content = JSON.parse(readFileSync(join(transcriptsDir, file), 'utf8'));
+          const isComplete = transcriptCompleted(content);
+          if (isComplete) {
+            existingTranscripts.add(file);
+          }
+        } catch {}
+      }
+    }
+    console.log(`○ 发现有效 transcript：${existingTranscripts.size} 个`);
+  }
+
   const results = [];
   for (const name of harnessNames) {
     const driver = DRIVERS[name];
@@ -109,6 +130,11 @@ async function runMatrix({ tasks, harnessNames, config, runs, runDir }) {
     const env = { ...process.env, ...resolved.env };
     for (const task of tasks) {
       for (let runIndex = 1; runIndex <= runs; runIndex += 1) {
+        const transcriptFile = `${name}-${task.id}-r${runIndex}.json`;
+        if (existingTranscripts.has(transcriptFile)) {
+          console.log(`⊙ ${name} · ${task.id} · run ${runIndex} — transcript 已存在，跳过`);
+          continue;
+        }
         const result = await runOne({ driver, name, task, runIndex, model, env, runDir });
         results.push(result);
         const mark = result.success ? '✓' : result.status === 'error' ? '✗' : '○';
@@ -120,6 +146,16 @@ async function runMatrix({ tasks, harnessNames, config, runs, runDir }) {
     }
   }
   return results;
+}
+
+function transcriptCompleted(content) {
+  if (content.events && content.events.length > 0) {
+    return content.events.some((e) => e.type === 'terminal_completed' || e.type === 'completed');
+  }
+  if (content.frames && content.frames.length > 0) {
+    return content.frames.some((f) => f.type === 'result' || f.subtype === 'success' || f.subtype === 'completed');
+  }
+  return false;
 }
 
 function baseResult(task, harness, runIndex, overrides) {
@@ -191,8 +227,14 @@ async function main() {
     : (options.harness ?? Object.keys(DRIVERS).filter((name) => name !== 'echo'));
   for (const name of harnessNames) if (!DRIVERS[name]) { console.error(`未知 harness：${name}`); process.exit(2); }
 
-  const runDir = join(resultsRoot, `${options.selfTest ? 'selftest-' : ''}${stamp()}`);
+  const runDir = options.resume
+    ? join(resultsRoot, options.resume)
+    : join(resultsRoot, `${options.selfTest ? 'selftest-' : ''}${stamp()}`);
   const runStamp = runDir.split('/').at(-1) ?? runDir;
+  if (options.resume && !existsSync(runDir)) {
+    console.error(`恢复目录不存在：${runDir}`);
+    process.exit(2);
+  }
   ensureDir(runDir);
   const results = await runMatrix({ tasks, harnessNames, config, runs: options.runs, runDir });
 
