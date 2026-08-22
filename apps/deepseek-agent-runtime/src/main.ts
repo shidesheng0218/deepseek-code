@@ -63,7 +63,7 @@ type ProviderProtocol = "openai-compatible" | "anthropic-messages"
 
 type Request = {
   id: string
-  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover" | "session.fork" | "session.branches" | "session.replay"
+  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover" | "session.fork" | "session.branches" | "session.replay" | "session.arena" | "session.shadowEval" | "terminal.open" | "terminal.exec"
   params?: Partial<AgentRunParams> & {
     text?: string
     approvalID?: string
@@ -72,6 +72,8 @@ type Request = {
     untilSequence?: number
     reason?: string
     newSessionID?: string
+    command?: string
+    variants?: unknown
   }
 }
 
@@ -625,6 +627,9 @@ async function lspBindings(sessionID: string, projectPath: string): Promise<MCPB
   return { schemas, handlers: { lsp_diagnostics: handler } }
 }
 
+// Shared by the agent's run_command tool and the human-facing terminal panel:
+// both attach to the same PersistentTerminal per sessionID, so `cd` / env state
+// set from either side is visible to the other (one session, one shell state).
 function terminalFor(sessionID: string, projectPath: string): PersistentTerminal {
   const existing = terminals.get(sessionID)
   if (existing && existing.projectPath === projectPath) return existing.terminal
@@ -632,6 +637,31 @@ function terminalFor(sessionID: string, projectPath: string): PersistentTerminal
   const terminal = new PersistentTerminal({ cwd: projectPath })
   terminals.set(sessionID, { projectPath, terminal })
   return terminal
+}
+
+/** terminal.open：确保该会话的持久化终端已启动，返回目前为止的转录（供面板重新打开时回填）。 */
+async function openInteractiveTerminal(request: Request): Promise<Response> {
+  const sessionID = request.params?.sessionID?.trim()
+  const projectPath = request.params?.projectPath?.trim()
+  if (!sessionID || !projectPath) return { id: request.id, type: "response", ok: false, error: "terminal.open requires sessionID and projectPath" }
+  const terminal = terminalFor(sessionID, projectPath)
+  return { id: request.id, type: "response", ok: true, sessionID, result: { opened: true, entries: terminal.read(0) } }
+}
+
+/** terminal.exec：在该会话的持久化终端里直接执行一条人工输入的命令。
+ *  复用 runPersistentCommand 的完整管线（污点检查、Exec Policy、事件落盘），
+ *  与 Agent 的 run_command 工具走同一条审计路径——终端里敲的命令同样进日志、同样受策略约束。 */
+async function execInteractiveTerminal(request: Request): Promise<Response> {
+  const sessionID = request.params?.sessionID?.trim()
+  const projectPath = request.params?.projectPath?.trim()
+  const command = request.params?.command?.trim()
+  if (!sessionID || !projectPath || !command) return { id: request.id, type: "response", ok: false, error: "terminal.exec requires sessionID, projectPath and command" }
+  try {
+    const result = await runPersistentCommand(sessionID, projectPath, { command })
+    return { id: request.id, type: "response", ok: true, sessionID, result }
+  } catch (error) {
+    return { id: request.id, type: "response", ok: false, sessionID, error: redact(error instanceof Error ? error.message : String(error)) }
+  }
 }
 
 async function runPersistentCommand(sessionID: string, projectPath: string, input: Record<string, unknown>): Promise<unknown> {
@@ -1843,8 +1873,10 @@ async function handle(request: Request): Promise<void> {
         "session.replay",
         "session.arena",
         "session.shadowEval",
+        "terminal.open",
+        "terminal.exec",
       ],
-      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection", "tournament", "shadow-eval"],
+      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection", "tournament", "shadow-eval", "interactive-terminal"],
     }
     respond({ id: request.id, type: "response", ok: true, result: capabilities })
     return
@@ -1859,6 +1891,14 @@ async function handle(request: Request): Promise<void> {
   }
   if (request.method === "session.replay") {
     respond(await replaySession(request))
+    return
+  }
+  if (request.method === "terminal.open") {
+    respond(await openInteractiveTerminal(request))
+    return
+  }
+  if (request.method === "terminal.exec") {
+    respond(await execInteractiveTerminal(request))
     return
   }
   if (request.method === "session.arena") {

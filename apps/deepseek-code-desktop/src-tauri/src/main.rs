@@ -59,12 +59,19 @@ struct UsageStats {
 #[serde(rename_all = "camelCase")]
 struct ModelTokens { model: String, tokens: u64 }
 
+// Deserialize keeps the frontend's plain-camelCase invoke() shape (sessionId, baseUrl, apiKey);
+// Serialize overrides to the acronym-capitalized keys (sessionID, baseURL, apiKey) that the
+// sidecar's Request["params"] type actually reads. Without the serialize-side override, serde's
+// rename_all = "camelCase" produces "sessionId"/"baseUrl", which the sidecar never matches —
+// every session.run/resolveApproval/recover call would fail immediately on a missing sessionID.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRequest {
+    #[serde(rename(serialize = "sessionID"))]
     session_id: String,
     project_path: String,
     prompt: String,
+    #[serde(rename(serialize = "baseURL"))]
     base_url: String,
     api_key: String,
     model: String,
@@ -77,13 +84,16 @@ struct AgentRequest {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApprovalRequest {
+    #[serde(rename(serialize = "sessionID"))]
     session_id: String,
     project_path: String,
+    #[serde(rename(serialize = "baseURL"))]
     base_url: String,
     api_key: String,
     model: String,
     protocol: String,
     mode: String,
+    #[serde(rename(serialize = "approvalID"))]
     approval_id: String,
     decision: String,
 }
@@ -92,11 +102,21 @@ struct ApprovalRequest {
 #[serde(rename_all = "camelCase")]
 struct CancelRequest { session_id: String }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOpenRequest { session_id: String, project_path: String }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalExecRequest { session_id: String, project_path: String, command: String }
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ResumeRequest {
+    #[serde(rename(serialize = "sessionID"))]
     session_id: String,
     project_path: String,
+    #[serde(rename(serialize = "baseURL"))]
     base_url: String,
     api_key: String,
     model: String,
@@ -458,6 +478,29 @@ fn resume_session(app: AppHandle, state: State<'_, RuntimeProcess>, request: Res
     send_runtime_request(&app, &state, payload)
 }
 
+// Unlike run_agent/resolve_approval (fire-and-forget: the frontend just waits for the next
+// "response" frame on the shared conversation stream), the terminal panel needs to know which
+// response belongs to which command — a user can run `ls` then `pwd` in quick succession.
+// So these two return the generated request id; the frontend filters runtime-event frames by
+// frame.id === that id instead of relying on "the next response frame" being the right one.
+#[tauri::command]
+fn open_terminal(app: AppHandle, state: State<'_, RuntimeProcess>, request: TerminalOpenRequest) -> Result<String, String> {
+    if request.session_id.trim().is_empty() || request.project_path.trim().is_empty() { return Err("sessionId 和 projectPath 不能为空".into()); }
+    let id = format!("{}-{}", request.session_id, uuid_like());
+    let payload = serde_json::json!({ "id": id, "method": "terminal.open", "params": { "sessionID": request.session_id, "projectPath": request.project_path } });
+    send_runtime_request(&app, &state, payload)?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn exec_terminal(app: AppHandle, state: State<'_, RuntimeProcess>, request: TerminalExecRequest) -> Result<String, String> {
+    if request.session_id.trim().is_empty() || request.project_path.trim().is_empty() || request.command.trim().is_empty() { return Err("sessionId、projectPath 和 command 不能为空".into()); }
+    let id = format!("{}-{}", request.session_id, uuid_like());
+    let payload = serde_json::json!({ "id": id, "method": "terminal.exec", "params": { "sessionID": request.session_id, "projectPath": request.project_path, "command": request.command } });
+    send_runtime_request(&app, &state, payload)?;
+    Ok(id)
+}
+
 fn send_runtime_request(app: &AppHandle, state: &RuntimeProcess, payload: serde_json::Value) -> Result<(), String> {
     ensure_runtime(app, state)?;
     let mut process = state.0.lock().map_err(|_| "runtime lock poisoned".to_string())?;
@@ -492,7 +535,8 @@ fn main() {
         .manage(RuntimeProcess(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, usage_stats, load_session_history, run_agent, resolve_approval, cancel_session, resume_session, check_for_update])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, usage_stats, load_session_history, run_agent, resolve_approval, cancel_session, resume_session, open_terminal, exec_terminal, check_for_update])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
 }
@@ -519,6 +563,52 @@ mod tests {
     #[test]
     fn exposes_a_non_empty_build_stamp() {
         assert!(build_stamp_value().contains('-'));
+    }
+
+    // Regression guard: the sidecar's Request["params"] type reads sessionID/baseURL/approvalID
+    // (capitalized acronyms). Plain #[serde(rename_all = "camelCase")] on session_id/base_url/
+    // approval_id would instead serialize as sessionId/baseUrl/approvalId, which the sidecar
+    // never matches — every session.run / resolveApproval call would silently fail with
+    // "sessionID and text are required" before reaching the model. This asserts the on-the-wire
+    // shape actually sent to the sidecar, not just that the struct round-trips.
+    #[test]
+    fn agent_request_serializes_acronym_fields_for_the_sidecar() {
+        let request = AgentRequest {
+            session_id: "session-1".into(),
+            project_path: "/tmp/project".into(),
+            prompt: "fix it".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "deepseek-chat".into(),
+            fast_model: String::new(),
+            protocol: "openai-compatible".into(),
+            mode: "auto".into(),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["sessionID"], "session-1");
+        assert_eq!(json["baseURL"], "https://api.deepseek.com/v1");
+        assert_eq!(json["projectPath"], "/tmp/project");
+        assert!(json.get("sessionId").is_none(), "must not emit the lowercase-d variant the sidecar ignores");
+        assert!(json.get("baseUrl").is_none(), "must not emit the lowercase-rl variant the sidecar ignores");
+    }
+
+    #[test]
+    fn approval_request_serializes_acronym_fields_for_the_sidecar() {
+        let request = ApprovalRequest {
+            session_id: "session-1".into(),
+            project_path: "/tmp/project".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "deepseek-chat".into(),
+            protocol: "openai-compatible".into(),
+            mode: "auto".into(),
+            approval_id: "approval-1".into(),
+            decision: "allow".into(),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["sessionID"], "session-1");
+        assert_eq!(json["baseURL"], "https://api.deepseek.com/v1");
+        assert_eq!(json["approvalID"], "approval-1");
     }
 
     #[test]

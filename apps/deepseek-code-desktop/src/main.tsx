@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
+import { open as openDialog } from "@tauri-apps/plugin-dialog"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client"
 import "./styles.css"
@@ -10,7 +11,8 @@ type Settings = { baseUrl: string; model: string; fastModel?: string; projectPat
 type SessionSummary = { sessionId: string; title: string; updatedAt: number; projectPath: string }
 type UsageStats = { sessions: number; messages: number; totalTokens: number; inputTokens: number; outputTokens: number; cachedTokens: number; activeDays: number; currentStreak: number; longestStreak: number; peakHour: number | null; favoriteModel: string | null; dailyActivity: number[]; dailyStart: string | null; modelTokens: { model: string; tokens: number }[] }
 type RestoredMessage = { role: "user" | "assistant"; text: string }
-type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; kind?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; inputID?: string; preview?: string; name?: string; names?: string[]; warnings?: string[]; receiptID?: string; receiptPath?: string; logHash?: string }; result?: { text?: string; status?: string }; error?: string }
+type TerminalEntry = { sequence: number; command: string; stdout: string; stderr: string; exitCode: number; completedAt?: string }
+type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; kind?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; inputID?: string; preview?: string; name?: string; names?: string[]; warnings?: string[]; receiptID?: string; receiptPath?: string; logHash?: string }; result?: { text?: string; status?: string; opened?: boolean; entries?: TerminalEntry[]; ok?: boolean; sequence?: number; stdout?: string; stderr?: string; exitCode?: number }; error?: string }
 type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
 type Approval = { id: string; tool: string; risk: string; preview?: string }
 type Usage = { input: number; output: number; cached: number }
@@ -153,6 +155,108 @@ function groupSessionsByProject(sessions: SessionSummary[]): { name: string; ses
 
 const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", fastModel: "", projectPath: "", apiKey: "", protocol: "openai-compatible" }
 
+/**
+ * 终端面板：与主对话共享同一个持久化 Shell（terminalFor(sessionID)），
+ * 所以在这里 cd 到某个目录后，Agent 用 run_command 执行的命令也会在那个目录下跑——
+ * 一个 Session、一份 Shell 状态。响应通过 sessionId-nanos 请求 id 在 runtime-event 流上
+ * 一次性过滤，而不是复用会话消息流的"下一条 response 就是它"逻辑（终端可能连续敲多条命令）。
+ */
+function TerminalPanel({ sessionID, projectPath, onRequireProject }: { sessionID: string; projectPath: string; onRequireProject: () => void }) {
+  const [entries, setEntries] = useState<TerminalEntry[]>([])
+  const [input, setInput] = useState("")
+  const [running, setRunning] = useState(false)
+  const [opened, setOpened] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const openedForRef = useRef<string | null>(null)
+
+  function waitForFrame(requestID: string, timeoutMs = 120_000): Promise<RuntimeFrame> {
+    return new Promise((resolve, reject) => {
+      let unlisten: (() => void) | undefined
+      const timer = setTimeout(() => { unlisten?.(); reject(new Error("终端命令超时")) }, timeoutMs)
+      void listen<RuntimeFrame>("runtime-event", (event) => {
+        if (event.payload.id !== requestID) return
+        clearTimeout(timer)
+        unlisten?.()
+        resolve(event.payload)
+      }).then((stop) => { unlisten = stop })
+    })
+  }
+
+  async function openTerminal() {
+    if (!projectPath.trim()) { onRequireProject(); return }
+    setError(null)
+    try {
+      const requestID = await invoke<string>("open_terminal", { request: { sessionId: sessionID, projectPath } })
+      const frame = await waitForFrame(requestID)
+      if (!frame.ok) { setError(frame.error ?? "终端启动失败"); return }
+      setEntries(frame.result?.entries ?? [])
+      setOpened(true)
+      openedForRef.current = sessionID
+    } catch (err) { setError(String(err)) }
+  }
+
+  useEffect(() => {
+    // Switching sessions attaches to that session's own persistent shell; re-open lazily
+    // on next command rather than eagerly spawning a shell for every session on load.
+    if (openedForRef.current !== sessionID) { setOpened(false); setEntries([]) }
+  }, [sessionID])
+
+  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }) }, [entries])
+
+  async function runCommand() {
+    const command = input.trim()
+    if (!command || running) return
+    if (!projectPath.trim()) { onRequireProject(); return }
+    setError(null)
+    setRunning(true)
+    setInput("")
+    try {
+      if (!opened) await openTerminal()
+      const requestID = await invoke<string>("exec_terminal", { request: { sessionId: sessionID, projectPath, command } })
+      const frame = await waitForFrame(requestID)
+      if (!frame.ok) { setError(frame.error ?? "命令执行失败"); return }
+      const result = frame.result
+      setEntries((current) => [...current, {
+        sequence: current.length ? current[current.length - 1].sequence + 1 : 1,
+        command,
+        stdout: result?.stdout ?? "",
+        stderr: result?.stderr ?? "",
+        exitCode: result?.exitCode ?? 0
+      }])
+    } catch (err) { setError(String(err)) }
+    finally { setRunning(false) }
+  }
+
+  return <section className="terminal-panel">
+    {!opened && <button type="button" className="terminal-connect" onClick={() => void openTerminal()}>连接终端 · {projectPath || "先在设置里选择项目目录"}</button>}
+    {opened && <>
+      <div className="terminal-output" ref={scrollRef}>
+        {entries.length === 0 && <p className="terminal-empty">终端已连接，工作目录 {projectPath}。输入命令并回车执行。</p>}
+        {entries.map((entry) => <div className="terminal-entry" key={entry.sequence}>
+          <div className="terminal-command"><span>$</span>{entry.command}</div>
+          {entry.stdout && <pre className="terminal-stdout">{entry.stdout}</pre>}
+          {entry.stderr && <pre className="terminal-stderr">{entry.stderr}</pre>}
+          {entry.exitCode !== 0 && <span className="terminal-exit">退出码 {entry.exitCode}</span>}
+        </div>)}
+      </div>
+      <div className="terminal-input-row">
+        <span className="terminal-prompt">$</span>
+        <input
+          className="terminal-input"
+          value={input}
+          disabled={running}
+          onChange={(event) => setInput(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void runCommand() } }}
+          placeholder={running ? "执行中…" : "输入命令，回车执行"}
+          autoFocus
+        />
+      </div>
+    </>}
+    {error && <p className="terminal-error">{error}</p>}
+  </section>
+}
+
 function newSessionID(): string { return `session-${Date.now()}` }
 
 function initialSessionID(): string {
@@ -175,6 +279,7 @@ function App() {
   const [currentRoute, setCurrentRoute] = useState<string>("")
   const [stats, setStats] = useState<UsageStats | null>(null)
   const [statsRange, setStatsRange] = useState<StatRangeKey>("all")
+  const [view, setView] = useState<"chat" | "terminal">("chat")
   const seenFrameIDs = useRef(new Set<string>())
 
   async function refreshSessions() {
@@ -196,6 +301,15 @@ function App() {
   function applyQuickAction(actionPrompt: string) {
     setPrompt(actionPrompt)
     document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus()
+  }
+
+  async function chooseProjectDirectory() {
+    // Native Finder picker beats hand-typing an absolute path; falls back to the
+    // existing manual input on cancel or on platforms where the dialog is unavailable.
+    try {
+      const selected = await openDialog({ directory: true, multiple: false, defaultPath: settings.projectPath || undefined })
+      if (typeof selected === "string" && selected.trim()) setSettings((current) => ({ ...current, projectPath: selected }))
+    } catch { /* User cancelled or dialog unavailable; manual input remains usable. */ }
   }
 
   async function openSession(nextSessionID: string) {
@@ -386,7 +500,7 @@ function App() {
     <aside className="sidebar" data-tauri-drag-region>
       <div className="brand"><span>◆</span><strong>DeepSeek Code</strong></div>
       <button className="new-session" type="button" onClick={beginNewSession}>＋ 新建任务</button>
-      <nav><button className="active" type="button">会话</button><button type="button" onClick={() => setShowSettings(true)}>设置</button><button type="button">终端</button><button type="button">用量</button></nav>
+      <nav><button className={view === "chat" ? "active" : ""} type="button" onClick={() => setView("chat")}>会话</button><button type="button" onClick={() => setShowSettings(true)}>设置</button><button className={view === "terminal" ? "active" : ""} type="button" onClick={() => setView("terminal")}>终端</button><button type="button">用量</button></nav>
       <div className="session-list" aria-label="已保存会话">{groupSessionsByProject(sessions.slice(0, 24)).map((group) => <div className="session-group" key={group.name}>
         <p className="session-group-name">{group.name}</p>
         {group.sessions.map((session) => <button key={session.sessionId} className={session.sessionId === sessionID ? "active-session" : ""} type="button" onClick={() => void openSession(session.sessionId)} title={session.title}>{session.title}</button>)}
@@ -397,20 +511,24 @@ function App() {
       <header data-tauri-drag-region><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{messages.length ? "正在协作解决问题" : "✦ 接下来做点什么？"}</h1></div><span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></header>
       {(usage.input > 0 || usage.output > 0 || currentRoute) && <div className="usage-bar">{currentRoute && <span className="route-chip">{currentRoute}</span>}<span>输入 {usage.input.toLocaleString()}{usage.cached > 0 ? `（缓存 ${usage.cached.toLocaleString()}）` : ""}</span><span>输出 {usage.output.toLocaleString()}</span><span>模型 {settings.model}{settings.fastModel ? ` · 快速 ${settings.fastModel}` : ""}</span></div>}
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
-      <section className={messages.length ? "conversation" : "conversation home"} aria-live="polite">
-        {!messages.length && <>
-          {(!settings.apiKey.trim() || !settings.projectPath.trim()) && <p className="setup-hint">先在<button type="button" className="setup-link" onClick={() => setShowSettings(true)}>设置</button>里配置项目目录和 API Key，然后直接描述任务。</p>}
-          <StatsPanel stats={stats} range={statsRange} onRangeChange={changeStatsRange} />
-          <div className="quick-actions">{QUICK_ACTIONS.map((action) => <button key={action.label} type="button" onClick={() => applyQuickAction(action.prompt)}><QuickIcon name={action.icon} />{action.label}</button>)}</div>
+      {view === "terminal"
+        ? <TerminalPanel sessionID={sessionID} projectPath={settings.projectPath} onRequireProject={() => setShowSettings(true)} />
+        : <>
+          <section className={messages.length ? "conversation" : "conversation home"} aria-live="polite">
+            {!messages.length && <>
+              {(!settings.apiKey.trim() || !settings.projectPath.trim()) && <p className="setup-hint">先在<button type="button" className="setup-link" onClick={() => setShowSettings(true)}>设置</button>里配置项目目录和 API Key，然后直接描述任务。</p>}
+              <StatsPanel stats={stats} range={statsRange} onRangeChange={changeStatsRange} />
+              <div className="quick-actions">{QUICK_ACTIONS.map((action) => <button key={action.label} type="button" onClick={() => applyQuickAction(action.prompt)}><QuickIcon name={action.icon} />{action.label}</button>)}</div>
+            </>}
+            {groupConversation(messages).map((item) => item.kind === "toolGroup"
+              ? <ToolActivityGroup key={item.key} activities={item.activities} />
+              : <article className={`message ${item.message.role} ${item.message.kind ?? ""}`} key={item.key}><span className="message-label">{item.message.role === "user" ? "你" : item.message.role === "tool" ? "Runtime" : item.message.role === "system" ? "系统" : "DeepSeek"}</span><div>{item.message.text}</div></article>)}
+            {approval && <section className="approval"><header><strong>需要确认</strong><span className={`risk-badge risk-${approval.risk.toLowerCase()}`}>{approval.risk}</span></header><span>{approval.tool} 将执行受控操作。</span>{approval.preview && <code className="approval-preview">{approval.preview}</code>}<div><button type="button" onClick={() => void resolveApproval("deny")}>取消</button><button className="allow" type="button" onClick={() => void resolveApproval("allow")}>允许一次</button></div></section>}
+            {busy && <div className="typing"><i /><i /><i /> 正在工作</div>}
+          </section>
+          <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行；Esc 停止 · 新消息会排队到安全边界" : "回车发送 · Shift+Enter 换行 · ⌘K 切换会话 · ⌘N 新任务"}</span>{busy && <button type="button" onClick={() => void cancel()}>停止</button>}<button type="button" disabled={!canRun} onClick={() => void submit()}>{submitActionLabel(busy)}</button></footer></section>
         </>}
-        {groupConversation(messages).map((item) => item.kind === "toolGroup"
-          ? <ToolActivityGroup key={item.key} activities={item.activities} />
-          : <article className={`message ${item.message.role} ${item.message.kind ?? ""}`} key={item.key}><span className="message-label">{item.message.role === "user" ? "你" : item.message.role === "tool" ? "Runtime" : item.message.role === "system" ? "系统" : "DeepSeek"}</span><div>{item.message.text}</div></article>)}
-        {approval && <section className="approval"><header><strong>需要确认</strong><span className={`risk-badge risk-${approval.risk.toLowerCase()}`}>{approval.risk}</span></header><span>{approval.tool} 将执行受控操作。</span>{approval.preview && <code className="approval-preview">{approval.preview}</code>}<div><button type="button" onClick={() => void resolveApproval("deny")}>取消</button><button className="allow" type="button" onClick={() => void resolveApproval("allow")}>允许一次</button></div></section>}
-        {busy && <div className="typing"><i /><i /><i /> 正在工作</div>}
-      </section>
-      <section className="composer"><textarea aria-label="任务描述" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit() } }} placeholder="例如：定位登录状态不同步的问题，修复后运行相关测试。" /><footer><span>{busy ? "Agent 正在执行；Esc 停止 · 新消息会排队到安全边界" : "回车发送 · Shift+Enter 换行 · ⌘K 切换会话 · ⌘N 新任务"}</span>{busy && <button type="button" onClick={() => void cancel()}>停止</button>}<button type="button" disabled={!canRun} onClick={() => void submit()}>{submitActionLabel(busy)}</button></footer></section>
-      {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /></label><label>协议<select value={settings.protocol} onChange={(event) => setSettings({ ...settings, protocol: event.target.value as Settings["protocol"] })}><option value="openai-compatible">OpenAI-compatible / DeepSeek</option><option value="anthropic-messages">Anthropic Messages</option></select></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>主模型（复杂任务/编码）<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>快速模型（简单问答/分类，可留空）<input value={settings.fastModel ?? ""} onChange={(event) => setSettings({ ...settings, fastModel: event.target.value })} placeholder="留空则全部使用主模型" /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
+      {showSettings && <div className="settings-backdrop" onClick={() => setShowSettings(false)}><section className="settings" onClick={(event) => event.stopPropagation()}><header><div><p>LOCAL CONFIGURATION</p><h2>连接与项目</h2></div><button type="button" onClick={() => setShowSettings(false)}>×</button></header><label>项目目录<div className="path-row"><input value={settings.projectPath} onChange={(event) => setSettings({ ...settings, projectPath: event.target.value })} placeholder="/Users/you/Projects/my-app" /><button type="button" className="browse" onClick={() => void chooseProjectDirectory()}>浏览…</button></div></label><label>协议<select value={settings.protocol} onChange={(event) => setSettings({ ...settings, protocol: event.target.value as Settings["protocol"] })}><option value="openai-compatible">OpenAI-compatible / DeepSeek</option><option value="anthropic-messages">Anthropic Messages</option></select></label><label>Base URL<input value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} /></label><label>主模型（复杂任务/编码）<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label><label>快速模型（简单问答/分类，可留空）<input value={settings.fastModel ?? ""} onChange={(event) => setSettings({ ...settings, fastModel: event.target.value })} placeholder="留空则全部使用主模型" /></label><label>API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="只写入 macOS Keychain" /></label><button className="save" type="button" onClick={() => { void invoke("save_settings", { settings }); setShowSettings(false) }}>保存配置</button></section></div>}
     </section>
   </main>
 }

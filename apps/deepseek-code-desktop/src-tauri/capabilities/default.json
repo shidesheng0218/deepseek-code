@@ -27,6 +27,7 @@
         "name": "binaries/deepseek-agent-runtime",
         "sidecar": true
       }]
-    }
+    },
+    "dialog:allow-open"
   ]
 }
