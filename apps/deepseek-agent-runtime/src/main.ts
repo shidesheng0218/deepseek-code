@@ -30,6 +30,7 @@ import { buildDeliveryReceipt } from "../../../src/core/delivery-receipt"
 import { collectBrowserEvidence } from "../../../src/core/browser-evidence"
 import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
 import { classifyCIFailureLog } from "../../../src/core/ci-log-classifier"
+import { redactSecrets } from "../../../src/core/secret-redactor"
 import { createCIRepairSession, type CIRepairSession } from "../../../src/core/ci-repair-session"
 import { CIRepairQueue } from "../../../src/core/ci-repair-queue"
 import { TournamentOrchestrator, type Tournament, type Hypothesis, type JudgeInput } from "../../../src/core/arena"
@@ -99,6 +100,7 @@ type RuntimeEvent =
   | { type: "taint_detected"; toolName: string; taintedParams: Array<{ param: string; source: string; origin: string }>; riskLevel: string; decision: string }
   | { type: "sandbox_executed"; command: string; exitCode: number; sandboxed: boolean; violations: Array<{ type: string; path?: string; host?: string; operation: string }> }
   | { type: "sandbox_violation"; violations: Array<{ type: string; path?: string; host?: string; operation: string }>; command: string }
+  | { type: "graph_index_completed"; symbolCount: number; files: number }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
@@ -468,6 +470,7 @@ async function recoverInterruptedSessions(): Promise<void> {
 }
 const activeControllers = new Map<string, AbortController>()
 const pendingCancels = new Set<string>()
+const indexedCodeGraphProjects = new Set<string>()
 const terminals = new Map<string, { projectPath: string; terminal: PersistentTerminal }>()
 const sshTerminals = new Map<string, SSHRemotePersistentTerminal>()
 type MCPClient = MCPStdioClient | MCPStreamableHTTPClient | MCPWebSocketClient
@@ -630,6 +633,32 @@ async function lspBindings(sessionID: string, projectPath: string): Promise<MCPB
 // Shared by the agent's run_command tool and the human-facing terminal panel:
 // both attach to the same PersistentTerminal per sessionID, so `cd` / env state
 // set from either side is visible to the other (one session, one shell state).
+/** 代码图谱首次索引：`indexWorkspace`/`updateFile` 之前写好了但从未被调用，
+ *  查图谱工具永远返回空结果。这里在每个项目首次 session.run 时后台建一次索引，
+ *  失败静默降级（图谱不可用时调用方本就会退化为全文搜索），绝不阻塞主流程。 */
+async function ensureCodeGraphIndexed(sessionID: string, projectPath: string): Promise<void> {
+  if (indexedCodeGraphProjects.has(projectPath)) return
+  indexedCodeGraphProjects.add(projectPath)
+  try {
+    const { symbolCount, files } = await codeGraph.indexWorkspace(projectPath)
+    await emitSessionEvent(sessionID, { type: "graph_index_completed", symbolCount, files })
+  } catch (error) {
+    indexedCodeGraphProjects.delete(projectPath)
+    process.stderr.write(`${redact(`code graph indexing skipped: ${error instanceof Error ? error.message : String(error)}`)}\n`)
+  }
+}
+
+/** apply_patch 成功后增量更新图谱：只重建被改动的文件，不必重新扫描全仓库。 */
+function wrapApplyPatchWithGraphUpdate(applyPatch: (input: Record<string, unknown>) => Promise<{ checkpointId: string; changedFiles: string[] }>, projectPath: string) {
+  return async (input: Record<string, unknown>) => {
+    const result = await applyPatch(input)
+    for (const relativePath of result.changedFiles) {
+      await codeGraph.updateFile(join(projectPath, relativePath), projectPath).catch(() => undefined)
+    }
+    return result
+  }
+}
+
 function terminalFor(sessionID: string, projectPath: string): PersistentTerminal {
   const existing = terminals.get(sessionID)
   if (existing && existing.projectPath === projectPath) return existing.terminal
@@ -1275,6 +1304,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
   const controller = new AbortController()
   activeControllers.set(sessionID, controller)
   if (pendingCancels.delete(sessionID)) controller.abort()
+  void ensureCodeGraphIndexed(sessionID, projectPath) // 后台索引，不阻塞本轮响应
   const client = createProviderClient(params, controller.signal)
   const tools = createWorkspaceAgentTools({ root: projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
@@ -1314,7 +1344,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       list_directory: tools.list_directory,
       search_workspace: tools.search_workspace,
       read_file: tools.read_file,
-      apply_patch: tools.apply_patch,
+      apply_patch: wrapApplyPatchWithGraphUpdate(tools.apply_patch, projectPath),
       inspect_git: tools.inspect_git,
       run_command: (input) => runPersistentCommand(sessionID, projectPath, input),
       run_sandboxed_command: (input) => runSandboxedCommand(sessionID, projectPath, input),
@@ -1422,7 +1452,7 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
     model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
     toolDefinitions: { ...pipelineDefinitions(schemas), ...runtimeContext.extensions.definitions },
     hooks: runtimeContext.pipelineHooks,
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: tools.apply_patch, inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), github_pr_context: () => githubPRContext(sessionID, params.projectPath!), github_pr_comment: (input) => githubPRComment(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers, ...runtimeContext.extensions.tools },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: wrapApplyPatchWithGraphUpdate(tools.apply_patch, params.projectPath!), inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), github_pr_context: () => githubPRContext(sessionID, params.projectPath!), github_pr_comment: (input) => githubPRComment(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers, ...runtimeContext.extensions.tools },
     onEvent: (event) => {
       void emitAgentEvent(sessionID, event)
       for (const listener of runtimeContext.extensions.listeners) {

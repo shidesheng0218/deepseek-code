@@ -5,45 +5,16 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client"
 import "./styles.css"
 import { canSubmitTask, shouldRenderFrame, submitActionLabel } from "./interaction-policy"
+import { groupConversation, groupSessionsByProject, type ConversationItem, type Message, type SessionSummary } from "./conversation-grouping"
 
 type RuntimeStatus = { ready: boolean; version: string; detail?: string }
 type Settings = { baseUrl: string; model: string; fastModel?: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
-type SessionSummary = { sessionId: string; title: string; updatedAt: number; projectPath: string }
 type UsageStats = { sessions: number; messages: number; totalTokens: number; inputTokens: number; outputTokens: number; cachedTokens: number; activeDays: number; currentStreak: number; longestStreak: number; peakHour: number | null; favoriteModel: string | null; dailyActivity: number[]; dailyStart: string | null; modelTokens: { model: string; tokens: number }[] }
 type RestoredMessage = { role: "user" | "assistant"; text: string }
 type TerminalEntry = { sequence: number; command: string; stdout: string; stderr: string; exitCode: number; completedAt?: string }
 type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; kind?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; inputID?: string; preview?: string; name?: string; names?: string[]; warnings?: string[]; receiptID?: string; receiptPath?: string; logHash?: string }; result?: { text?: string; status?: string; opened?: boolean; entries?: TerminalEntry[]; ok?: boolean; sequence?: number; stdout?: string; stderr?: string; exitCode?: number }; error?: string }
-type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
 type Approval = { id: string; tool: string; risk: string; preview?: string }
 type Usage = { input: number; output: number; cached: number }
-
-type ConversationItem = { key: string } & (
-  | { kind: "message"; message: Message }
-  | { kind: "toolGroup"; activities: Message[] }
-)
-
-const TOOL_ACTIVITY_KINDS = new Set(["tool_requested", "tool_started", "tool_completed", "terminal_completed", "ssh_terminal_opened", "ssh_terminal_completed", "ssh_terminal_closed", "ssh_completed"])
-
-/** 连续的工具活动合并为一个可折叠分组，时间线保持干净。 */
-function groupConversation(messages: Message[]): ConversationItem[] {
-  const items: ConversationItem[] = []
-  let group: Message[] = []
-  const flush = () => {
-    if (group.length > 0) {
-      items.push({ key: `group-${items.length}`, kind: "toolGroup", activities: group })
-      group = []
-    }
-  }
-  messages.forEach((message, index) => {
-    if (message.role === "tool" && TOOL_ACTIVITY_KINDS.has(message.kind ?? "")) group.push(message)
-    else {
-      flush()
-      items.push({ key: `msg-${index}`, kind: "message", message })
-    }
-  })
-  flush()
-  return items
-}
 
 function ToolActivityGroup({ activities }: { activities: Message[] }) {
   const failed = activities.filter((activity) => activity.kind === "tool_completed" && /失败|错误/.test(activity.text)).length
@@ -134,23 +105,6 @@ function StatsPanel({ stats, range, onRangeChange }: { stats: UsageStats | null;
       {stats.modelTokens.map((row) => <div className="model-row" key={row.model}><span className="model-name" title={row.model}>{row.model}</span><div className="model-bar"><i style={{ width: `${Math.max(2, (row.tokens / maxModelTokens) * 100)}%` }} /></div><span className="model-tokens">{formatTokens(row.tokens)}</span></div>)}
     </div>}
   </section>
-}
-
-function projectGroupName(projectPath: string): string {
-  if (!projectPath) return "未关联项目"
-  const parts = projectPath.split("/").filter(Boolean)
-  return parts.at(-1) ?? projectPath
-}
-
-function groupSessionsByProject(sessions: SessionSummary[]): { name: string; sessions: SessionSummary[] }[] {
-  const groups = new Map<string, SessionSummary[]>()
-  for (const session of sessions) {
-    const name = projectGroupName(session.projectPath)
-    const existing = groups.get(name) ?? []
-    existing.push(session)
-    groups.set(name, existing)
-  }
-  return [...groups.entries()].map(([name, grouped]) => ({ name, sessions: grouped }))
 }
 
 const defaults: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", fastModel: "", projectPath: "", apiKey: "", protocol: "openai-compatible" }

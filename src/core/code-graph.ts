@@ -215,12 +215,28 @@ export class CodeGraphService {
       }
     }
 
-    // 提取调用关系（简化版：只找 import 语句）
+    // 提取调用关系：粗粒度文件级边（"这个文件用到了这个导入符号"），不是逐函数
+    // 精确调用图（需要真正的 AST 才能做到），但比什么都没有强——之前这里是空循环，
+    // getCallers/analyzeImpact 永远拿不到任何边。
+    this.callGraph = this.callGraph.filter((edge) => edge.filePath !== filePath);
+    const importLineIndexes = new Set(lines.reduce<number[]>((acc, line, index) => (/^\s*import\b/.test(line) ? [...acc, index] : acc), []));
     const importPattern = /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
     let importMatch;
     while ((importMatch = importPattern.exec(content)) !== null) {
-      const symbols = importMatch[1]?.split(',').map((s) => s.trim()) ?? [];
-      // TODO: 构建 CallGraphEdge（需要跨文件解析）
+      const symbols = importMatch[1]?.split(',').map((s) => s.trim().split(/\s+as\s+/)[0]?.trim()).filter((s): s is string => Boolean(s)) ?? [];
+      for (const symbol of symbols) {
+        const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const wordPattern = new RegExp(`\\b${escaped}\\b`, 'g');
+        let usedElsewhere = false;
+        let firstUsageLine = -1;
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          if (!line || importLineIndexes.has(i)) continue;
+          if (wordPattern.test(line)) { usedElsewhere = true; firstUsageLine = i; break; }
+        }
+        // 只有真的在导入行以外被用到才记边，避免"导入了但没用到"被误标成调用关系。
+        if (usedElsewhere) this.callGraph.push({ from: filePath, to: symbol, filePath, line: firstUsageLine + 1 });
+      }
     }
   }
 

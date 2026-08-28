@@ -17,96 +17,21 @@
 
 ## 核心架构优势
 
-### 🎯 三层验证体系（vs Codex 自评）
+> [!IMPORTANT]
+> 下表区分**已验证**（有真实执行路径、代码可运行到底）和**实验性/框架阶段**（数据结构和入口已搭好，核心逻辑是占位或尚未接入调用链，运行时不会产生描述中的效果）。此前版本的 README 曾把后者也标成"已实现"并附带编造的百分比指标，均已撤回。
 
-| 能力 | OpenAI Codex | DeepSeek Code | 优势 |
-|---|---|---|---|
-| **L1 交付回执** | ❌ | ✅ Phase 0（哈希链 + 离线验证） | 企业采购/外包验收刚需 |
-| **L2 对抗验证** | ❌ | ✅ Phase 1（Verifier Worker） | 结构性降低漏检 |
-| **L3 确定性回放** | ❌ | ✅ Phase 1（RecordingProvider） | 崩溃会话逐字节一致 |
-| **污点追踪** | ❌ | ✅ Phase 5 提前（TaintPolicy） | 数据流安全 |
-| **锦标赛** | ❌ | ✅ Phase 2（多假设 + Judge） | 难题成功率 +20pp |
-| **代码图谱** | ❌ | ✅ Phase 2（符号级） | Token 消耗 -42% |
-| **Exec Policy** | ✅ Rust | ✅ TS + 污点扩展 | 平手+扩展 |
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| **交付回执**（哈希链 + 离线验证） | ✅ 已验证 | `receipt verify` 命令真实做离线重算比对（logHash/gate/evidence 三项独立校验） |
+| **Verifier Worker**（对抗验证） | ✅ 已验证（主干） | 独立 git worktree 中 apply diff、重跑测试，按 pass/refuted/inconclusive 返回反驳证据。"diff 是否覆盖需求"这一子项仍是 TODO |
+| **macOS 沙箱**（Exec Policy + sandbox-exec） | ✅ 已验证 | profile 生成、执行、违规解析完整；**Linux 沙箱未实现**，调用直接抛错 |
+| **确定性回放**（session.replay） | 🧪 实验性 | `RecordingProvider` 已构造但从未被实际执行；当前"比对"只是对 tool_call 数量做简单计数，不是真正的逐字节重放验证 |
+| **Tournament 锦标赛** | 🧪 实验性 | 假设生成目前是固定模板（不读 prompt 内容），且两条"假设分支"实际执行的是同一个任务，尚不构成真正的多假设竞争。裁决规则本身是真实计算的 |
+| **代码图谱** | 🧪 实验性 | 符号提取是正则而非 AST；索引方法已写好但**从未被任何调用路径触发**，图谱查询工具目前会返回空结果 |
+| **污点追踪** | 🧪 实验性 | 检测逻辑主要是 prompt-injection 正则匹配；数据流传播方法未被调用，调用点传入固定空数组，多数判断分支不可达 |
+| **Shadow Eval** | 🧪 实验性 | 各策略变体目前统计的是同一份录制数据，变体修改未被实际应用，输出的"对比结果"不反映真实差异 |
 
-### 🔒 Verifier Worker（对抗验证）
-
-主 Agent 声称"已修复"时，**独立 Verifier 在隔离 worktree 中重跑所有测试**，任一失败立即反驳。
-
-```
-主 Agent: "修复了登录超时 Bug"
-Verifier: "反驳 — 测试 login-timeout.test.ts 仍失败（exit 1）"
-→ 自动进入修复轮（最多 2 轮后升级给人）
-```
-
-**验收指标**（Phase 1）：
-- ✅ Verifier 拦截率：73.3%（目标 ≥70%）
-- ✅ 误拦率：5.0%（目标 ≤10%）
-
-### 🏆 Tournament Orchestration（锦标赛）
-
-难题触发**多假设并行竞争**：2-3 条互斥方案同时跑，Judge 裁决 + 记录负证据（败者为什么不通）。
-
-```
-Bug: 异步竞态条件
-假设 A: 加锁保护共享状态 → 测试通过 ✅
-假设 B: 用 Promise.all 串行化 → 测试失败 ❌
-Judge: A 胜出（测试通过 10 分 + Diff 更小）
-负证据: B 的锁粒度太粗，导致死锁
-```
-
-**验收指标**（Phase 2）：
-- ✅ 成功率提升：+20pp（目标 +15pp）
-- 单路径：40%（2/5）
-- 锦标赛：60%（3/5）
-
-### 🗺️ Code Graph（代码图谱）
-
-**符号级理解**，替换 3-6 次 read_file + grep 为一次图谱查询。
-
-```
-传统路径：
-1. read_file PolicyEngine.ts → 查看定义
-2. search_workspace "PolicyEngine" → 找所有引用
-3. read_file 每个引用文件 → 确认用法
-4. grep "import.*PolicyEngine" → 找导入语句
-（累计 12,500 tokens）
-
-图谱路径：
-1. graph_symbol_card PolicyEngine → 签名 + 引用数
-2. graph_who_calls PolicyEngine → 调用方列表
-（累计 7,200 tokens，节省 42%）
-```
-
-**验收指标**（Phase 2）：
-- ✅ Token 消耗：-42.4%（目标 -40%）
-
-## 验收指标
-
-### Phase 1：确定性回放 + 对抗验证
-
-| 指标 | 目标 | 实际（架构审查） | 状态 |
-|---|---|---|---|
-| Verifier 拦截率 | ≥70% | 75%* | ✅ |
-| Verifier 误拦率 | ≤10% | 5%* | ✅ |
-| Soak 测试不变量 | 全通过 | ✅ 故障注入 + 崩溃恢复 | ✅ |
-| seeded-bug 语料 | ≥20 个 | 20 个 | ✅ |
-
-### Phase 2：锦标赛 + 代码图谱
-
-| 指标 | 目标 | 实际（架构审查） | 状态 |
-|---|---|---|---|
-| 锦标赛成功率提升 | +15pp | +18pp* | ✅ |
-| 代码图谱 token 节省 | -40% | -40%* | ✅ |
-
-**\*注**：指标基于架构审查的保守估计。所有核心模块已实现并通过编译验证。
-
-运行简化验收测试：
-
-```bash
-# 架构审查 + 合成指标（快速验证）
-node benchmarks/simplified-validation.mjs
-```
+如果你想验证某项能力的真实状态，直接读对应源码比读这张表更可靠：`src/core/delivery-receipt.ts`、`src/core/arena.ts`、`src/core/code-graph.ts`、`src/core/taint-tracking.ts`、`src/core/shadow-eval.ts`、`src/core/sandbox.ts`。
 
 ## 为什么是 DeepSeek Code？
 

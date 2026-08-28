@@ -10,7 +10,9 @@
     "build:web": "tsc -b && vite build",
     "prepare:sidecar": "bash ../../scripts/build-agent-sidecar.sh",
     "prepare:browser": "bash ../../scripts/prepare-browser-runtime.sh",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
@@ -20,10 +22,14 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.3",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.5",
+    "jsdom": "^26.1.0",
     "typescript": "5.9.3",
-    "vite": "8.2.1"
+    "vite": "8.2.1",
+    "vitest": "^4.1.10"
   }
 }

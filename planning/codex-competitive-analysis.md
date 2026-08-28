@@ -81,12 +81,14 @@
 | 维度 | Codex | DeepSeek Code | 胜负 |
 |---|---|---|---|
 | **审批机制** | `approval_pending / approval_resolved`：有 | `approval_pending / approval_resolved`：有 | 平手 |
-| **Exec Policy** | `execpolicy` crate：声明式策略 + 前缀规则 + 网络规则 | `.deepseek/policy.json`：**Phase 5 计划**，声明式 + 污点追踪 | Codex 赢（已实现） |
-| **沙箱** | `sandboxing/linux-sandbox/bwrap`：强隔离 | 无原生沙箱（依赖 macOS 权限 + 审批） | Codex 赢 |
-| **污点追踪** | **缺失**：无不可信数据流标签 | **Phase 5 计划**：`TaintLabel` + 数据流策略引擎 | **我们赢**（计划中） |
-| **Prompt Injection 防御** | 未见显式防御（可能在云端过滤） | **Phase 5 计划**：启发式扫描 + 污点升级 | **我们赢**（计划中） |
+| **Exec Policy** | `execpolicy` crate：声明式策略 + 前缀规则 + 网络规则 | `src/core/exec-policy.ts`：已实现，规则完整 | Codex 略优（Rust vs TS，功能相当） |
+| **沙箱** | `sandboxing/linux-sandbox/bwrap`：强隔离 | macOS `sandbox-exec` 已实现；Linux 未实现（直接抛错） | Codex 赢（跨平台） |
+| **污点追踪** | **缺失**：无不可信数据流标签 | **实验性**：`TaintLabel` 结构已建，但传播方法未被调用、调用点传入固定空数组，实际只剩 prompt-injection 正则这一条检测路径生效 | 我们领先方向，但兑现程度低 |
+| **Prompt Injection 防御** | 未见显式防御（可能在云端过滤） | 正则匹配常见注入短语，非结构化数据流分析 | 我们有雏形，非完整方案 |
 
-**判断**：Codex 的 exec policy 和沙箱已经很成熟，我们的污点追踪是更深的防线（Codex 没做）。
+**判断**：Codex 的 exec policy 和沙箱已经很成熟。我们规划的污点追踪方向仍是差异化优势，但截至目前的实现只是雏形——不要把这个表当作"我们已经做到了"的证据，具体差距见 `docs/INTEGRATION_STATUS.md`。
+
+> **2026-08-22 更新**：本文档写于 Phase 5 落地之前，"计划中"标注已过时。上表已替换为对当前代码的实测结论。
 
 ---
 
