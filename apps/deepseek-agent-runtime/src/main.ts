@@ -39,6 +39,7 @@ import { taintTracker } from "../../../src/core/taint-tracking"
 import { PolicyEngine, defaultPolicy } from "../../../src/core/exec-policy"
 import { shadowEvaluator, ShadowEvaluator } from "../../../src/core/shadow-eval"
 import { sandboxService } from "../../../src/core/sandbox"
+import { sessionCleaner, type DisposableResource, type SessionResourceRegistry } from "../../../src/core/memory-monitor"
 import { openProjection, type Projection } from "../../../src/core/session-projection"
 import { pathToFileURL } from "node:url"
 import type { AgentMode } from "../../../src/core/permissions"
@@ -101,6 +102,7 @@ type RuntimeEvent =
   | { type: "sandbox_executed"; command: string; exitCode: number; sandboxed: boolean; violations: Array<{ type: string; path?: string; host?: string; operation: string }> }
   | { type: "sandbox_violation"; violations: Array<{ type: string; path?: string; host?: string; operation: string }>; command: string }
   | { type: "graph_index_completed"; symbolCount: number; files: number }
+  | { type: "tournament_hypotheses_degraded"; tournamentID: string; reason: string }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
@@ -477,6 +479,29 @@ type MCPClient = MCPStdioClient | MCPStreamableHTTPClient | MCPWebSocketClient
 const mcpClients = new Map<string, MCPClient>()
 const lspClients = new Map<string, LanguageServerClient>()
 const deferredCIRepairs = new CIRepairQueue<RepairRuntimeConfig>()
+
+/** 把一个 Map<string, T> 适配成 SessionDataCleaner 认得的资源表；
+ *  toResource 负责从 map 存的值里取出真正会 close() 的那个对象
+ *  （terminals 存的是 { projectPath, terminal }，不是终端本身）。 */
+function asResourceRegistry<T>(map: Map<string, T>, toResource: (value: T) => DisposableResource): SessionResourceRegistry {
+  return {
+    entries: () => {
+      const adapted: Array<[string, DisposableResource]> = []
+      for (const [sessionID, value] of map.entries()) adapted.push([sessionID, toResource(value)])
+      return adapted[Symbol.iterator]()
+    },
+    delete: (sessionID: string) => map.delete(sessionID)
+  }
+}
+
+// 一个会话被视为空闲：没有正在跑的 turn（不在 activeSessions）且没有排队的输入——
+// 复用 handle() 里 session.cancel 分支已经用过的同一条判定（第 1993 行附近），
+// 不重新发明"什么时候算空闲"。
+sessionCleaner.setIdleCheck((sessionID) => !activeSessions.has(sessionID) && (queues.get(sessionID)?.length ?? 0) === 0)
+sessionCleaner.registerResource("terminal", asResourceRegistry(terminals, (v) => v.terminal))
+sessionCleaner.registerResource("ssh-terminal", asResourceRegistry(sshTerminals, (v) => v))
+sessionCleaner.registerResource("mcp-client", asResourceRegistry(mcpClients, (v) => v))
+sessionCleaner.registerResource("lsp-client", asResourceRegistry(lspClients, (v) => v))
 
 async function mcpBindings(sessionID: string, projectPath: string): Promise<MCPBinding> {
   const schemas: ToolSchema[] = []
@@ -1509,8 +1534,21 @@ async function executeTournament(request: Request): Promise<Response> {
   const tournamentID = `arena-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
   const orchestrator = new TournamentOrchestrator()
 
-  // 1. 生成假设（Phase 2 v1：模板，v2：调用规划模型）
-  const approaches = orchestrator.generateHypotheses(prompt, {})
+  // 1. 生成假设：真的调用一次规划模型（feature: "plan"），不是固定模板。
+  //    没有 baseURL/apiKey/model 时（理论上不会发生，session.arena 复用同一套凭据）
+  //    直接不传 callModel，走 generateHypotheses 自己的降级路径。
+  const callModel = (params?.baseURL && params?.apiKey && params?.model)
+    ? async (planningPrompt: string): Promise<string> => {
+        const client = createProviderClient(params!)
+        let text = ""
+        for await (const event of client.stream({ model: params!.model!, messages: [{ role: "user", content: planningPrompt }], feature: "plan", tools: [] })) {
+          if (event.type === "text_delta") text += event.text
+        }
+        return text
+      }
+    : undefined
+  const { approaches, degraded } = await orchestrator.generateHypotheses(prompt, {}, callModel)
+  if (degraded) await emitSessionEvent(parentSessionID, { type: "tournament_hypotheses_degraded", tournamentID, reason: callModel ? "规划模型调用失败或输出格式不符" : "缺少模型凭据" })
   const hypotheses: Hypothesis[] = []
 
   // 2. 为每个假设分叉会话 + 创建 worktree
@@ -1550,13 +1588,15 @@ async function executeTournament(request: Request): Promise<Response> {
   const results = await Promise.all(
     hypotheses.map(async (h) => {
       try {
-        // 在分叉会话中执行修复任务
+        // 在分叉会话中执行修复任务。必须把这条假设的 approach 并入 prompt——
+        // 否则每个分支都在跑完全相同的任务，锦标赛就只是把同一次修复跑了 N 遍，
+        // 不构成真正的互斥假设竞争。
         const runResult = await executeRun({
           id: `${tournamentID}-${h.id}`,
           params: {
             sessionID: h.forkedSessionID,
             projectPath: h.worktreePath,
-            prompt,
+            prompt: `${prompt}\n\n请按以下方向解决：${h.approach}`,
             baseURL: params?.baseURL,
             apiKey: params?.apiKey,
             model: params?.model,
@@ -1666,8 +1706,10 @@ async function executeTournament(request: Request): Promise<Response> {
   }
 }
 
-/** Shadow Eval（Phase 4）：离线策略对比
- *  用 RecordingProvider 重跑录制会话，对比不同策略的 token 消耗和成功率 */
+/** Shadow Eval（Phase 4）：离线策略对比。
+ *  只有 contextWindowSize 类变体在纯回放下能产生真实差异（重跑 buildContext 裁剪逻辑，
+ *  用的是这个会话真实的对话历史，不是编造数字）；instructionTemplate/toolOrder/modelTier
+ *  这三类需要真实模型调用才能验证，会在结果里标 evaluable:false 并说明原因，不冒充测过。 */
 async function shadowEvalSession(request: Request): Promise<Response> {
   const sessionID = request.params?.sessionID?.trim()
   if (!sessionID) return { id: request.id, type: "response", ok: false, error: "session.shadowEval requires sessionID" }
@@ -1684,11 +1726,15 @@ async function shadowEvalSession(request: Request): Promise<Response> {
   // 使用预定义策略变体
   const variants = request.params?.variants ?? ShadowEvaluator.commonVariants()
 
+  // 重建该会话真实的对话历史，供 contextWindowSize 变体重跑真实裁剪逻辑
+  const conversation = await eventStore.loadConversation(sessionID)
+
   // 运行 Shadow Eval
   const comparison = await shadowEvaluator.evaluate({
     sessionID,
     recordedTurns,
-    variants
+    variants,
+    conversation
   })
 
   return {
@@ -1701,9 +1747,11 @@ async function shadowEvalSession(request: Request): Promise<Response> {
       reasoning: comparison.reasoning,
       variants: comparison.variants.map((v) => ({
         name: v.variantName,
+        evaluable: v.evaluable,
+        ...(v.inapplicableReason ? { inapplicableReason: v.inapplicableReason } : {}),
         tokenUsage: v.tokenUsage.total,
         toolCalls: v.toolCallCount,
-        success: v.success
+        contextChars: v.contextChars
       }))
     }
   }
@@ -2018,6 +2066,7 @@ if (process.argv.includes("--terminal-daemon")) {
 
   await initProjection()
   await recoverInterruptedSessions()
+  sessionCleaner.start()
 
   let buffer = ""
   process.stdin.setEncoding("utf8")

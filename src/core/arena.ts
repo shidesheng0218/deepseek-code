@@ -95,17 +95,42 @@ export class TournamentOrchestrator {
   }
 
   /**
-   * 生成互斥假设（2-3 条）
-   * Phase 2 v1：占位实现，返回固定模板
-   * Phase 2 v2：调用规划模型生成
+   * 生成互斥假设（2-3 条）。
+   *
+   * callModel 由调用方注入（main.ts 传真实的 Provider.stream），本模块不直接
+   * 依赖 HTTP/Provider 细节。callModel 返回 undefined 或抛错时视为规划失败，
+   * 降级为两条通用模板——明确标注是降级结果，不是模型的真实判断，调用方应该
+   * 把这次锦标赛标为低置信度，而不是当作正常的多假设竞争。
    */
-  generateHypotheses(prompt: string, context: { estimatedImpact?: number }): string[] {
-    // TODO: 调用规划模型（DeepSeek R1 / Claude Opus）
-    // 当前占位：返回两条通用假设
+  async generateHypotheses(prompt: string, context: { estimatedImpact?: number }, callModel?: (planningPrompt: string) => Promise<string>): Promise<{ approaches: string[]; degraded: boolean }> {
+    if (!callModel) {
+      return { approaches: this.fallbackHypotheses(), degraded: true };
+    }
+    const planningPrompt = `任务：${prompt}\n\n请给出 2-3 条互斥的修复/实现思路（不同根因方向或不同架构层，不要给出同一个方案的措辞变体）。每条一行，格式为"方案 X：一句话描述"，不要输出其他内容。`;
+    try {
+      const raw = await callModel(planningPrompt);
+      const approaches = this.parseHypotheses(raw);
+      if (approaches.length < 2) return { approaches: this.fallbackHypotheses(), degraded: true };
+      return { approaches, degraded: false };
+    } catch {
+      return { approaches: this.fallbackHypotheses(), degraded: true };
+    }
+  }
+
+  private fallbackHypotheses(): string[] {
     return [
       '方案 A：从数据层修复（修改数据结构或查询逻辑）',
       '方案 B：从 UI 层修复（调整组件状态或事件处理）'
     ];
+  }
+
+  /** 从模型输出里解析"方案 X：描述"格式的行，最多取 3 条。 */
+  private parseHypotheses(raw: string): string[] {
+    return raw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^方案\s*[A-Za-z0-9]+[:：]/.test(line))
+      .slice(0, 3);
   }
 
   /**
