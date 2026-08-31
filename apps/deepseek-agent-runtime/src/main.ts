@@ -934,6 +934,38 @@ async function delegateWorker(sessionID: string, projectPath: string, input: Rec
   return result
 }
 
+/** 关键词覆盖率：requirement 里提到的具体标识符（函数名/类名/变量名等英文
+ *  token）有多少字面出现在 diff 文本里。这是粗粒度子串匹配，不是语义理解，
+ *  但英文标识符是这里唯一可靠的信号——需求原文若提到 "PolicyEngine"、
+ *  "checkCommand" 这类具体名字，diff 完全不碰它们就值得怀疑。
+ *
+ *  刻意不对纯中文描述做同样的字面匹配：中文自然语言描述几乎不会原样出现在
+ *  代码或 diff 里（"把这个函数改成异步的"→`async function foo()`，字面完全
+ *  不重合但显然是对的修复），早期实现试过对中文做 2-4 字滑动窗口子串匹配，
+ *  结果是"改对了但描述用词没重现"被系统性地误判为低覆盖率——比不做这个检查
+ *  还糟。所以 requirement 里一个英文标识符都没提到时，直接跳过这项检查
+ *  （返回 total:0），不产生虚假的低覆盖率信号。 */
+function extractRequirementIdentifiers(requirement: string): string[] {
+  const latinTokens = requirement.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) ?? []
+  const stopwords = new Set(["the", "and", "for", "with", "this", "that", "from", "into"])
+  const seen = new Set<string>()
+  const identifiers: string[] = []
+  for (const token of latinTokens.map((t) => t.toLowerCase())) {
+    if (stopwords.has(token) || seen.has(token)) continue
+    seen.add(token)
+    identifiers.push(token)
+  }
+  return identifiers
+}
+
+function keywordCoverage(requirement: string, diffText: string): { covered: number; total: number; uncovered: string[] } {
+  const identifiers = extractRequirementIdentifiers(requirement)
+  if (identifiers.length === 0) return { covered: 0, total: 0, uncovered: [] }
+  const lowerDiff = diffText.toLowerCase()
+  const uncovered = identifiers.filter((identifier) => !lowerDiff.includes(identifier))
+  return { covered: identifiers.length - uncovered.length, total: identifiers.length, uncovered }
+}
+
 /**
  * Verifier Worker v1（NEXT_GEN_ARCHITECTURE Phase 1 支柱二完整版）：
  * 在独立 worktree 中对主 Agent 的交付声明进行对抗性验证。
@@ -946,7 +978,9 @@ async function delegateWorker(sessionID: string, projectPath: string, input: Rec
  * 验证策略：
  * 1. 检查 git diff 存在且非空（无 diff = 反驳）
  * 2. 重跑主 Agent 声称通过的所有测试命令（任一失败 = 反驳）
- * 3. 检查 diff 是否覆盖用户需求中的关键词（TODO：Phase 1 v1.1）
+ * 3. 检查 diff 是否覆盖需求关键词（粗粒度字面匹配，见 keywordCoverage()）——
+ *    覆盖率很低时不足以单独判反驳（关键词不重合不代表没解决问题），
+ *    但会把测试通过的结论降级为 inconclusive 并说明原因，而不是直接 pass。
  */
 async function runVerifierWorker(sessionID: string, projectPath: string, claim: string, requirement?: string): Promise<{ state: "pass" | "refuted" | "inconclusive"; counterEvidence: string[]; summary: string }> {
   const workerID = `verifier-${crypto.randomUUID()}`
@@ -978,8 +1012,13 @@ async function runVerifierWorker(sessionID: string, projectPath: string, claim: 
       return { state: "refuted", counterEvidence: ["工作区无 Git Diff，声称的修改未落盘"], summary: "Verifier 反驳：无可验证补丁" }
     }
 
-    // 应用 diff 到 worktree
-    await execFileWithStdin("git", ["-C", worktreePath, "apply", "--"], diff, { maxBuffer: 500_000, timeoutMs: 30_000 }).catch((error) => {
+    // 应用 diff 到 worktree。diff 变量上面已经 .trim() 过（用于判空），但 git apply
+    // 要求补丁最后一行必须有换行结尾，否则报"补丁损坏"——trim() 会把这个换行也
+    // 一起吃掉。之前这里直接把 trim 后的 diff 传给 apply，任何最后一行恰好被
+    // trim 掉换行的补丁都会应用失败；实测复现：两个独立仓库（父仓库 + worktree），
+    // worktree 改一行文件内容后 diff HEAD，trim 后应用到父仓库直接报 "补丁在
+    // <stdin>:7 损坏"，加回换行后才能正确应用。
+    await execFileWithStdin("git", ["-C", worktreePath, "apply", "--"], `${diff}\n`, { maxBuffer: 500_000, timeoutMs: 30_000 }).catch((error) => {
       throw new Error(`Failed to apply diff to worktree: ${error instanceof Error ? error.message : String(error)}`)
     })
 
@@ -1016,8 +1055,20 @@ async function runVerifierWorker(sessionID: string, projectPath: string, claim: 
       return { state: "refuted", counterEvidence, summary: `Verifier 反驳：声称的修复在 ${failedTests.length} 条测试下仍失败` }
     }
 
-    // 5. 全部测试通过 = pass
+    // 5. 全部测试通过 = pass（除非需求明确提到的标识符大半没出现在 diff 里，
+    //    那样降级为 inconclusive——total:0 表示需求没提到任何具体标识符，
+    //    这项检查天然跳过，不产生虚假信号，见 keywordCoverage() 顶部注释）
     const diffStat = (await execFile("git", ["-C", worktreePath, "diff", "--stat", "HEAD"], { maxBuffer: 50_000 })).stdout.trim()
+    if (requirement) {
+      const coverage = keywordCoverage(requirement, diff)
+      if (coverage.total > 0 && coverage.covered / coverage.total < 0.5) {
+        return {
+          state: "inconclusive",
+          counterEvidence: [`需求提到的标识符大半没出现在 diff 里（${coverage.covered}/${coverage.total} 命中）：${coverage.uncovered.slice(0, 5).join('、')}`],
+          summary: `测试通过，但 diff 没有触及需求里明确提到的标识符，无法确认改动真的对应这次需求（字面匹配，非语义判断）`
+        }
+      }
+    }
     return { state: "pass", counterEvidence: [], summary: `Verifier 通过：工作区有修改（${diffStat.split('\n').length - 1} 个文件），${testCommands.length} 条测试全部通过` }
 
   } catch (error) {
@@ -1319,7 +1370,13 @@ function streamModel(sessionID: string, client: StreamingProvider, model: string
   return (async function* () {
     // Phase 1：录制所有模型事件用于确定性回放（NEXT_GEN_ARCHITECTURE 支柱一）
     const recordedDeltas: Array<{ type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown>; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number }> = []
-    let turnSequence = 0 // TODO: 从事件日志获取当前 turn 序号
+    // 一次 executeRun 里 AgentExecutor 会多次调用 streamModel（读→改→测的每一轮都是
+    // 一次独立的模型往返）。之前这里每次调用都从 0 开始，导致同一 session 下所有
+    // model_stream_recorded 事件的 turnSequence 全是 0，没法区分是第几轮往返——
+    // session.replay/Shadow Eval 靠事件在日志里的物理顺序而不是这个字段工作，所以
+    // 目前没有造成可观察的功能性 bug，但字段本身是假的。改为在写入前查询这个
+    // session 已有多少条 model_stream_recorded，用真实序号。
+    const turnSequence = (await eventStore.loadEvents(sessionID)).filter((event) => event.type === "model_stream_recorded").length
 
     for await (const event of client.stream({ model, messages, feature: "main_agent", tools: schemas })) {
       // 录制所有事件类型（text_delta/tool_call/usage/done）
@@ -1458,7 +1515,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       if (hasModification || hasPassedTests) {
         try {
           const claim = result.text.slice(0, 500) // 主 Agent 的最终文本作为声明
-          const verdict = await runVerifierWorker(sessionID, projectPath, claim)
+          const verdict = await runVerifierWorker(sessionID, projectPath, claim, prompt)
           await emitSessionEvent(sessionID, { type: "verifier_verdict", workerID: `verifier-${sessionID}`, state: verdict.state, counterEvidence: verdict.counterEvidence, summary: verdict.summary })
         } catch (error) {
           // Verifier 失败不影响主流程，只记录 inconclusive
