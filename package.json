@@ -20,7 +20,7 @@
     "bench:versus": "node benchmarks/versus/run.mjs",
     "bench:soak": "node benchmarks/soak.mjs",
     "test": "vitest run tests && npm run test:sidecar",
-    "test:sidecar": "bash scripts/test-agent-runtime.sh && bash scripts/test-agent-approval.sh && bash scripts/test-agent-worker.sh && bash scripts/test-agent-terminal.sh && bash scripts/test-agent-cancel.sh && bash scripts/test-agent-verifier.sh && bash scripts/test-agent-verifier-keyword-coverage.sh && bash scripts/test-agent-turn-sequence.sh",
+    "test:sidecar": "bash scripts/test-agent-runtime.sh && bash scripts/test-agent-approval.sh && bash scripts/test-agent-worker.sh && bash scripts/test-agent-terminal.sh && bash scripts/test-agent-cancel.sh && bash scripts/test-agent-verifier.sh && bash scripts/test-agent-verifier-keyword-coverage.sh && bash scripts/test-agent-turn-sequence.sh && bash scripts/test-agent-task-queue.sh && bash scripts/test-agent-task-queue-dependency.sh && bash scripts/test-agent-task-queue-cancel.sh",
     "legacy:dev": "electron-vite dev",
     "legacy:build": "npm run typecheck && electron-vite build",
     "legacy:test": "vitest run",

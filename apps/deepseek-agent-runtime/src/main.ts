@@ -24,6 +24,7 @@ import { createSystemSSHInteractiveRunner, SSHRemotePersistentTerminal, type SSH
 import { resolveWorkspacePath } from "../../../src/core/tools/workspace"
 import { runReadOnlyWorker, type WorkerResultEnvelope, type WorkerType } from "../../../src/core/worker-runtime"
 import { getGitHubCIStatus } from "../../../src/core/github-ci"
+import { canTransition, resolveDependencies, selectRunnable, selectDependencyResolved, type TaskTicket, type TaskTicketState } from "../../../src/core/task-queue"
 import { buildCIRepairComment, findGitHubPullRequestForCommit, updateGitHubPullRequest } from "../../../src/core/github-pr"
 import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
 import { buildDeliveryReceipt } from "../../../src/core/delivery-receipt"
@@ -65,7 +66,7 @@ type ProviderProtocol = "openai-compatible" | "anthropic-messages"
 
 type Request = {
   id: string
-  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover" | "session.fork" | "session.branches" | "session.replay" | "session.arena" | "session.shadowEval" | "terminal.open" | "terminal.exec"
+  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover" | "session.fork" | "session.branches" | "session.replay" | "session.arena" | "session.shadowEval" | "terminal.open" | "terminal.exec" | "task.enqueue" | "task.list" | "task.cancel"
   params?: Partial<AgentRunParams> & {
     text?: string
     approvalID?: string
@@ -76,6 +77,9 @@ type Request = {
     newSessionID?: string
     command?: string
     variants?: unknown
+    ticketID?: string
+    priority?: number
+    blockedBy?: string[]
   }
 }
 
@@ -110,6 +114,8 @@ type RuntimeEvent =
   | { type: "tournament_merge_failed"; tournamentID: string; winner: string; reason: string }
   | { type: "tournament_hypothesis_pruned_scheduled"; tournamentID: string; hypothesisID: string; projectPath: string; worktreePath: string; branch: string; prunableAfter: string }
   | { type: "tournament_hypothesis_pruned"; tournamentID: string; hypothesisID: string }
+  | { type: "ticket_enqueued"; ticketID: string; prompt: string; projectPath: string; priority: number; blockedBy?: string[] }
+  | { type: "ticket_state_changed"; ticketID: string; from: string; to: string; reason?: string; waitingCommit?: string }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
@@ -514,6 +520,14 @@ type MCPClient = MCPStdioClient | MCPStreamableHTTPClient | MCPWebSocketClient
 const mcpClients = new Map<string, MCPClient>()
 const lspClients = new Map<string, LanguageServerClient>()
 const deferredCIRepairs = new CIRepairQueue<RepairRuntimeConfig>()
+
+// 工单的模型凭据只留内存：ticket_enqueued 事件会经 emitSessionEvent 的 redact()
+// 管线自动脱敏（sk-... 一类前缀会被替换成 [REDACTED]），这意味着从事件日志恢复
+// 出来的凭据是坏的——所以干脆不往事件里写凭据，崩溃后工单的调度状态可以恢复
+// （queued/waiting_*/done/failed 这些是真的持久化的），但要恢复执行本身仍需要
+// 凭据还在内存里，或者调用方重新提供。这是"状态机可恢复"和"凭据不落盘"两个
+// 目标之间诚实的取舍，不是遗漏。
+const ticketCredentials = new Map<string, Pick<AgentRunParams, "baseURL" | "apiKey" | "model" | "protocol" | "mode" | "fastModel">>()
 
 /** 把一个 Map<string, T> 适配成 SessionDataCleaner 认得的资源表；
  *  toResource 负责从 map 存的值里取出真正会 close() 的那个对象
@@ -1869,6 +1883,181 @@ async function pruneExpiredArenaWorktrees(): Promise<void> {
   }
 }
 
+/** 从事件日志重建一张工单当前状态表：扫描所有 .jsonl 文件里的 ticket_enqueued/
+ *  ticket_state_changed 事件，按时间顺序重放出每个 ticketID 当前的状态——这就是
+ *  "状态迁移全部走事件日志、免费继承恢复语义"的具体做法，不需要额外的数据库。 */
+async function loadAllTickets(): Promise<TaskTicket[]> {
+  let files: string[] = []
+  try { files = await readdir(sessionRoot()) } catch { return [] }
+  const tickets = new Map<string, TaskTicket>()
+  for (const file of files.filter((name) => name.endsWith(".jsonl"))) {
+    const sessionID = file.slice(0, -".jsonl".length)
+    let events: Array<{ type?: string; payload?: Record<string, unknown>; createdAt?: string }> = []
+    try { events = await eventStore.loadEvents(sessionID) } catch { continue }
+    for (const event of events) {
+      if (event.type === "ticket_enqueued") {
+        const ticketID = event.payload?.ticketID as string
+        if (!ticketID) continue
+        tickets.set(ticketID, {
+          ticketID,
+          sessionID,
+          prompt: (event.payload?.prompt as string) ?? "",
+          projectPath: (event.payload?.projectPath as string) ?? "",
+          state: "queued",
+          priority: typeof event.payload?.priority === "number" ? event.payload.priority : 0,
+          ...(Array.isArray(event.payload?.blockedBy) ? { blockedBy: event.payload.blockedBy as string[] } : {}),
+          createdAt: event.createdAt ?? new Date().toISOString(),
+          updatedAt: event.createdAt ?? new Date().toISOString()
+        })
+      } else if (event.type === "ticket_state_changed") {
+        const ticketID = event.payload?.ticketID as string
+        const existing = ticketID ? tickets.get(ticketID) : undefined
+        if (!existing) continue
+        existing.state = event.payload?.to as TaskTicketState
+        existing.updatedAt = event.createdAt ?? new Date().toISOString()
+        if (typeof event.payload?.waitingCommit === "string") existing.waitingCommit = event.payload.waitingCommit
+        if (typeof event.payload?.reason === "string" && existing.state === "failed") existing.error = event.payload.reason
+      }
+    }
+  }
+  return [...tickets.values()]
+}
+
+/** 记一条状态迁移事件，并校验转移是否合法——不合法的转移直接拒绝而不是静默写入
+ *  一个矛盾的状态，这样事件日志本身就是一份可信的审计轨迹。 */
+async function changeTicketState(ticket: TaskTicket, to: TaskTicketState, extra: { reason?: string; waitingCommit?: string } = {}): Promise<void> {
+  if (!canTransition(ticket.state, to)) {
+    throw new Error(`Illegal ticket state transition: ${ticket.state} -> ${to}`)
+  }
+  await emitSessionEvent(ticket.sessionID, { type: "ticket_state_changed", ticketID: ticket.ticketID, from: ticket.state, to, ...extra })
+  ticket.state = to
+  if (extra.waitingCommit) ticket.waitingCommit = extra.waitingCommit
+  if (extra.reason && to === "failed") ticket.error = extra.reason
+}
+
+/** task.enqueue：创建一个新工单。有依赖时先进 waiting_dependency，没有依赖直接 queued。 */
+async function enqueueTicket(request: Request): Promise<Response> {
+  const params = request.params
+  const prompt = params?.prompt?.trim()
+  const projectPath = params?.projectPath?.trim()
+  if (!prompt || !projectPath) return { id: request.id, type: "response", ok: false, error: "task.enqueue requires prompt and projectPath" }
+  if (!params?.baseURL || !params?.apiKey || !params?.model) return { id: request.id, type: "response", ok: false, error: "task.enqueue requires baseURL, apiKey and model" }
+
+  const ticketID = `ticket-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
+  const priority = typeof params.priority === "number" ? params.priority : 0
+  const blockedBy = params.blockedBy?.length ? params.blockedBy : undefined
+
+  await eventStore.append(ticketID, "ticket_enqueued", { ticketID, prompt, projectPath, priority, ...(blockedBy ? { blockedBy } : {}) })
+  ticketCredentials.set(ticketID, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode, fastModel: params.fastModel })
+
+  const ticket: TaskTicket = { ticketID, sessionID: ticketID, prompt, projectPath, state: "queued", priority, ...(blockedBy ? { blockedBy } : {}), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+  if (blockedBy) {
+    const all = await loadAllTickets()
+    const { ready } = resolveDependencies(ticket, { list: () => all })
+    if (!ready) await changeTicketState(ticket, "waiting_dependency")
+  }
+
+  void tickTaskQueue()
+  return { id: request.id, type: "response", ok: true, result: { ticketID, state: ticket.state } }
+}
+
+async function listTicketsHandler(request: Request): Promise<Response> {
+  const tickets = await loadAllTickets()
+  return { id: request.id, type: "response", ok: true, result: { tickets: tickets.map((t) => ({ ticketID: t.ticketID, state: t.state, priority: t.priority, prompt: t.prompt.slice(0, 200), blockedBy: t.blockedBy, error: t.error, createdAt: t.createdAt, updatedAt: t.updatedAt })) } }
+}
+
+async function cancelTicketHandler(request: Request): Promise<Response> {
+  const ticketID = request.params?.ticketID?.trim()
+  if (!ticketID) return { id: request.id, type: "response", ok: false, error: "task.cancel requires ticketID" }
+  const tickets = await loadAllTickets()
+  const ticket = tickets.find((t) => t.ticketID === ticketID)
+  if (!ticket) return { id: request.id, type: "response", ok: false, error: `Ticket not found: ${ticketID}` }
+  if (ticket.state === "done" || ticket.state === "failed") return { id: request.id, type: "response", ok: false, error: `Ticket already in terminal state: ${ticket.state}` }
+  try {
+    await changeTicketState(ticket, "failed", { reason: "cancelled by user" })
+    ticketCredentials.delete(ticketID)
+    return { id: request.id, type: "response", ok: true, result: { ticketID, state: "failed" } }
+  } catch (error) {
+    return { id: request.id, type: "response", ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** 调度循环的一次 tick：把 waiting_dependency 里依赖已满足的工单转回 queued，
+ *  把 queued 里排得上的工单真正推进 queues/drain 执行引擎（复用已有的执行机制，
+ *  本函数只负责"轮到谁了"）。工单开始跑之后转 running；executeTaskTicket 里
+ *  跑完再决定是 done、waiting_approval 还是 waiting_ci。 */
+async function tickTaskQueue(): Promise<void> {
+  const tickets = await loadAllTickets()
+
+  // waiting_ci：真的调用 GitHub CI 状态查询，不是假装轮询。目前没有任何代码路径
+  // 会把工单主动置入 waiting_ci（那需要执行中的工单自己判断"这一步要等 CI"，
+  // 这部分逻辑还没写），这里只实现"已经在 waiting_ci 状态的工单，CI 通过后
+  // 转回 queued"这一半——如实标注，不假装整条链路已经打通。
+  for (const ticket of tickets.filter((t) => t.state === "waiting_ci" && t.waitingCommit)) {
+    try {
+      const result = await getGitHubCIStatus(ticket.projectPath, ticket.waitingCommit!, async (args) => (await execFile("gh", args, { cwd: ticket.projectPath, maxBuffer: 200_000 })).stdout)
+      if (result.passed) await changeTicketState(ticket, "queued").catch(() => undefined)
+    } catch { /* CI 查询失败不影响其他工单，下一次 tick 再试 */ }
+  }
+
+  for (const ticket of selectDependencyResolved(tickets)) {
+    await changeTicketState(ticket, "queued").catch(() => undefined)
+  }
+
+  const refreshed = await loadAllTickets()
+  for (const ticket of selectRunnable(refreshed)) {
+    if (activeSessions.has(ticket.sessionID)) continue // 已经在跑，不重复推进
+    const credentials = ticketCredentials.get(ticket.ticketID)
+    if (!credentials) {
+      // 凭据只在内存里，sidecar 重启后会丢失（见 ticketCredentials 声明处的说明）。
+      // 不是把工单标失败——调用方可能只是还没重新连上来——而是先跳过，等
+      // 凭据补上（目前没有补凭据的 IPC 方法，这是已知的诚实限制，留给以后
+      // 需要时再加 task.resume 之类的方法）。
+      continue
+    }
+    await changeTicketState(ticket, "running").catch(() => undefined)
+    const queue = queues.get(ticket.sessionID) ?? []
+    queue.push({ id: `ticket-run-${crypto.randomUUID()}`, params: { sessionID: ticket.sessionID, projectPath: ticket.projectPath, prompt: ticket.prompt, ...credentials } })
+    queues.set(ticket.sessionID, queue)
+    void drainTicketSession(ticket.ticketID, ticket.sessionID)
+  }
+}
+
+/** 工单专用的 drain 包装：跑完后按结果决定 done/failed，而不是普通会话那样
+ *  直接把响应发回 IPC 调用方——工单的调用方早就断开了，结果要写回事件日志。 */
+async function drainTicketSession(ticketID: string, sessionID: string): Promise<void> {
+  if (activeSessions.has(sessionID)) return
+  activeSessions.add(sessionID)
+  try {
+    const queue = queues.get(sessionID) ?? []
+    while (queue.length > 0) {
+      const request = queue.shift()!
+      try {
+        await eventStore.append(sessionID, "input_claimed", { inputID: request.id })
+        const result = await executeRun(request)
+        const tickets = await loadAllTickets()
+        const ticket = tickets.find((t) => t.ticketID === ticketID)
+        if (ticket && ticket.state === "running") {
+          if (result.status === "waiting_approval") await changeTicketState(ticket, "waiting_approval").catch(() => undefined)
+          else await changeTicketState(ticket, "done").catch(() => undefined)
+        }
+      } catch (error) {
+        const tickets = await loadAllTickets()
+        const ticket = tickets.find((t) => t.ticketID === ticketID)
+        if (ticket && ticket.state === "running") await changeTicketState(ticket, "failed", { reason: error instanceof Error ? error.message : String(error) }).catch(() => undefined)
+      }
+    }
+  } finally {
+    activeSessions.delete(sessionID)
+    if ((queues.get(sessionID)?.length ?? 0) > 0) void drainTicketSession(ticketID, sessionID)
+    // 这张工单刚结束（done/failed），可能有别的工单正 waiting_dependency 等它——
+    // 不等 30s 的定期 tick，立即重新调度一次。没有这个的话，B 依赖 A 时，
+    // A 完成后 B 要等到下一次周期性 tick 才会被发现"依赖已满足"，实测验证过
+    // 这个延迟是真实存在的（依赖测试在没有这行时会等满 30s 才通过）。
+    else void tickTaskQueue()
+  }
+}
+
 /** Shadow Eval（Phase 4）：离线策略对比。
  *  只有 contextWindowSize 类变体在纯回放下能产生真实差异（重跑 buildContext 裁剪逻辑，
  *  用的是这个会话真实的对话历史，不是编造数字）；instructionTemplate/toolOrder/modelTier
@@ -2116,8 +2305,11 @@ async function handle(request: Request): Promise<void> {
         "session.shadowEval",
         "terminal.open",
         "terminal.exec",
+        "task.enqueue",
+        "task.list",
+        "task.cancel",
       ],
-      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection", "tournament", "shadow-eval", "interactive-terminal"],
+      features: ["fork", "branches", "replay", "delivery-receipt", "session-projection", "tournament", "shadow-eval", "interactive-terminal", "task-queue"],
     }
     respond({ id: request.id, type: "response", ok: true, result: capabilities })
     return
@@ -2140,6 +2332,18 @@ async function handle(request: Request): Promise<void> {
   }
   if (request.method === "terminal.exec") {
     respond(await execInteractiveTerminal(request))
+    return
+  }
+  if (request.method === "task.enqueue") {
+    respond(await enqueueTicket(request))
+    return
+  }
+  if (request.method === "task.list") {
+    respond(await listTicketsHandler(request))
+    return
+  }
+  if (request.method === "task.cancel") {
+    respond(await cancelTicketHandler(request))
     return
   }
   if (request.method === "session.arena") {
@@ -2231,6 +2435,13 @@ if (process.argv.includes("--terminal-daemon")) {
   await recoverInterruptedSessions()
   await pruneExpiredArenaWorktrees()
   sessionCleaner.start()
+  // 崩溃恢复后，重启时可能有工单还停在 queued/waiting_dependency（凭据早就丢了，
+  // 见 ticketCredentials 的说明）——先 tick 一次让依赖图能推进的先推进，之后
+  // 定期轮询 waiting_ci、推进 queued 工单。凭据缺失的工单会在 tickTaskQueue 里
+  // 被永久跳过（当前没有 task.resume 之类的方法能给已存在的 ticketID 补凭据，
+  // 这是已知缺口，不是"会自动恢复"的假象）。
+  void tickTaskQueue()
+  setInterval(() => { void tickTaskQueue() }, 30_000)
 
   let buffer = ""
   process.stdin.setEncoding("utf8")
