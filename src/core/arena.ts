@@ -12,7 +12,7 @@
  * - 锦标赛是"竞争-证伪"，难题成功率结构性更高
  */
 
-export type TournamentStatus = 'running' | 'judging' | 'merged' | 'aborted';
+export type TournamentStatus = 'running' | 'judging' | 'merged' | 'merge_failed' | 'aborted';
 
 export interface Hypothesis {
   id: string;

@@ -103,6 +103,13 @@ type RuntimeEvent =
   | { type: "sandbox_violation"; violations: Array<{ type: string; path?: string; host?: string; operation: string }>; command: string }
   | { type: "graph_index_completed"; symbolCount: number; files: number }
   | { type: "tournament_hypotheses_degraded"; tournamentID: string; reason: string }
+  | { type: "tournament_started"; tournamentID: string; hypothesesCount: number; approaches: string[] }
+  | { type: "hypothesis_completed"; tournamentID: string; hypothesisID: string; approach: string; testExitCode: number; deliveryState: string; error?: string }
+  | { type: "tournament_judged"; tournamentID: string; winner: string; reasoning: string }
+  | { type: "tournament_merged"; tournamentID: string; winner: string; patchHash: string }
+  | { type: "tournament_merge_failed"; tournamentID: string; winner: string; reason: string }
+  | { type: "tournament_hypothesis_pruned_scheduled"; tournamentID: string; hypothesisID: string; projectPath: string; worktreePath: string; branch: string; prunableAfter: string }
+  | { type: "tournament_hypothesis_pruned"; tournamentID: string; hypothesisID: string }
   | { type: "terminal_completed"; sequence: number; command: string; stdout: string; stderr: string; exitCode: number }
   | { type: "worker_completed"; workerID: string; workerType: WorkerType; state: string; summary: string; evidenceCount: number }
   | { type: "verifier_started"; workerID: string; claim: string; patchHash?: string }
@@ -409,6 +416,34 @@ function conversationFromEntries(entries: Array<{ type?: string; payload?: Recor
 
 const eventStore = new JsonlEventStore()
 const execFile = promisify(execFileCallback)
+
+/** execFile(...) 的 callback/promisified 版本不支持 `input` 选项——那只在
+ *  execFileSync/spawnSync 里存在。之前两处 `execFile("git", [...apply...], { input: diff })`
+ *  会真实挂起：git apply 在等一个永远不会被写入或关闭的 stdin，`await` 永远不 resolve。
+ *  这不是理论问题——runVerifierWorker 的调用路径上完全没有外层 timeout 包裹，
+ *  意味着任何一次 Agent 成功改动文件后触发 Verifier，整个 turn 都会卡死不返回。
+ *  真正需要把内容写进子进程 stdin 时，必须走 spawn + child.stdin.end()，用这个封装。 */
+function execFileWithStdin(command: string, args: string[], input: string, options: { maxBuffer?: number; timeoutMs?: number } = {}): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] })
+    let stdout = ""
+    let stderr = ""
+    const maxBuffer = options.maxBuffer ?? 1_000_000
+    const timer = options.timeoutMs ? setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`${command} timed out after ${options.timeoutMs}ms`)) }, options.timeoutMs) : undefined
+    child.stdout.setEncoding("utf8")
+    child.stderr.setEncoding("utf8")
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; if (stdout.length > maxBuffer) child.kill("SIGKILL") })
+    child.stderr.on("data", (chunk: string) => { stderr += chunk })
+    child.once("error", (error) => { if (timer) clearTimeout(timer); reject(error) })
+    child.once("exit", (code) => {
+      if (timer) clearTimeout(timer)
+      if (code === 0) resolve({ stdout, stderr })
+      else reject(Object.assign(new Error(`${command} exited with code ${code}: ${stderr.slice(-500)}`), { code, stdout, stderr }))
+    })
+    child.stdin.end(input)
+  })
+}
+
 const queues = new Map<string, RunRequest[]>()
 const activeSessions = new Set<string>()
 
@@ -944,7 +979,7 @@ async function runVerifierWorker(sessionID: string, projectPath: string, claim: 
     }
 
     // 应用 diff 到 worktree
-    await execFile("git", ["-C", worktreePath, "apply", "--"], { input: diff, maxBuffer: 500_000 }).catch((error) => {
+    await execFileWithStdin("git", ["-C", worktreePath, "apply", "--"], diff, { maxBuffer: 500_000, timeoutMs: 30_000 }).catch((error) => {
       throw new Error(`Failed to apply diff to worktree: ${error instanceof Error ? error.message : String(error)}`)
     })
 
@@ -1549,6 +1584,7 @@ async function executeTournament(request: Request): Promise<Response> {
     : undefined
   const { approaches, degraded } = await orchestrator.generateHypotheses(prompt, {}, callModel)
   if (degraded) await emitSessionEvent(parentSessionID, { type: "tournament_hypotheses_degraded", tournamentID, reason: callModel ? "规划模型调用失败或输出格式不符" : "缺少模型凭据" })
+  await emitSessionEvent(parentSessionID, { type: "tournament_started", tournamentID, hypothesesCount: approaches.length, approaches })
   const hypotheses: Hypothesis[] = []
 
   // 2. 为每个假设分叉会话 + 创建 worktree
@@ -1619,6 +1655,8 @@ async function executeTournament(request: Request): Promise<Response> {
 
         const delivery = evaluateDeliveryGate(events)
 
+        await emitSessionEvent(parentSessionID, { type: "hypothesis_completed", tournamentID, hypothesisID: h.id, approach: h.approach, testExitCode, deliveryState: delivery.state })
+
         return {
           hypothesis: h,
           result: {
@@ -1628,9 +1666,11 @@ async function executeTournament(request: Request): Promise<Response> {
             tokensUsed: events.filter((e) => e.type === "usage_recorded").reduce((sum, e) => sum + (typeof e.payload?.outputTokens === "number" ? e.payload.outputTokens : 0), 0),
             deliveryState: delivery.state
           },
-          diff: patchResult.stdout.slice(0, 10_000) // 裁判只看前 10k 字符
+          diff: patchResult.stdout.slice(0, 10_000), // 裁判只看前 10k 字符，避免评分输入过长
+          fullDiff: patchResult.stdout // 合并胜者时需要完整 diff，不能用裁判看的截断版
         }
       } catch (error) {
+        await emitSessionEvent(parentSessionID, { type: "hypothesis_completed", tournamentID, hypothesisID: h.id, approach: h.approach, testExitCode: -1, deliveryState: "needsAttention", error: error instanceof Error ? error.message : String(error) })
         return {
           hypothesis: h,
           result: {
@@ -1641,6 +1681,7 @@ async function executeTournament(request: Request): Promise<Response> {
             deliveryState: "needsAttention"
           },
           diff: "",
+          fullDiff: "",
           error: error instanceof Error ? error.message : String(error)
         }
       }
@@ -1661,6 +1702,7 @@ async function executeTournament(request: Request): Promise<Response> {
   }
 
   const verdict = orchestrator.judge(judgeInput)
+  await emitSessionEvent(parentSessionID, { type: "tournament_judged", tournamentID, winner: verdict.winner, reasoning: verdict.reasoning })
 
   // 5. 记录负证据
   const negativeEvidence = results
@@ -1671,12 +1713,40 @@ async function executeTournament(request: Request): Promise<Response> {
       reason: r.error ?? (r.result.testExitCode !== 0 ? "测试失败" : "Diff 更大或交付状态更差")
     }))
 
-  // 6. 清理失败假设的 worktree，保留胜者
+  // 6. 合并胜者：把胜者的完整 diff 真的 apply 到主工作区。之前这一步完全没做——
+  //    tournament.status 硬编码写 "merged"，但从来没有任何代码把补丁落到 projectPath，
+  //    调用方拿到一个"判决结果"，工作区毫无变化。
+  const winnerResult = results.find((r) => r.hypothesis.id === verdict.winner)
+  let mergeStatus: "merged" | "merge_failed" = "merge_failed"
+  if (winnerResult?.fullDiff) {
+    try {
+      await execFileWithStdin("git", ["-C", projectPath, "apply", "--"], winnerResult.fullDiff, { maxBuffer: 500_000, timeoutMs: 30_000 })
+      mergeStatus = "merged"
+      await emitSessionEvent(parentSessionID, { type: "tournament_merged", tournamentID, winner: verdict.winner, patchHash: winnerResult.result.patchHash })
+    } catch (error) {
+      await emitSessionEvent(parentSessionID, { type: "tournament_merge_failed", tournamentID, winner: verdict.winner, reason: error instanceof Error ? error.message : String(error) })
+    }
+  } else {
+    await emitSessionEvent(parentSessionID, { type: "tournament_merge_failed", tournamentID, winner: verdict.winner, reason: "胜者没有可用的 diff（执行失败或未产生任何改动）" })
+  }
+
+  // 7. 清理 worktree：合并成功时胜者的改动已经落到主工作区，胜者自己的 worktree
+  //    也可以清掉；合并失败时保留胜者 worktree，方便人工去那里查看/手动合并。
+  //    败者分支不再立即删除（之前 git branch -D 立刻删掉，文档要求保留 30 天
+  //    供人工查看"为什么这条路不通"——只记裁决文字、把原始 diff 销毁掉不算真的
+  //    保留了负证据）。改为记一条待清理标记，交给 pruneExpiredArenaWorktrees()
+  //    在到期后真正删除。
+  const prunableAfter = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
   for (const r of results) {
-    if (r.hypothesis.id !== verdict.winner && r.hypothesis.worktreePath && r.hypothesis.branch) {
+    const isWinner = r.hypothesis.id === verdict.winner
+    if (!r.hypothesis.worktreePath || !r.hypothesis.branch) continue
+    if (isWinner && mergeStatus === "merged") {
       await execFile("git", ["-C", projectPath, "worktree", "remove", "--force", r.hypothesis.worktreePath], { timeout: 10_000 }).catch(() => undefined)
       await execFile("git", ["-C", projectPath, "branch", "-D", r.hypothesis.branch], { timeout: 10_000 }).catch(() => undefined)
+    } else if (!isWinner) {
+      await emitSessionEvent(parentSessionID, { type: "tournament_hypothesis_pruned_scheduled", tournamentID, hypothesisID: r.hypothesis.id, projectPath, worktreePath: r.hypothesis.worktreePath, branch: r.hypothesis.branch, prunableAfter })
     }
+    // 合并失败时胜者的 worktree 原样保留，不清理。
   }
 
   const tournament: Tournament = {
@@ -1684,7 +1754,7 @@ async function executeTournament(request: Request): Promise<Response> {
     parentSessionID,
     prompt,
     hypotheses,
-    status: "merged",
+    status: mergeStatus,
     winner: verdict.winner,
     judgeReasoning: verdict.reasoning,
     negativeEvidence,
@@ -1695,13 +1765,49 @@ async function executeTournament(request: Request): Promise<Response> {
   return {
     id: request.id,
     type: "response",
-    ok: true,
+    ok: mergeStatus === "merged",
+    ...(mergeStatus === "merge_failed" ? { error: "锦标赛已裁决，但胜者补丁未能应用到主工作区，需要人工介入" } : {}),
     result: {
       tournamentID,
+      status: mergeStatus,
       winner: verdict.winner,
       reasoning: verdict.reasoning,
       negativeEvidence,
       hypothesesCount: hypotheses.length
+    }
+  }
+}
+
+/** 扫描所有会话事件日志，删除已过期（>30 天）的锦标赛败者 worktree/分支。
+ *  在 sidecar 启动时调用（与 recoverInterruptedSessions 同一批一次性扫描），
+ *  不需要额外的定时任务基础设施——本来就是个长驱进程，每次启动清一次足够。 */
+async function pruneExpiredArenaWorktrees(): Promise<void> {
+  let files: string[] = []
+  try { files = await readdir(sessionRoot()) } catch { return }
+  const now = Date.now()
+  for (const file of files.filter((name) => name.endsWith(".jsonl"))) {
+    const sessionID = file.slice(0, -".jsonl".length)
+    try {
+      const events = await eventStore.loadEvents(sessionID)
+      const pruned = new Set(events.filter((e) => e.type === "tournament_hypothesis_pruned").map((e) => e.payload?.hypothesisID as string))
+      const scheduled = events.filter((e) => e.type === "tournament_hypothesis_pruned_scheduled" && !pruned.has(e.payload?.hypothesisID as string))
+      for (const entry of scheduled) {
+        const prunableAfter = typeof entry.payload?.prunableAfter === "string" ? Date.parse(entry.payload.prunableAfter) : NaN
+        if (Number.isNaN(prunableAfter) || prunableAfter > now) continue
+        const worktreePath = entry.payload?.worktreePath as string
+        const branch = entry.payload?.branch as string
+        const hypothesisID = entry.payload?.hypothesisID as string
+        const tournamentID = entry.payload?.tournamentID as string
+        const arenaProjectPath = entry.payload?.projectPath as string
+        if (!worktreePath || !branch || !arenaProjectPath) continue
+        // 必须从主仓库（arenaProjectPath）发起 remove，不能 -C 到即将删除的
+        // worktree 目录本身——部分 git 版本会拒绝在自己所在的工作树内删除它。
+        await execFile("git", ["-C", arenaProjectPath, "worktree", "remove", "--force", worktreePath], { timeout: 10_000 }).catch(() => undefined)
+        await execFile("git", ["-C", arenaProjectPath, "branch", "-D", branch], { timeout: 10_000 }).catch(() => undefined)
+        await emitSessionEvent(sessionID, { type: "tournament_hypothesis_pruned", tournamentID, hypothesisID })
+      }
+    } catch (error) {
+      process.stderr.write(`${redact(`arena worktree prune skipped for ${sessionID}: ${error instanceof Error ? error.message : String(error)}`)}\n`)
     }
   }
 }
@@ -2066,6 +2172,7 @@ if (process.argv.includes("--terminal-daemon")) {
 
   await initProjection()
   await recoverInterruptedSessions()
+  await pruneExpiredArenaWorktrees()
   sessionCleaner.start()
 
   let buffer = ""
