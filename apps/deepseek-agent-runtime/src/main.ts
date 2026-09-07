@@ -8,6 +8,9 @@ import { tmpdir } from "node:os"
 import type { ToolDefinition } from "../../../src/core/tool-execution-pipeline"
 import { OpenAICompatibleClient, type ModelEvent } from "../../../src/core/providers/openai-compatible"
 import { AnthropicMessagesClient } from "../../../src/core/providers/anthropic-messages"
+import { describeModelError, isRetryableModelError } from "../../../src/core/providers/model-errors"
+import { streamWithRetry } from "../../../src/core/providers/stream-retry"
+import { estimateUsageCost, pricingForModel } from "../../../src/core/usage"
 import { createWorkspaceAgentTools } from "../../../src/core/tools/agent-tools"
 import { createWebTools } from "../../../src/core/tools/web"
 import { loadProjectInstructions } from "../../../src/core/project-instructions"
@@ -100,7 +103,8 @@ type RuntimeEvent =
   | AgentExecutorEvent
   | { type: "turn_started"; prompt: string; projectPath?: string }
   | { type: "turn_ended"; reason: string; status?: string; error?: string }
-  | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string }
+  | { type: "usage_recorded"; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string; feature?: string; latencyMs?: number; estimatedCost?: number }
+  | { type: "model_retrying"; attempt: number; maxAttempts: number; error: string }
   | { type: "model_stream_recorded"; turnSequence: number; model: string; deltas: Array<{ type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown>; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number }> }
   | { type: "taint_detected"; toolName: string; taintedParams: Array<{ param: string; source: string; origin: string }>; riskLevel: string; decision: string }
   | { type: "sandbox_executed"; command: string; exitCode: number; sandboxed: boolean; violations: Array<{ type: string; path?: string; host?: string; operation: string }> }
@@ -1392,7 +1396,23 @@ function streamModel(sessionID: string, client: StreamingProvider, model: string
     // session 已有多少条 model_stream_recorded，用真实序号。
     const turnSequence = (await eventStore.loadEvents(sessionID)).filter((event) => event.type === "model_stream_recorded").length
 
-    for await (const event of client.stream({ model, messages, feature: "main_agent", tools: schemas })) {
+    // 模型调用是整条任务链路上唯一没有超时与重试的环节：provider 挂起会把
+    // 整轮任务拖到只能按 Esc。这里加上有限自动重试——只在尚未产出任何事件
+    // （请求仍幂等）时重试可恢复错误（429/5xx/网络/超时），已开始生成后
+    // 的失败绝不重试，避免重复文本与重复工具执行。
+    const startedAt = Date.now()
+    const stream = streamWithRetry(
+      () => client.stream({ model, messages, feature: "main_agent", tools: schemas }),
+      isRetryableModelError,
+      {
+        maxAttempts: 3,
+        onRetry: (attempt, error) => {
+          void emitSessionEvent(sessionID, { type: "model_retrying", attempt, maxAttempts: 3, error: describeModelError(error) })
+        }
+      }
+    )
+
+    for await (const event of stream) {
       // 录制所有事件类型（text_delta/tool_call/usage/done）
       if (event.type === "text_delta") {
         recordedDeltas.push({ type: "text_delta", text: event.text })
@@ -1402,12 +1422,18 @@ function streamModel(sessionID: string, client: StreamingProvider, model: string
         yield event
       } else if (event.type === "usage") {
         recordedDeltas.push({ type: "usage", inputTokens: event.inputTokens, outputTokens: event.outputTokens, cachedInputTokens: event.cachedInputTokens })
+        // 成本日志：功能名/模型/token/耗时/估算成本全部落到事件日志，
+        // 用量页与事后审计都能回答"哪个功能烧了多少钱"。
+        // 未知模型没有可确认单价，宁可不估算也不显示编造数字。
+        const pricing = pricingForModel(model)
+        const usage = { inputTokens: event.inputTokens, cachedInputTokens: event.cachedInputTokens, outputTokens: event.outputTokens }
         await emitSessionEvent(sessionID, {
           type: "usage_recorded",
-          inputTokens: event.inputTokens,
-          cachedInputTokens: event.cachedInputTokens,
-          outputTokens: event.outputTokens,
-          model
+          ...usage,
+          model,
+          feature: "main_agent",
+          latencyMs: Date.now() - startedAt,
+          ...(pricing ? { estimatedCost: estimateUsageCost(pricing, usage) } : {})
         })
       } else if (event.type === "done") {
         recordedDeltas.push({ type: "done" })
@@ -1547,7 +1573,7 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       await emitSessionEvent(sessionID, { type: "turn_ended", reason: "cancelled", status: "cancelled" })
       return { text: "已取消当前任务。", status: "cancelled", messages: await eventStore.loadConversation(sessionID) }
     }
-    const message = redact(error instanceof Error ? error.message : String(error))
+    const message = redact(describeModelError(error))
     await emitSessionEvent(sessionID, { type: "turn_ended", reason: "error", error: message })
     throw new Error(message)
   } finally {
@@ -2305,6 +2331,7 @@ async function handle(request: Request): Promise<void> {
         "session.shadowEval",
         "terminal.open",
         "terminal.exec",
+        "skills.list",
         "task.enqueue",
         "task.list",
         "task.cancel",
@@ -2328,6 +2355,14 @@ async function handle(request: Request): Promise<void> {
   }
   if (request.method === "terminal.open") {
     respond(await openInteractiveTerminal(request))
+    return
+  }
+  if (request.method === "skills.list") {
+    // 供桌面端 Composer 的斜杠菜单使用：与运行时触发共用 loadSkills 扫描，
+    // 只透出名称/描述/来源，正文仍在触发时由 resolveSlashSkill 注入。
+    const projectPath = request.params?.projectPath?.trim() || "."
+    const skills = await loadSkills(projectPath).catch(() => [] as Skill[])
+    respond({ id: request.id, type: "response", ok: true, result: { skills: skills.map((skill) => ({ name: skill.name, description: skill.description, location: skill.location })) } })
     return
   }
   if (request.method === "terminal.exec") {

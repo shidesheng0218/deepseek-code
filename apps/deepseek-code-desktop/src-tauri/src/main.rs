@@ -53,6 +53,7 @@ struct UsageStats {
     daily_activity: Vec<u64>,
     daily_start: Option<String>,
     model_tokens: Vec<ModelTokens>,
+    estimated_cost: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -109,6 +110,10 @@ struct TerminalOpenRequest { session_id: String, project_path: String }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminalExecRequest { session_id: String, project_path: String, command: String }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsRequest { project_path: String }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -282,7 +287,7 @@ fn compute_usage_stats(days: Option<u32>) -> UsageStats {
     let mut stats = UsageStats {
         sessions: 0, messages: 0, total_tokens: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0,
         active_days: 0, current_streak: 0, longest_streak: 0, peak_hour: None, favorite_model: None,
-        daily_activity: Vec::new(), daily_start: None, model_tokens: Vec::new(),
+        daily_activity: Vec::new(), daily_start: None, model_tokens: Vec::new(), estimated_cost: 0.0,
     };
     let mut day_set = std::collections::BTreeSet::new();
     let mut daily: HashMap<chrono::NaiveDate, u64> = HashMap::new();
@@ -314,6 +319,8 @@ fn compute_usage_stats(days: Option<u32>) -> UsageStats {
                     stats.output_tokens += output;
                     stats.cached_tokens += number("cachedInputTokens");
                     stats.total_tokens += input + output;
+                    // 运行时只在模型价格可确认时写入 estimatedCost；未知模型保持缺省，不计入。
+                    stats.estimated_cost += payload.and_then(|value| value.get("estimatedCost")).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                     if let Some(model) = payload.and_then(|value| value.get("model")).and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
                         *models.entry(model.to_string()).or_default() += input + output;
                     }
@@ -501,6 +508,16 @@ fn exec_terminal(app: AppHandle, state: State<'_, RuntimeProcess>, request: Term
     Ok(id)
 }
 
+// skills.list uses the same request-id pattern as the terminal commands: the Composer's
+// slash menu needs to match this exact response frame, not whatever frame arrives next.
+#[tauri::command]
+fn list_skills(app: AppHandle, state: State<'_, RuntimeProcess>, request: SkillsRequest) -> Result<String, String> {
+    let id = format!("skills-{}", uuid_like());
+    let payload = serde_json::json!({ "id": id, "method": "skills.list", "params": { "projectPath": request.project_path } });
+    send_runtime_request(&app, &state, payload)?;
+    Ok(id)
+}
+
 fn send_runtime_request(app: &AppHandle, state: &RuntimeProcess, payload: serde_json::Value) -> Result<(), String> {
     ensure_runtime(app, state)?;
     let mut process = state.0.lock().map_err(|_| "runtime lock poisoned".to_string())?;
@@ -536,7 +553,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, usage_stats, load_session_history, run_agent, resolve_approval, cancel_session, resume_session, open_terminal, exec_terminal, check_for_update])
+        .invoke_handler(tauri::generate_handler![runtime_status, build_stamp, load_settings, save_settings, list_sessions, usage_stats, load_session_history, run_agent, resolve_approval, cancel_session, resume_session, open_terminal, exec_terminal, list_skills, check_for_update])
         .run(tauri::generate_context!())
         .expect("failed to run DeepSeek Code desktop application");
 }
@@ -626,7 +643,7 @@ mod tests {
         };
         let lines = [
             event(now, "turn_started", "{\"prompt\":\"修复登录问题\",\"projectPath\":\"/tmp/demo\"}"),
-            event(now, "usage_recorded", "{\"inputTokens\":100,\"outputTokens\":50,\"cachedInputTokens\":10,\"model\":\"deepseek-chat\"}"),
+            event(now, "usage_recorded", "{\"inputTokens\":100,\"outputTokens\":50,\"cachedInputTokens\":10,\"model\":\"deepseek-chat\",\"estimatedCost\":0.0001}"),
             event(now, "turn_ended", "{\"status\":\"completed\"}"),
             event(now, "turn_started", "{\"prompt\":\"第二个问题\"}"),
             event(old, "turn_started", "{\"prompt\":\"旧问题\"}"),
@@ -646,6 +663,7 @@ mod tests {
         assert!(all.current_streak >= 1);
         assert!(all.longest_streak >= 1);
         assert_eq!(all.peak_hour, Some(now.hour()));
+        assert!((all.estimated_cost - 0.0001).abs() < 1e-9);
 
         let recent = compute_usage_stats(Some(30));
         assert_eq!(recent.messages, 3);

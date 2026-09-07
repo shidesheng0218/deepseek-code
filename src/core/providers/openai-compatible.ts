@@ -1,3 +1,5 @@
+import { MODEL_STREAM_TIMEOUT_MS, ModelRequestError, httpError, mergedStreamSignal } from './model-errors';
+
 export interface AgentToolCall {
   id: string;
   name: string;
@@ -92,22 +94,35 @@ export class OpenAICompatibleClient {
   }
 
   async *stream(input: ChatRequestInput): AsyncGenerator<ModelEvent> {
-    const response = await this.fetchImpl(this.endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.options.apiKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream'
-      },
-      body: JSON.stringify(buildChatRequest(input)),
-      ...(this.options.signal ? { signal: this.options.signal } : {})
-    });
+    const { signal, isTimeout } = mergedStreamSignal(this.options.signal, MODEL_STREAM_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(this.endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.options.apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream'
+        },
+        body: JSON.stringify(buildChatRequest(input)),
+        signal
+      });
+    } catch (error) {
+      if (this.options.signal?.aborted) throw error; // 用户主动取消：原样传播，不包装、不重试
+      if (isTimeout()) throw new ModelRequestError(`Model request timed out after ${MODEL_STREAM_TIMEOUT_MS}ms`, 'timeout', true);
+      throw new ModelRequestError(error instanceof Error ? error.message : String(error), 'network_error', true);
+    }
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 500);
-      throw new Error(`Model request failed with ${response.status}: ${detail}`);
+      throw httpError(response.status, detail);
     }
     if (!response.body) throw new Error('Model response did not include a body');
-    yield* parseOpenAICompatibleSse(decodeResponseBody(response.body));
+    try {
+      yield* parseOpenAICompatibleSse(decodeResponseBody(response.body));
+    } catch (error) {
+      if (!this.options.signal?.aborted && isTimeout()) throw new ModelRequestError(`Model stream timed out after ${MODEL_STREAM_TIMEOUT_MS}ms`, 'timeout', true);
+      throw error;
+    }
   }
 }
 
@@ -172,7 +187,10 @@ export async function* parseOpenAICompatibleSse(chunks: Iterable<string> | Async
         const argumentsObject = JSON.parse(tool.argumentsText) as Record<string, unknown>;
         yield { type: 'tool_call', id: tool.id, name: tool.name, arguments: argumentsObject };
       } catch {
-        // Invalid partial tool arguments are ignored until the provider finishes them.
+        // flush 发生在流结束时，此时参数已完整；解析失败即真实损坏。
+        // 静默丢弃会让 executor 把"工具意图蒸发"当作正常完成收场，
+        // 必须显式失败，由上层以明确错误结束本轮（不执行任何不完整操作）。
+        throw new ModelRequestError(`Model returned malformed tool call arguments for "${tool.name}"`, 'malformed_tool_arguments', false);
       }
     }
   };

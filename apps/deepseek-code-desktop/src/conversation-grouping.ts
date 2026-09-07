@@ -2,7 +2,8 @@
 // React or touching Tauri's invoke/listen — these functions decide what the user
 // actually sees in the conversation timeline and session list.
 
-export type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string }
+export type ToolState = "running" | "done" | "failed"
+export type Message = { role: "user" | "assistant" | "tool" | "system"; text: string; kind?: string; tool?: string; state?: ToolState }
 export type SessionSummary = { sessionId: string; title: string; updatedAt: number; projectPath: string }
 
 export type ConversationItem = { key: string } & (

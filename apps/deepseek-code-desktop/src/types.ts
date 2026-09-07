@@ -1,0 +1,13 @@
+export type RuntimeStatus = { ready: boolean; version: string; detail?: string }
+export type Settings = { baseUrl: string; model: string; fastModel?: string; projectPath: string; apiKey: string; protocol: "openai-compatible" | "anthropic-messages" }
+export type UsageStats = { sessions: number; messages: number; totalTokens: number; inputTokens: number; outputTokens: number; cachedTokens: number; activeDays: number; currentStreak: number; longestStreak: number; peakHour: number | null; favoriteModel: string | null; dailyActivity: number[]; dailyStart: string | null; modelTokens: { model: string; tokens: number }[]; estimatedCost: number }
+export type RestoredMessage = { role: "user" | "assistant"; text: string }
+export type TerminalEntry = { sequence: number; command: string; stdout: string; stderr: string; exitCode: number; completedAt?: string }
+export type RuntimeFrame = { id: string; type: "event" | "response"; ok: boolean; sessionID?: string; event?: { type: string; id?: string; text?: string; tool?: string; risk?: string; kind?: string; error?: string; reason?: string; sequence?: number; command?: string; exitCode?: number; workerID?: string; workerType?: string; summary?: string; evidenceCount?: number; currentRunCount?: number; staleRunCount?: number; state?: string; reasons?: string[]; url?: string; ok?: boolean; consoleErrorCount?: number; networkCount?: number; repairSessionID?: string; runID?: number; commit?: string; status?: string; delivery?: string; hostID?: string; remoteTool?: string; indeterminate?: boolean; terminalID?: string; attached?: boolean; number?: number; body?: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; route?: string; modelTier?: string; responseContract?: string; attempt?: number; maxAttempts?: number; inputID?: string; preview?: string; name?: string; names?: string[]; warnings?: string[]; receiptID?: string; receiptPath?: string; logHash?: string }; result?: { text?: string; status?: string; opened?: boolean; entries?: TerminalEntry[]; ok?: boolean; sequence?: number; stdout?: string; stderr?: string; exitCode?: number; skills?: SkillInfo[] }; error?: string }
+export type Approval = { id: string; tool: string; risk: string; preview?: string }
+export type Usage = { input: number; output: number; cached: number }
+export type UpdateStatus = { available: boolean; version?: string; detail: string }
+export type SkillInfo = { name: string; description?: string; location?: "project" | "user" }
+
+// deepseek-chat 已于 2026-07-24 下线，新用户首次打开应用不该拿到一个已失效的默认模型名。
+export const defaultSettings: Settings = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-v4-flash", fastModel: "", projectPath: "", apiKey: "", protocol: "openai-compatible" }

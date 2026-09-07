@@ -102,7 +102,7 @@ brew install --cask shidesheng0218/tap/deepseek-code
 
 - Tauri 轻量工作区：Session、Conversation、Workspace 与 Runtime 状态。
 - Tauri 启动时恢复最近会话列表与已提交的用户/助手对话；工具中断不会伪装成完整回复。
-- 中文优先的 Session、计划、工具活动、Diff、Browser 和 Review 界面。
+- 中文优先的会话时间线、工具活动分组、审批卡片、共享终端与用量统计界面；Diff、Browser 和 Review 结果目前以时间线事件呈现，独立视图在迭代路线图中。
 - Plan / Manual / Accept Edits / Auto 四种权限模式。
 - 细粒度命令风险分类和审批决策。
 - Sidecar 的 JSONL Session Event Log：持久化对话、工具、审批、Browser 与 CI 证据；未完成工具会被 Delivery Gate 标记为需要关注。
@@ -110,7 +110,7 @@ brew install --cask shidesheng0218/tap/deepseek-code
 - 每次模型流记录输入、缓存输入和输出 Token；价格与路由策略仍在发布硬化范围内。
 - 工作区路径隔离、符号链接逃逸防护和行范围读取。
 - Git Worktree 服务：创建受管理的 `deepseek/<task>` 分支与独立工作树。
-- Provider 设置页：Base URL + API Key 开箱配置，并可显式选择 OpenAI-compatible / Anthropic Messages。
+- Provider 设置页：Base URL + API Key 开箱配置，并可显式选择 OpenAI-compatible / Anthropic Messages；内置 DeepSeek 官方、阿里云百炼（DashScope OpenAI 兼容模式）、Anthropic 官方三个一键预设，选中自动填好 Base URL、协议与建议模型名，其余 OpenAI-compatible 服务手动填 Base URL 即可接入。百炼模型的用量成本估算暂未收录官方计费（未查到可信来源前不编数字），会正常记录 Token 用量但不显示预估费用。
 - API Key 由 macOS Keychain 保存；工具事件、CI 日志和子会话提示在写入模型上下文前进行脱敏。
 - Agent IPC 执行闭环：模型流 → `ToolExecutionPipeline` 参数校验、风险/审批、超时与 `indeterminate` → 文件、Git、命令工具 → 脱敏事件回传。
 - 文件工具支持原子 Patch、乐观哈希、检查点恢复，以及目录/符号链接工作区隔离。

@@ -1,4 +1,5 @@
 import type { AgentToolCall, ModelEvent } from './openai-compatible';
+import { MODEL_STREAM_TIMEOUT_MS, ModelRequestError, httpError, mergedStreamSignal } from './model-errors';
 
 export interface AnthropicMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -117,20 +118,33 @@ export class AnthropicMessagesClient {
   }
 
   async *stream(input: AnthropicChatRequestInput): AsyncGenerator<ModelEvent> {
-    const response = await this.fetchImpl(this.endpoint, {
-      method: 'POST',
-      headers: {
-        'x-api-key': this.options.apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-        Accept: 'text/event-stream'
-      },
-      body: JSON.stringify(buildAnthropicMessagesRequest(input)),
-      ...(this.options.signal ? { signal: this.options.signal } : {})
-    });
-    if (!response.ok) throw new Error(`Model request failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    const { signal, isTimeout } = mergedStreamSignal(this.options.signal, MODEL_STREAM_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(this.endpoint, {
+        method: 'POST',
+        headers: {
+          'x-api-key': this.options.apiKey,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+          Accept: 'text/event-stream'
+        },
+        body: JSON.stringify(buildAnthropicMessagesRequest(input)),
+        signal
+      });
+    } catch (error) {
+      if (this.options.signal?.aborted) throw error; // 用户主动取消：原样传播，不包装、不重试
+      if (isTimeout()) throw new ModelRequestError(`Model request timed out after ${MODEL_STREAM_TIMEOUT_MS}ms`, 'timeout', true);
+      throw new ModelRequestError(error instanceof Error ? error.message : String(error), 'network_error', true);
+    }
+    if (!response.ok) throw httpError(response.status, (await response.text()).slice(0, 500));
     if (!response.body) throw new Error('Model response did not include a body');
-    yield* parseAnthropicMessagesSse(decodeResponseBody(response.body));
+    try {
+      yield* parseAnthropicMessagesSse(decodeResponseBody(response.body));
+    } catch (error) {
+      if (!this.options.signal?.aborted && isTimeout()) throw new ModelRequestError(`Model stream timed out after ${MODEL_STREAM_TIMEOUT_MS}ms`, 'timeout', true);
+      throw error;
+    }
   }
 }
 
@@ -183,7 +197,11 @@ export async function* parseAnthropicMessagesSse(chunks: Iterable<string> | Asyn
     if (!tool?.id || !tool.name) return;
     const input = tool.partialInput || tool.initialInput || '{}';
     try { yield { type: 'tool_call', id: tool.id, name: tool.name, arguments: JSON.parse(input) as Record<string, unknown> }; }
-    catch { /* Invalid partial tool input remains unavailable to the executor. */ }
+    catch {
+      // 与 OpenAI 兼容端一致：流结束时参数已完整，解析失败即真实损坏，
+      // 显式失败而不是让工具意图静默蒸发后被当作"正常完成"。
+      throw new ModelRequestError(`Model returned malformed tool call arguments for "${tool.name}"`, 'malformed_tool_arguments', false);
+    }
   };
 
   for await (const chunk of asAsync(chunks)) {
