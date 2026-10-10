@@ -5,7 +5,6 @@
   "description": "A local-first DeepSeek coding agent desktop application.",
   "license": "MIT",
   "type": "module",
-  "main": "dist/main/index.js",
   "bin": { "deepseek": "bin/deepseek.mjs" },
   "scripts": {
     "dev": "npm run dev:tauri",
@@ -19,43 +18,26 @@
     "bench:real": "node benchmarks/runner.mjs --real && node benchmarks/score.mjs",
     "bench:versus": "node benchmarks/versus/run.mjs",
     "bench:soak": "node benchmarks/soak.mjs",
-    "test": "vitest run tests && npm run test:sidecar",
-    "test:sidecar": "bash scripts/test-agent-runtime.sh && bash scripts/test-agent-approval.sh && bash scripts/test-agent-worker.sh && bash scripts/test-agent-terminal.sh && bash scripts/test-agent-cancel.sh && bash scripts/test-agent-verifier.sh && bash scripts/test-agent-verifier-keyword-coverage.sh && bash scripts/test-agent-turn-sequence.sh && bash scripts/test-agent-task-queue.sh && bash scripts/test-agent-task-queue-dependency.sh && bash scripts/test-agent-task-queue-cancel.sh",
-    "legacy:dev": "electron-vite dev",
-    "legacy:build": "npm run typecheck && electron-vite build",
-    "legacy:test": "vitest run",
-    "preview": "electron-vite preview",
-    "test:watch": "vitest",
+    "test": "vitest run && npm run test:sidecar",
+    "test:sidecar": "bash scripts/test-agent-runtime.sh && bash scripts/test-agent-approval.sh && bash scripts/test-agent-worker.sh && bash scripts/test-agent-terminal.sh && bash scripts/test-agent-cancel.sh && bash scripts/test-agent-verifier.sh && bash scripts/test-agent-verifier-keyword-coverage.sh && bash scripts/test-agent-turn-sequence.sh && bash scripts/test-agent-task-queue.sh && bash scripts/test-agent-task-queue-dependency.sh && bash scripts/test-agent-task-queue-cancel.sh && bash scripts/test-agent-resilience.sh",
     "test:e2e": "playwright test -c e2e/playwright.config.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0"
   },
-  "dependencies": {
-    "@monaco-editor/react": "^4.7.0",
-    "lucide-react": "^0.536.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "zod": "^4.0.0",
-    "zustand": "^5.0.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@eslint/js": "^9.0.0",
     "@playwright/test": "^1.62.1",
-    "@testing-library/jest-dom": "^6.0.0",
-    "@testing-library/react": "^16.0.0",
     "@types/node": "^24.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "@vitejs/plugin-react": "^5.0.0",
-    "electron": "^43.3.0",
-    "electron-vite": "^5.0.0",
     "eslint": "^9.0.0",
     "eslint-plugin-react-hooks": "^5.0.0",
     "eslint-plugin-react-refresh": "^0.4.0",
-    "jsdom": "^26.0.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.0.0",
     "vite": "^7.3.6",
     "vitest": "^4.1.10"
+  },
+  "optionalDependencies": {
+    "@oven/bun-darwin-aarch64": "1.3.14"
   }
 }

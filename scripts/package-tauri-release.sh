@@ -25,10 +25,12 @@ if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
   if [[ -f "$updater_key" ]]; then
     export TAURI_SIGNING_PRIVATE_KEY_PATH="$updater_key"
     export TAURI_SIGNING_PRIVATE_KEY="$(cat "$updater_key")"
-    export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-deepseek-updater-2026}"
   fi
-else
-  export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-deepseek-updater-2026}"
+fi
+if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" && -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]; then
+  echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required when a signing key is present." >&2
+  echo "Set it in the environment (CI: GitHub Secrets; local: export before running)." >&2
+  exit 1
 fi
 (cd "$desktop" && ./node_modules/.bin/tauri build --config "{\"version\":\"$version\"}")
 test -f "$source_dmg"

@@ -120,9 +120,9 @@ async function assertReplayInvariant(sidecar, sessionRoot, sessionID) {
   const { recordedTurns } = assertLogInvariants(sessionRoot, sessionID);
   if (recordedTurns.length === 0) return; // 崩溃会话可能无录制
 
-  // 回放验证：mode=model 应成功构造 RecordingProvider
+  // 回放验证：mode=model 应成功回放录制流
   try {
-    const replay = await sidecar.send('session.replay', { sessionID, mode: 'model' }, 10_000);
+    const replay = await sidecar.send('session.replay', { sessionID, replayMode: 'model' }, 10_000);
     check(replay.ok === true, `${sessionID}: replay mode=model 失败`);
     check(replay.result?.mode === 'model', `${sessionID}: replay 未返回 model 模式结果`);
     check(replay.result?.recordedTurns === recordedTurns.length, `${sessionID}: replay 录制 turn 数不匹配（期望 ${recordedTurns.length}，实际 ${replay.result?.recordedTurns ?? 0}）`);

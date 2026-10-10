@@ -5,7 +5,7 @@
  * 对比不同上下文策略的真实效果。
  *
  * 重要边界（读代码前必须知道）：
- * RecordingProvider 只能重放已经录制好的模型输出——给它换一套系统指令、
+ * 录制回放只能重放已经录制好的模型输出——给它换一套系统指令、
  * 换一套工具顺序，它吐出的 delta 序列不会变，因为模型从未真的被重新调用过。
  * 所以"指令模板"“工具顺序"“模型档位"这三类变体，靠纯回放**无法**产生任何
  * 真实差异——之前的版本把这几类也塞进对比表、编出几乎相同的数字，那是假的。
@@ -59,7 +59,7 @@ const VARIANT_KINDS_REQUIRING_LIVE_MODEL = ['instructionTemplate', 'toolOrder', 
 function whyNotEvaluable(variant: StrategyVariant): string | undefined {
   const blocking = VARIANT_KINDS_REQUIRING_LIVE_MODEL.find((key) => variant.modifications[key] !== undefined);
   if (!blocking) return undefined;
-  return `修改 ${blocking} 需要真实模型调用产生不同的输出；RecordingProvider 只回放已录制的 delta，纯回放下无法验证这类变体`;
+  return `修改 ${blocking} 需要真实模型调用产生不同的输出；录制回放只回放已录制的 delta，纯回放下无法验证这类变体`;
 }
 
 /**

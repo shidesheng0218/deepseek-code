@@ -24,12 +24,12 @@
 |---|---|---|
 | **交付回执**（哈希链 + 离线验证） | ✅ 已验证 | `receipt verify` 命令真实做离线重算比对（logHash/gate/evidence 三项独立校验） |
 | **Verifier Worker**（对抗验证） | ✅ 已验证（主干） | 独立 git worktree 中 apply diff、重跑测试，按 pass/refuted/inconclusive 返回反驳证据。"diff 是否覆盖需求"这一子项仍是 TODO |
-| **macOS 沙箱**（Exec Policy + sandbox-exec） | ✅ 已验证 | profile 生成、执行、违规解析完整；**Linux 沙箱未实现**，调用直接抛错 |
-| **确定性回放**（session.replay） | 🧪 实验性 | `RecordingProvider` 已构造但从未被实际执行；当前"比对"只是对 tool_call 数量做简单计数，不是真正的逐字节重放验证 |
-| **Tournament 锦标赛** | 🧪 实验性 | 假设生成目前是固定模板（不读 prompt 内容），且两条"假设分支"实际执行的是同一个任务，尚不构成真正的多假设竞争。裁决规则本身是真实计算的 |
-| **代码图谱** | 🧪 实验性 | 符号提取是正则而非 AST；索引方法已写好但**从未被任何调用路径触发**，图谱查询工具目前会返回空结果 |
+| **macOS 沙箱**（Exec Policy + sandbox-exec） | ✅ 已验证 | profile 生成、执行、违规解析完整。Linux 走 bubblewrap mount namespace（未装 bwrap 时如实降级为无沙箱，标 `sandboxed: false`）；Linux 路径未在真实 Linux 环境验证过，`violations` 恒为空 |
+| **确定性回放**（session.replay） | 🧪 实验性 | 回放由 sidecar 内联实现：`replayMode: "model"` 用录制流重放、`"verify"` 做校验，两条路径都会真实执行。但一致性比对仍限于工具调用计数级，不是真正的逐字节重放验证 |
+| **Tournament 锦标赛** | 🧪 实验性 | 假设生成已接入真实模型（调用失败降级为固定模板并标 `degraded`）；各分支在独立 git worktree 中执行拼入了各自方向的修复，不再跑同一任务。裁决仍是纯规则打分，尚非独立模型裁决 |
+| **代码图谱** | 🧪 实验性 | 索引已接入调用链：打开项目后台自动建索引、`apply_patch` 后增量更新。但符号提取仍是正则（只认行首 `export`）而非 AST，调用边为文件级粗粒度 |
 | **污点追踪** | 🧪 实验性 | 检测逻辑主要是 prompt-injection 正则匹配；数据流传播方法未被调用，调用点传入固定空数组，多数判断分支不可达 |
-| **Shadow Eval** | 🧪 实验性 | 各策略变体目前统计的是同一份录制数据，变体修改未被实际应用，输出的"对比结果"不反映真实差异 |
+| **Shadow Eval** | 🧪 实验性 | `contextWindowSize` 变体用不同预算真实重跑上下文裁剪并测字符数；其余变体（指令模板 / 工具顺序 / 模型档位）标 `evaluable: false`，不假装测过 |
 
 如果你想验证某项能力的真实状态，直接读对应源码比读这张表更可靠：`src/core/delivery-receipt.ts`、`src/core/arena.ts`、`src/core/code-graph.ts`、`src/core/taint-tracking.ts`、`src/core/shadow-eval.ts`、`src/core/sandbox.ts`。
 
