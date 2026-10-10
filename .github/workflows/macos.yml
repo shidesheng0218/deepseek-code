@@ -27,6 +27,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Secret scan
+        run: bash scripts/check-no-secrets.sh
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -62,13 +65,17 @@ jobs:
       - name: Install bundled Chromium runtime
         run: npx playwright install chromium
 
-      - name: Run Agent Runtime and desktop integration tests
-        run: |
-          npx vitest run tests
-          npm run test:sidecar
+      - name: Typecheck (root config covers the agent runtime sidecar)
+        run: npm run typecheck
 
-      - name: Run Swift migration checks
+      - name: Lint
+        run: npm run lint
+
+      - name: Run unit and sidecar integration tests
         run: npm test
+
+      - name: Run mock benchmark gate
+        run: npm run bench
 
       - name: Build DeepSeek Code Tauri DMG
         env:

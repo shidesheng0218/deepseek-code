@@ -120,7 +120,7 @@ nav button.active .icon, nav button:hover .icon { color: currentColor; }
 
 .privacy { margin-top: auto; padding: 10px; color: var(--ink-faint); font-size: 11px; line-height: 1.5; }
 
-.workspace { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 20px; padding: 26px clamp(32px, 8vw, 100px) 20px; background: var(--bg-gradient); }
+.workspace { display: flex; flex-direction: column; min-height: 100vh; min-width: 0; gap: 20px; padding: 26px clamp(32px, 8vw, 100px) 20px; overflow: hidden; background: var(--bg-gradient); }
 header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 header p { margin: 0 0 6px; color: var(--ink-faint); font-size: 11px; letter-spacing: .09em; font-weight: 600; text-transform: uppercase; }
 h1, h2 { margin: 0; }
@@ -131,7 +131,7 @@ h1 { font-size: 27px; color: var(--ink); font-weight: 700; letter-spacing: -.015
 .notice { max-width: 900px; padding: 10px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5; }
 .notice.error, .message.error { color: var(--danger-ink); background: var(--danger-bg); border: 1px solid var(--danger-border); }
 
-.conversation { min-height: 0; max-width: 900px; overflow: auto; padding-right: 8px; display: grid; align-content: start; gap: 12px; }
+.conversation { flex: 1 1 auto; min-height: 0; max-width: 900px; overflow: auto; padding-right: 8px; display: grid; align-content: start; gap: 12px; }
 .message { max-width: 84%; padding: 10px 15px; border-radius: 14px; white-space: pre-wrap; line-height: 1.6; font-size: 14px; }
 .message-label { display: block; margin-bottom: 4px; color: var(--ink-faint); font-size: 10px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
 .message.user { justify-self: end; color: #ffffff; background: linear-gradient(150deg, var(--accent), var(--accent-2)); box-shadow: var(--shadow-accent); border-radius: 14px 14px 4px 14px; }
@@ -148,7 +148,7 @@ h1 { font-size: 27px; color: var(--ink); font-weight: 700; letter-spacing: -.015
 .setup-hint { margin: 0; max-width: 900px; color: var(--ink-dim); font-size: 13px; }
 .setup-link { border: 0; padding: 0 2px; color: var(--accent); background: transparent; text-decoration: underline; text-underline-offset: 3px; }
 
-.composer { max-width: 900px; border: 1px solid var(--border-soft); border-radius: 14px; background: var(--surface); overflow: hidden; box-shadow: var(--shadow-2); }
+.composer { position: sticky; bottom: 0; z-index: 2; flex: 0 0 auto; max-width: 900px; border: 1px solid var(--border-soft); border-radius: 14px; background: var(--surface); overflow: hidden; box-shadow: var(--shadow-2); }
 .composer textarea { display: block; width: 100%; min-height: 72px; padding: 14px 16px; border: 0; outline: 0; resize: vertical; color: var(--ink); background: transparent; font-size: 14px; line-height: 1.55; }
 .composer footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 13px; border-top: 1px solid var(--border-soft); color: var(--ink-faint); font-size: 11px; }
 .composer button { display: flex; align-items: center; gap: 6px; border: 0; border-radius: 9px; padding: 7px 15px; background: linear-gradient(150deg, var(--accent), var(--accent-2)); color: #ffffff; font-weight: 550; font-size: 13px; box-shadow: var(--shadow-accent); }
@@ -192,10 +192,7 @@ h1 { font-size: 27px; color: var(--ink); font-weight: 700; letter-spacing: -.015
 .approval .allow { border-color: var(--success-strong-border); color: var(--success-strong-ink); background: var(--success-strong-bg); }
 .approval .allow:hover { background: var(--success-bg); }
 
-.usage-bar { display: flex; align-items: center; gap: 14px; max-width: 900px; padding: 7px 13px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface); color: var(--ink-dim); font-size: 11px; box-shadow: var(--shadow-1); }
-.usage-bar .route-chip { padding: 2px 9px; border-radius: 99px; color: var(--accent); background: var(--accent-soft); font-size: 10px; font-weight: 600; }
-
-.usage-view { min-height: 0; overflow: auto; padding-right: 8px; }
+.usage-view { flex: 1 1 auto; min-height: 0; overflow: auto; padding-right: 8px; }
 .stats-empty { max-width: 900px; color: var(--ink-dim); font-size: 13px; }
 
 .stats-card { max-width: 900px; padding: 20px 22px; border: 1px solid var(--border-soft); border-radius: 16px; background: var(--surface); display: grid; gap: 16px; box-shadow: var(--shadow-2); }
@@ -251,7 +248,7 @@ h1 { font-size: 27px; color: var(--ink); font-weight: 700; letter-spacing: -.015
 .risk-badge.risk-l3, .risk-badge.risk-l4 { color: var(--danger-ink); background: var(--danger-bg); border: 1px solid var(--danger-border); }
 .approval-preview { display: block; max-height: 120px; overflow: auto; padding: 9px 11px; border: 1px solid var(--warning-border); border-radius: 8px; color: var(--warning-ink); background: var(--warning-preview-bg); font-size: 11px; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, monospace; }
 
-.terminal-panel { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; gap: 10px; }
+.terminal-panel { flex: 1 1 auto; display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; gap: 10px; }
 .terminal-connect { justify-self: start; border: 1px solid var(--border-soft); border-radius: 11px; padding: 11px 17px; background: var(--surface); color: var(--ink-strong); font-size: 13px; box-shadow: var(--shadow-1); }
 .terminal-connect:hover { border-color: var(--hover-border-accent); color: var(--accent); box-shadow: var(--shadow-2); }
 .terminal-output { min-height: 0; overflow: auto; padding: 14px 16px; border-radius: 14px; background: #171b2c; color: #e2e8f0; font-family: ui-monospace, "SF Mono", monospace; font-size: 12.5px; line-height: 1.6; box-shadow: var(--shadow-2); }
@@ -303,7 +300,6 @@ h1 { font-size: 27px; color: var(--ink); font-weight: 700; letter-spacing: -.015
 .tool-group-compact { color: var(--ink-faint); font-size: 11px; padding: 2px 4px; }
 
 /* Slash command menu */
-.composer { position: relative; }
 .slash-menu { position: absolute; left: 10px; right: 10px; bottom: 100%; margin-bottom: 6px; display: grid; gap: 2px; max-height: 260px; overflow: auto; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow-3); z-index: 5; }
 .slash-menu button { display: flex; align-items: baseline; gap: 8px; border: 0; border-radius: 8px; padding: 7px 9px; background: transparent; color: var(--ink); text-align: left; font-size: 13px; }
 .slash-menu button.active { background: var(--accent-soft); }

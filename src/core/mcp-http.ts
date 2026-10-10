@@ -65,10 +65,26 @@ export class MCPStreamableHTTPClient {
     return Array.isArray(result.resources) ? result.resources.filter((value): value is MCPResourceDefinition => Boolean(value && typeof value === 'object' && typeof (value as MCPResourceDefinition).uri === 'string')).slice(0, 256) : [];
   }
 
+  async readResource(uri: string): Promise<unknown> {
+    if (!uri.trim()) throw new Error('MCP resource URI is required');
+    await this.start();
+    const result = await this.request('resources/read', { uri });
+    if (JSON.stringify(result).length > (this.config.maxOutputBytes ?? 200_000)) throw new Error('MCP resource output exceeded limit');
+    return result;
+  }
+
   async listPrompts(): Promise<MCPPromptDefinition[]> {
     await this.start();
     const result = await this.request('prompts/list', {}) as { prompts?: unknown };
     return Array.isArray(result.prompts) ? result.prompts.filter((value): value is MCPPromptDefinition => Boolean(value && typeof value === 'object' && typeof (value as MCPPromptDefinition).name === 'string')).slice(0, 128) : [];
+  }
+
+  async getPrompt(name: string, argumentsValue: Record<string, unknown> = {}): Promise<unknown> {
+    if (!name.trim()) throw new Error('MCP prompt name is required');
+    await this.start();
+    const result = await this.request('prompts/get', { name, arguments: argumentsValue });
+    if (JSON.stringify(result).length > (this.config.maxOutputBytes ?? 200_000)) throw new Error('MCP prompt output exceeded limit');
+    return result;
   }
 
   async callTool(name: string, argumentsValue: Record<string, unknown>): Promise<unknown> {

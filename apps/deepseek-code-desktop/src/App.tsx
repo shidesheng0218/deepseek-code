@@ -3,8 +3,8 @@ import { listen } from "@tauri-apps/api/event"
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { canSubmitTask, shouldRenderFrame } from "./interaction-policy"
-import type { Message, SessionSummary } from "./conversation-grouping"
-import { defaultSettings, type Approval, type RestoredMessage, type RuntimeFrame, type RuntimeStatus, type Settings, type SkillInfo, type Usage, type UsageStats } from "./types"
+import { appendAssistantStream, reconcileFinalAssistantResponse, type Message, type SessionSummary } from "./conversation-grouping"
+import { defaultSettings, type Approval, type RestoredMessage, type RuntimeFrame, type RuntimeStatus, type Settings, type SkillInfo, type UsageStats } from "./types"
 import { applyTheme, loadThemePreference, saveThemePreference, watchSystemTheme, type ThemePreference } from "./theme"
 import { waitForFrame } from "./runtime-frames"
 import { Composer } from "./components/Composer"
@@ -40,8 +40,6 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false)
   const [sessionID, setSessionID] = useState(initialSessionID)
   const [sessions, setSessions] = useState<SessionSummary[]>([])
-  const [usage, setUsage] = useState<Usage>({ input: 0, output: 0, cached: 0 })
-  const [currentRoute, setCurrentRoute] = useState<string>("")
   const [stats, setStats] = useState<UsageStats | null>(null)
   const [statsRange, setStatsRange] = useState<StatRangeKey>("all")
   const [view, setView] = useState<ViewKey>("chat")
@@ -176,10 +174,7 @@ export function App() {
       if (frame.sessionID && frame.sessionID !== sessionID) return
       if (!shouldRenderFrame(frame.id, seenFrameIDs.current)) return
       if (frame.type === "response") {
-        if (frame.result?.text) setMessages((current) => {
-          const last = current[current.length - 1]
-          return last?.role === "assistant" && last.text === frame.result?.text ? current : [...current, { role: "assistant", text: frame.result?.text ?? "" }]
-        })
+        if (frame.result?.text) setMessages((current) => reconcileFinalAssistantResponse(current, frame.result?.text ?? ""))
         if (!frame.ok) setMessages((current) => [...current, { role: "system", text: frame.error ?? "任务执行失败", kind: "error" }])
         setBusy(false)
         void refreshSessions()
@@ -188,11 +183,7 @@ export function App() {
       const runtimeEvent = frame.event
       if (!runtimeEvent) return
       if (runtimeEvent.type === "assistant_text" && runtimeEvent.text) {
-        setMessages((current) => {
-          const last = current[current.length - 1]
-          if (last?.role === "assistant" && last.kind === "stream") return [...current.slice(0, -1), { ...last, text: last.text + runtimeEvent.text }]
-          return [...current, { role: "assistant", text: runtimeEvent.text ?? "", kind: "stream" }]
-        })
+        setMessages((current) => appendAssistantStream(current, runtimeEvent.text ?? ""))
       } else if (runtimeEvent.type === "tool_requested" || runtimeEvent.type === "tool_started") {
         setMessages((current) => [...current, { role: "tool", text: `${runtimeEvent.type === "tool_started" ? "执行" : "准备"} ${runtimeEvent.tool ?? "工具"}…`, kind: runtimeEvent.type }])
       } else if (runtimeEvent.type === "tool_completed") {
@@ -238,12 +229,8 @@ export function App() {
       } else if (runtimeEvent.type === "extension_loaded") {
         const warnings = runtimeEvent.warnings?.length ? `（${runtimeEvent.warnings.length} 个警告）` : ""
         if (runtimeEvent.names?.length || warnings) setMessages((current) => [...current, { role: "tool", text: `扩展已加载：${runtimeEvent.names?.join("、") || "无"}${warnings}`, kind: runtimeEvent.type }])
-      } else if (runtimeEvent.type === "usage_recorded") {
-        setUsage((current) => ({ input: current.input + (runtimeEvent.inputTokens ?? 0), output: current.output + (runtimeEvent.outputTokens ?? 0), cached: current.cached + (runtimeEvent.cachedInputTokens ?? 0) }))
       } else if (runtimeEvent.type === "model_retrying") {
         setMessages((current) => [...current, { role: "tool", text: `模型请求失败，正在自动重试（第 ${runtimeEvent.attempt ?? "?"}/${runtimeEvent.maxAttempts ?? 3} 次）：${runtimeEvent.error ?? ""}`, kind: runtimeEvent.type }])
-      } else if (runtimeEvent.type === "decision_made") {
-        setCurrentRoute(runtimeEvent.route ?? "")
       } else if (runtimeEvent.type === "delivery_evaluated") {
         const label: Record<string, string> = { delivered: "已交付", handoffReady: "待交接", needsRepair: "需要修复", needsAttention: "需要关注" }
         setMessages((current) => [...current, { role: "tool", text: `交付门禁：${label[runtimeEvent.state ?? ""] ?? runtimeEvent.state}${runtimeEvent.reasons?.length ? ` · ${runtimeEvent.reasons.join(" ")}` : ""}`, kind: runtimeEvent.type }])
@@ -321,7 +308,6 @@ export function App() {
     />
     <section className="workspace">
       <header data-tauri-drag-region><div><p>DEEPSEEK CODE / LOCAL AGENT</p><h1>{headline}</h1></div><div className="header-side">{view === "chat" && <nav className="density-switch" aria-label="视图密度">{([["summary", "简洁"], ["normal", "标准"], ["verbose", "详细"]] as const).map(([key, label]) => <button key={key} type="button" className={density === key ? "active" : ""} onClick={() => setDensity(key)}>{label}</button>)}</nav>}<span className={runtime.ready ? "runtime ready" : "runtime"}>{runtime.ready ? `● ${runtime.version}` : "○ Runtime 不可用"}<small className="build-stamp"> · Build {buildStamp}</small></span></div></header>
-      {(usage.input > 0 || usage.output > 0 || currentRoute) && <div className="usage-bar">{currentRoute && <span className="route-chip">{currentRoute}</span>}<span>输入 {usage.input.toLocaleString()}{usage.cached > 0 ? `（缓存 ${usage.cached.toLocaleString()}）` : ""}</span><span>输出 {usage.output.toLocaleString()}</span><span>模型 {settings.model}{settings.fastModel ? ` · 快速 ${settings.fastModel}` : ""}</span></div>}
       {runtime.detail && <div className="notice error">Runtime: {runtime.detail}</div>}
       {view === "terminal" && <TerminalPanel sessionID={sessionID} projectPath={settings.projectPath} onRequireProject={() => setShowSettings(true)} />}
       {view === "usage" && <div className="usage-view"><StatsPanel stats={stats} range={statsRange} onRangeChange={changeStatsRange} /></div>}

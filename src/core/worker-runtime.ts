@@ -2,7 +2,6 @@ import { readFile, readdir, realpath } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createHash } from 'node:crypto';
 
 export type WorkerType = 'explore' | 'review' | 'research' | 'ci' | 'verify';
 

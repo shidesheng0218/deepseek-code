@@ -191,6 +191,6 @@ writeFileSync(join(bugsDir, 'results.json'), JSON.stringify(results, null, 2));
 console.log(`\n详细结果已写入: benchmarks/seeded-bugs/results.json`);
 
 // 清理临时目录
-try { rmSync(sessionRoot, { recursive: true, force: true }); } catch {}
+try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* 清理失败不影响退出码 */ }
 
 process.exit(passed_threshold ? 0 : 1);

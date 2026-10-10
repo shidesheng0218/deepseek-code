@@ -147,7 +147,7 @@ for (const bug of hardBugs) {
   writeFileSync(join(projectPath, bug.testFile), bug.testCode);
 
   try {
-    const response = await sidecar.send('session.run', {
+    await sidecar.send('session.run', {
       sessionID,
       projectPath,
       prompt: bug.fixPrompt,
@@ -244,6 +244,6 @@ writeFileSync(join(root, 'benchmarks', 'arena-comparison.json'), JSON.stringify(
 console.log(`\n详细结果已写入: benchmarks/arena-comparison.json`);
 
 // 清理
-try { rmSync(sessionRoot, { recursive: true, force: true }); } catch {}
+try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* 清理失败不影响退出码 */ }
 
 process.exit(passed ? 0 : 1);

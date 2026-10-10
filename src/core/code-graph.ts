@@ -61,7 +61,7 @@ export class CodeGraphService {
    * Phase 2 v2：正则提取符号（函数、类、接口、类型）
    */
   async indexWorkspace(projectPath: string): Promise<{ symbolCount: number; files: number }> {
-    const { readdir, readFile, stat } = await import('node:fs/promises');
+    const { readdir } = await import('node:fs/promises');
     const { join } = await import('node:path');
 
     // 1. 递归找到所有 .ts/.tsx/.js/.jsx 文件（排除 node_modules、dist、build）

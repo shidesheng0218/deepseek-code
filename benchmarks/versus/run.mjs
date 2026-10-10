@@ -108,7 +108,7 @@ async function runMatrix({ tasks, harnessNames, config, runs, runDir }) {
           if (isComplete) {
             existingTranscripts.add(file);
           }
-        } catch {}
+        } catch { /* 单个 transcript 不可解析时跳过，不影响其它文件 */ }
       }
     }
     console.log(`○ 发现有效 transcript：${existingTranscripts.size} 个`);

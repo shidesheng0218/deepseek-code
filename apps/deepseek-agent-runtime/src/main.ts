@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { execFile as execFileCallback, spawn } from "node:child_process"
 import { createConnection, createServer, type Socket } from "node:net"
 import { promisify } from "node:util"
+import { createHash } from "node:crypto"
 import { AgentExecutor, type AgentExecutorEvent, type AgentMessage, type ApprovedToolCall } from "../../../src/core/agent-executor"
 import { tmpdir } from "node:os"
 import type { ToolDefinition } from "../../../src/core/tool-execution-pipeline"
@@ -33,15 +34,15 @@ import { evaluateDeliveryGate } from "../../../src/core/delivery-gate"
 import { buildDeliveryReceipt } from "../../../src/core/delivery-receipt"
 import { collectBrowserEvidence } from "../../../src/core/browser-evidence"
 import { localChromiumLauncher } from "../../../src/core/playwright-launcher"
-import { classifyCIFailureLog } from "../../../src/core/ci-log-classifier"
+import { classifyCIFailureLog, type CIFailureKind } from "../../../src/core/ci-log-classifier"
 import { redactSecrets } from "../../../src/core/secret-redactor"
 import { createCIRepairSession, type CIRepairSession } from "../../../src/core/ci-repair-session"
 import { CIRepairQueue } from "../../../src/core/ci-repair-queue"
-import { TournamentOrchestrator, type Tournament, type Hypothesis, type JudgeInput } from "../../../src/core/arena"
-import { codeGraph, type ImpactAnalysis } from "../../../src/core/code-graph"
+import { TournamentOrchestrator, type Hypothesis, type JudgeInput } from "../../../src/core/arena"
+import { codeGraph } from "../../../src/core/code-graph"
 import { taintTracker } from "../../../src/core/taint-tracking"
 import { PolicyEngine, defaultPolicy } from "../../../src/core/exec-policy"
-import { shadowEvaluator, ShadowEvaluator } from "../../../src/core/shadow-eval"
+import { shadowEvaluator, ShadowEvaluator, type StrategyVariant } from "../../../src/core/shadow-eval"
 import { sandboxService } from "../../../src/core/sandbox"
 import { sessionCleaner, type DisposableResource, type SessionResourceRegistry } from "../../../src/core/memory-monitor"
 import { openProjection, type Projection } from "../../../src/core/session-projection"
@@ -61,15 +62,17 @@ type AgentRunParams = {
   baseURL: string
   apiKey: string
   model: string
-  protocol?: ProviderProtocol
-  mode?: AgentMode
-  fastModel?: string
+  // 可选字段显式带上 | undefined：这些凭据对象在多个地方被"原样转发"，
+  // exactOptionalPropertyTypes 下不允许把 undefined 赋给未标注的可选属性。
+  protocol?: ProviderProtocol | undefined
+  mode?: AgentMode | undefined
+  fastModel?: string | undefined
 }
 type ProviderProtocol = "openai-compatible" | "anthropic-messages"
 
 type Request = {
   id: string
-  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover" | "session.fork" | "session.branches" | "session.replay" | "session.arena" | "session.shadowEval" | "terminal.open" | "terminal.exec" | "task.enqueue" | "task.list" | "task.cancel"
+  method: "health" | "session.enqueue" | "session.run" | "session.resolveApproval" | "session.cancel" | "session.recover" | "session.fork" | "session.branches" | "session.replay" | "session.arena" | "session.shadowEval" | "terminal.open" | "terminal.exec" | "skills.list" | "task.enqueue" | "task.list" | "task.cancel"
   params?: Partial<AgentRunParams> & {
     text?: string
     approvalID?: string
@@ -83,10 +86,13 @@ type Request = {
     ticketID?: string
     priority?: number
     blockedBy?: string[]
+    /** session.replay 的回放模式。故意不复用 params.mode——那个字段是 AgentMode，
+     *  "model"（用录制流重放）不是合法的 AgentMode，混用会让回放分支永远走不到。 */
+    replayMode?: "model" | "verify"
   }
 }
 
-type Response = { id: string; type: "response"; ok: boolean; sessionID?: string; result?: unknown; error?: string }
+type Response = { id: string; type: "response"; ok: boolean; sessionID?: string | undefined; result?: unknown; error?: string }
 type RuntimeEventFrame = {
   id: string
   type: "event"
@@ -96,9 +102,11 @@ type RuntimeEventFrame = {
 }
 type OutputFrame = Response | RuntimeEventFrame
 type RunRequest = { id: string; params: AgentRunParams; repair?: CIRepairSession }
-type RepairRuntimeConfig = Pick<AgentRunParams, "baseURL" | "apiKey" | "model" | "protocol" | "mode">
+// protocol/mode 显式带上 | undefined：调用方常常是在"原样转发"可选参数，
+// exactOptionalPropertyTypes 下不允许把 undefined 赋给可选属性。
+type RepairRuntimeConfig = Pick<AgentRunParams, "baseURL" | "apiKey" | "model"> & { protocol?: ProviderProtocol | undefined; mode?: AgentMode | undefined }
 type CIRepairLineage = Pick<CIRepairSession, "sessionID" | "parentSessionID" | "runID" | "commit" | "failureKind" | "pullRequest">
-type ExecuteResult = { text: string; status: string; messages: AgentMessage[]; delivery?: string; repairLineage?: CIRepairLineage }
+type ExecuteResult = { text: string; status: string; messages: AgentMessage[]; delivery?: string | undefined; repairLineage?: CIRepairLineage | undefined }
 type RuntimeEvent =
   | AgentExecutorEvent
   | { type: "turn_started"; prompt: string; projectPath?: string }
@@ -131,7 +139,7 @@ type RuntimeEvent =
   | { type: "ci_failure_classified"; runID: number; kind: string; summary: string }
   | { type: "ci_repair_session_created"; repairSessionID: string; runID: number; commit: string; kind: string; summary: string }
   | { type: "ci_repair_session_started"; repairSessionID: string; runID: number; commit: string }
-  | { type: "ci_repair_session_completed"; repairSessionID: string; runID: number; status: string; delivery?: string; summary: string }
+  | { type: "ci_repair_session_completed"; repairSessionID: string; runID: number; status: string; delivery?: string | undefined; summary: string }
   | { type: "ci_repair_session_failed"; repairSessionID: string; runID: number; error: string }
   | { type: "ci_repair_pr_update_ready"; repairSessionID: string; number: number; body: string }
   | { type: "ssh_completed"; hostID: string; remoteTool: string; ok: boolean; indeterminate: boolean }
@@ -148,7 +156,9 @@ type RuntimeEvent =
   | { type: "extension_loaded"; names: string[]; warnings: string[] }
 type PendingApproval = ApprovedToolCall & { approvalID: string; risk: string }
 
-const toolSchemas = [
+// 显式标注为 ToolSchema[]：不加注解时字面量的 type 会放宽成 string，
+// 与 AgentExecutor/Provider 期望的 "function" 判别式不兼容。
+const toolSchemas: ToolSchema[] = [
   { type: "function", function: { name: "list_directory", description: "列出工作区目录", parameters: { type: "object", properties: { path: { type: "string" } }, required: [] } } },
   { type: "function", function: { name: "search_workspace", description: "在工作区搜索文本", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "read_file", description: "读取工作区文件", parameters: { type: "object", properties: { path: { type: "string" }, startLine: { type: "number" }, maxLines: { type: "number" } }, required: ["path"] } } },
@@ -206,6 +216,13 @@ function instructionsForDecision(projectPath: string, prompt: string): Promise<s
 }
 
 function redact(value: string): string { return redactSecrets(value) }
+
+/** 事件日志里的 failureKind 是历史字符串；只有落回已知集合才可信。
+ *  认不出来时按 classifyCIFailureLog 的默认归类 'code' 处理（未分类）。 */
+const CI_FAILURE_KINDS: readonly string[] = ['dependency', 'type', 'test', 'environment', 'code']
+function asCIFailureKind(value: unknown): CIFailureKind {
+  return typeof value === 'string' && CI_FAILURE_KINDS.includes(value) ? value as CIFailureKind : 'code'
+}
 
 function sessionRoot(): string {
   return process.env.DEEPSEEK_SESSION_ROOT ?? join(userDataDir("DeepSeekCode"), "sessions")
@@ -402,8 +419,8 @@ class JsonlEventStore {
       const failureKind = event.payload?.failureKind
       const pullRequestValue = event.payload?.pullRequest
       const pullRequest = pullRequestValue && typeof pullRequestValue === "object" && !Array.isArray(pullRequestValue) ? pullRequestValue as CIRepairSession["pullRequest"] : undefined
-      if (typeof parentSessionID === "string" && typeof repairSessionID === "string" && typeof runID === "number" && typeof commit === "string" && typeof failureKind === "string") {
-        return { parentSessionID, sessionID: repairSessionID, runID, commit, failureKind, ...(pullRequest ? { pullRequest } : {}) }
+      if (typeof parentSessionID === "string" && typeof repairSessionID === "string" && typeof runID === "number" && typeof commit === "string") {
+        return { parentSessionID, sessionID: repairSessionID, runID, commit, failureKind: asCIFailureKind(failureKind), ...(pullRequest ? { pullRequest } : {}) }
       }
     }
     return undefined
@@ -531,7 +548,7 @@ const deferredCIRepairs = new CIRepairQueue<RepairRuntimeConfig>()
 // （queued/waiting_*/done/failed 这些是真的持久化的），但要恢复执行本身仍需要
 // 凭据还在内存里，或者调用方重新提供。这是"状态机可恢复"和"凭据不落盘"两个
 // 目标之间诚实的取舍，不是遗漏。
-const ticketCredentials = new Map<string, Pick<AgentRunParams, "baseURL" | "apiKey" | "model" | "protocol" | "mode" | "fastModel">>()
+const ticketCredentials = new Map<string, Pick<AgentRunParams, "baseURL" | "apiKey" | "model"> & { protocol?: ProviderProtocol | undefined; mode?: AgentMode | undefined; fastModel?: string | undefined }>()
 
 /** 把一个 Map<string, T> 适配成 SessionDataCleaner 认得的资源表；
  *  toResource 负责从 map 存的值里取出真正会 close() 的那个对象
@@ -799,7 +816,7 @@ async function runPersistentCommand(sessionID: string, projectPath: string, inpu
   // 4. 拦截或执行
   if (finalDecision === 'forbidden') {
     const reason = taintAnalysis.taintedParams.length > 0
-      ? `命令包含污染参数（${taintAnalysis.taintedParams[0].source}）`
+      ? `命令包含污染参数（${taintAnalysis.taintedParams[0]?.source ?? 'unknown'}）`
       : policyResult.justification ?? '策略禁止'
     throw new Error(`命令被拦截: ${reason}`)
   }
@@ -1374,9 +1391,11 @@ function redactPayload(event: AgentExecutorEvent | RuntimeEvent): Record<string,
   return redactUnknown(event) as Record<string, unknown>
 }
 
-type StreamingProvider = { stream(input: { model: string; messages: AgentMessage[]; feature: "main_agent"; tools: ToolSchema[] }): AsyncIterable<ModelEvent> }
+// feature 与两个 Provider 的 ChatRequestInput['feature'] 保持一致：竞技场的
+// 假设生成会以 "plan" 调用规划模型，旧类型只写死 "main_agent" 会把它挡在类型层。
+type StreamingProvider = { stream(input: { model: string; messages: AgentMessage[]; feature: "plan" | "main_agent" | "explore" | "review" | "summary"; tools: ToolSchema[] }): AsyncIterable<ModelEvent> }
 
-function createProviderClient(params: Pick<AgentRunParams, "baseURL" | "apiKey" | "protocol">, signal?: AbortSignal): StreamingProvider {
+function createProviderClient(params: Pick<AgentRunParams, "baseURL" | "apiKey"> & { protocol?: ProviderProtocol | undefined }, signal?: AbortSignal): StreamingProvider {
   const options = { baseUrl: params.baseURL, apiKey: params.apiKey, ...(signal ? { signal } : {}) }
   if (params.protocol !== undefined && params.protocol !== "openai-compatible" && params.protocol !== "anthropic-messages") {
     throw new Error(`Unsupported provider protocol: ${String(params.protocol)}`)
@@ -1523,7 +1542,11 @@ async function executeRun(request: RunRequest): Promise<ExecuteResult> {
       ...runtimeContext.extensions.tools
     },
     onEvent: (event) => {
-      void emitAgentEvent(sessionID, event)
+      // 事件落盘失败不该让整轮任务炸掉，但也不能无声无息——写 stderr（脱敏后
+      // Rust 侧会转成 runtime-error 事件）。未处理的 rejection 会触发崩溃守卫。
+      void emitAgentEvent(sessionID, event).catch((error: unknown) => {
+        process.stderr.write(`${redact(`event persist failed: ${describeError(error)}`)}\n`)
+      })
       for (const listener of runtimeContext.extensions.listeners) {
         try { listener(event) } catch { /* 扩展监听器异常不影响主流程 */ }
       }
@@ -1586,6 +1609,11 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
   const sessionID = params?.sessionID?.trim()
   const approvalID = params?.approvalID?.trim()
   if (!sessionID || !approvalID || !params?.decision || !params.projectPath || !params.baseURL || !params.apiKey || !params.model) throw new Error("session.resolveApproval requires sessionID, approvalID, decision, projectPath, baseURL, apiKey and model")
+  // 守卫窄化的是 params.<field>；属性窄化不会带进箭头函数闭包，所以这里先取出
+  // const 局部量，下面所有闭包统一用它们。
+  const baseURL = params.baseURL
+  const apiKey = params.apiKey
+  const model = params.model
   const pending = await eventStore.loadPendingApproval(sessionID, approvalID)
   if (!pending) throw new Error("Approval continuation was not found or has already been resolved")
   await eventStore.append(sessionID, "approval_resolved", { approvalID, decision: params.decision })
@@ -1593,7 +1621,7 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
     await emitSessionEvent(sessionID, { type: "turn_ended", reason: "approval_denied", status: "cancelled" })
     return { text: "已取消该操作。", status: "cancelled", messages: await eventStore.loadConversation(sessionID) }
   }
-  const client = createProviderClient(params)
+  const client = createProviderClient({ baseURL, apiKey, ...(params.protocol ? { protocol: params.protocol } : {}) })
   const tools = createWorkspaceAgentTools({ root: params.projectPath, checkpointRoot: join(sessionRoot(), "checkpoints", sessionID) })
   const webTools = createWebTools()
   const runtimeContext = await assembleRuntimeContext(sessionID, params.projectPath)
@@ -1606,12 +1634,16 @@ async function executeApproval(request: Request): Promise<ExecuteResult> {
   const executor = new AgentExecutor({
     mode: params.mode ?? "accept_edits",
     instructions,
-    model: { stream: (messages) => streamModel(sessionID, client, params.model!, messages, schemas) },
+    model: { stream: (messages) => streamModel(sessionID, client, model, messages, schemas) },
     toolDefinitions: { ...pipelineDefinitions(schemas), ...runtimeContext.extensions.definitions },
     hooks: runtimeContext.pipelineHooks,
-    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: wrapApplyPatchWithGraphUpdate(tools.apply_patch, params.projectPath!), inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL: params.baseURL, apiKey: params.apiKey, model: params.model, protocol: params.protocol, mode: params.mode }, !repairLineage), github_pr_context: () => githubPRContext(sessionID, params.projectPath!), github_pr_comment: (input) => githubPRComment(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers, ...runtimeContext.extensions.tools },
+    tools: { list_directory: tools.list_directory, search_workspace: tools.search_workspace, read_file: tools.read_file, apply_patch: wrapApplyPatchWithGraphUpdate(tools.apply_patch, params.projectPath!), inspect_git: tools.inspect_git, run_command: (input) => runPersistentCommand(sessionID, params.projectPath!, input), web_search: webTools.web_search, web_fetch: webTools.web_fetch, delegate_worker: (input) => delegateWorker(sessionID, params.projectPath!, input), github_ci_status: () => githubCIStatus(sessionID, params.projectPath!), github_ci_failure_log: (input) => githubCIFailureLog(sessionID, params.projectPath!, input, { baseURL, apiKey, model, ...(params.protocol ? { protocol: params.protocol } : {}), ...(params.mode ? { mode: params.mode } : {}) }, !repairLineage), github_pr_context: () => githubPRContext(sessionID, params.projectPath!), github_pr_comment: (input) => githubPRComment(sessionID, params.projectPath!, input), browser_evidence: (input) => browserEvidence(sessionID, input), ...mcp.handlers, ...ssh.handlers, ...lsp.handlers, ...runtimeContext.extensions.tools },
     onEvent: (event) => {
-      void emitAgentEvent(sessionID, event)
+      // 事件落盘失败不该让整轮任务炸掉，但也不能无声无息——写 stderr（脱敏后
+      // Rust 侧会转成 runtime-error 事件）。未处理的 rejection 会触发崩溃守卫。
+      void emitAgentEvent(sessionID, event).catch((error: unknown) => {
+        process.stderr.write(`${redact(`event persist failed: ${describeError(error)}`)}\n`)
+      })
       for (const listener of runtimeContext.extensions.listeners) {
         try { listener(event) } catch { /* 扩展监听器异常不影响主流程 */ }
       }
@@ -1669,11 +1701,15 @@ async function executeTournament(request: Request): Promise<Response> {
   // 1. 生成假设：真的调用一次规划模型（feature: "plan"），不是固定模板。
   //    没有 baseURL/apiKey/model 时（理论上不会发生，session.arena 复用同一套凭据）
   //    直接不传 callModel，走 generateHypotheses 自己的降级路径。
-  const callModel = (params?.baseURL && params?.apiKey && params?.model)
+  //    凭据在这里就取成 const：属性窄化不会带进下面的箭头函数闭包。
+  const baseURL = params?.baseURL
+  const apiKey = params?.apiKey
+  const model = params?.model
+  const callModel = (baseURL && apiKey && model)
     ? async (planningPrompt: string): Promise<string> => {
-        const client = createProviderClient(params!)
+        const client = createProviderClient({ baseURL, apiKey, ...(params?.protocol ? { protocol: params.protocol } : {}) })
         let text = ""
-        for await (const event of client.stream({ model: params!.model!, messages: [{ role: "user", content: planningPrompt }], feature: "plan", tools: [] })) {
+        for await (const event of client.stream({ model, messages: [{ role: "user", content: planningPrompt }], feature: "plan", tools: [] })) {
           if (event.type === "text_delta") text += event.text
         }
         return text
@@ -1688,33 +1724,52 @@ async function executeTournament(request: Request): Promise<Response> {
   const worktreeService = new (await import("../../../src/core/git/worktree")).GitWorktreeService()
   const projectPath = params?.projectPath ?? sessionRoot()
 
-  for (let i = 0; i < approaches.length; i++) {
-    const approach = approaches[i]
-    const hypothesisID = `${tournamentID}-h${i}`
-    const forkSessionID = `${parentSessionID}-fork-h${i}`
+  // 每个假设都要用完整凭据跑一轮 executeRun；缺凭据时在这里一次性说清楚，
+  // 而不是等 N 个假设各自失败后报一个含糊的 merge_failed。
+  if (!baseURL || !apiKey || !model) {
+    return { id: request.id, type: "response", ok: false, error: "session.arena requires baseURL, apiKey and model to run hypotheses" }
+  }
 
-    // 分叉会话
-    await eventStore.append(forkSessionID, "session_forked", {
-      sourceSessionID: parentSessionID,
-      baseSequence: (await eventStore.loadEvents(parentSessionID)).length,
-      reason: `锦标赛假设 ${i + 1}: ${approach}`
-    })
+  const createdWorktrees: Array<{ path: string; branch: string }> = []
+  try {
+    for (let i = 0; i < approaches.length; i++) {
+      const approach = approaches[i]
+      if (!approach) continue
+      const hypothesisID = `${tournamentID}-h${i}`
+      const forkSessionID = `${parentSessionID}-fork-h${i}`
 
-    // 创建独立 worktree
-    const worktree = await worktreeService.create({
-      repository: projectPath,
-      storage: join(tmpdir(), "deepseek-arena-worktrees"),
-      taskTitle: hypothesisID,
-      baseRef: "HEAD"
-    })
+      // 分叉会话
+      await eventStore.append(forkSessionID, "session_forked", {
+        sourceSessionID: parentSessionID,
+        baseSequence: (await eventStore.loadEvents(parentSessionID)).length,
+        reason: `锦标赛假设 ${i + 1}: ${approach}`
+      })
 
-    hypotheses.push({
-      id: hypothesisID,
-      approach,
-      forkedSessionID: forkSessionID,
-      worktreePath: worktree.path,
-      branch: worktree.branch
-    })
+      // 创建独立 worktree
+      const worktree = await worktreeService.create({
+        repository: projectPath,
+        storage: join(tmpdir(), "deepseek-arena-worktrees"),
+        taskTitle: hypothesisID,
+        baseRef: "HEAD"
+      })
+      createdWorktrees.push({ path: worktree.path, branch: worktree.branch })
+
+      hypotheses.push({
+        id: hypothesisID,
+        approach,
+        forkedSessionID: forkSessionID,
+        worktreePath: worktree.path,
+        branch: worktree.branch
+      })
+    }
+  } catch (error) {
+    // projectPath 不是 git 仓库、分支冲突、磁盘满等都会在这里抛。清掉已经建好的
+    // worktree 后返回明确错误——绝不能让这个 reject 变成未处理拒绝把 sidecar 带走。
+    for (const worktree of createdWorktrees) {
+      await execFile("git", ["-C", projectPath, "worktree", "remove", "--force", worktree.path], { timeout: 10_000 }).catch(() => undefined)
+      await execFile("git", ["-C", projectPath, "branch", "-D", worktree.branch], { timeout: 10_000 }).catch(() => undefined)
+    }
+    return { id: request.id, type: "response", ok: false, error: `session.arena could not prepare worktrees: ${error instanceof Error ? error.message : String(error)}` }
   }
 
   // 3. 并行执行所有假设（每个在独立 worktree 中运行）
@@ -1724,17 +1779,19 @@ async function executeTournament(request: Request): Promise<Response> {
         // 在分叉会话中执行修复任务。必须把这条假设的 approach 并入 prompt——
         // 否则每个分支都在跑完全相同的任务，锦标赛就只是把同一次修复跑了 N 遍，
         // 不构成真正的互斥假设竞争。
-        const runResult = await executeRun({
+        const worktreePath = h.worktreePath
+        if (!worktreePath) throw new Error(`Hypothesis ${h.id} has no worktree path`)
+        await executeRun({
           id: `${tournamentID}-${h.id}`,
           params: {
             sessionID: h.forkedSessionID,
-            projectPath: h.worktreePath,
+            projectPath: worktreePath,
             prompt: `${prompt}\n\n请按以下方向解决：${h.approach}`,
-            baseURL: params?.baseURL,
-            apiKey: params?.apiKey,
-            model: params?.model,
-            protocol: params?.protocol,
-            mode: params?.mode
+            baseURL,
+            apiKey,
+            model,
+            ...(params?.protocol ? { protocol: params.protocol } : {}),
+            ...(params?.mode ? { mode: params.mode } : {})
           }
         })
 
@@ -1744,10 +1801,10 @@ async function executeTournament(request: Request): Promise<Response> {
         const lastTest = testEvents[testEvents.length - 1]
         const testExitCode = typeof lastTest?.payload?.exitCode === "number" ? lastTest.payload.exitCode : -1
 
-        const diffResult = await execFile("git", ["-C", h.worktreePath, "diff", "--stat", "HEAD"], { maxBuffer: 50_000 }).catch(() => ({ stdout: "" }))
+        const diffResult = await execFile("git", ["-C", worktreePath, "diff", "--stat", "HEAD"], { maxBuffer: 50_000 }).catch(() => ({ stdout: "" }))
         const diffStat = diffResult.stdout.trim()
 
-        const patchResult = await execFile("git", ["-C", h.worktreePath, "diff", "HEAD"], { maxBuffer: 500_000 }).catch(() => ({ stdout: "" }))
+        const patchResult = await execFile("git", ["-C", worktreePath, "diff", "HEAD"], { maxBuffer: 500_000 }).catch(() => ({ stdout: "" }))
         const patchHash = createHash("sha256").update(patchResult.stdout).digest("hex").slice(0, 16)
 
         const delivery = evaluateDeliveryGate(events)
@@ -1844,19 +1901,6 @@ async function executeTournament(request: Request): Promise<Response> {
       await emitSessionEvent(parentSessionID, { type: "tournament_hypothesis_pruned_scheduled", tournamentID, hypothesisID: r.hypothesis.id, projectPath, worktreePath: r.hypothesis.worktreePath, branch: r.hypothesis.branch, prunableAfter })
     }
     // 合并失败时胜者的 worktree 原样保留，不清理。
-  }
-
-  const tournament: Tournament = {
-    tournamentID,
-    parentSessionID,
-    prompt,
-    hypotheses,
-    status: mergeStatus,
-    winner: verdict.winner,
-    judgeReasoning: verdict.reasoning,
-    negativeEvidence,
-    createdAt: new Date().toISOString(),
-    completedAt: new Date().toISOString()
   }
 
   return {
@@ -2101,8 +2145,9 @@ async function shadowEvalSession(request: Request): Promise<Response> {
     return { id: request.id, type: "response", ok: false, error: "No recorded model streams found (session may predate Phase 1 recording)" }
   }
 
-  // 使用预定义策略变体
-  const variants = request.params?.variants ?? ShadowEvaluator.commonVariants()
+  // 使用预定义策略变体；调用方可以显式传变体，但必须先确认它真的是变体数组
+  const requestedVariants = request.params?.variants
+  const variants: StrategyVariant[] = Array.isArray(requestedVariants) ? requestedVariants as StrategyVariant[] : ShadowEvaluator.commonVariants()
 
   // 重建该会话真实的对话历史，供 contextWindowSize 变体重跑真实裁剪逻辑
   const conversation = await eventStore.loadConversation(sessionID)
@@ -2224,11 +2269,12 @@ async function listBranches(request: Request): Promise<Response> {
 }
 
 /** 回放校验：从事件日志确定性重建交付门禁与对话，与记录在案的状态比对。
- *  Phase 1 完整版：支持模型级回放（录制流重放），用 RecordingProvider 替换 live client。 */
+ *  verify 模式只重算门禁；model 模式用录制下来的模型流逐 turn 比对。
+ *  model 模式目前不复用 params.mode——那是 AgentMode，"model" 不是合法取值。 */
 async function replaySession(request: Request): Promise<Response> {
   const sessionID = request.params?.sessionID?.trim()
   if (!sessionID) return { id: request.id, type: "response", ok: false, error: "session.replay requires sessionID" }
-  const mode = request.params?.mode === "model" ? "model" : "verify"
+  const mode = request.params?.replayMode === "model" ? "model" : "verify"
   const until = request.params?.untilSequence
   const all = await eventStore.loadEvents(sessionID)
   if (all.length === 0) return { id: request.id, type: "response", ok: false, error: `Session not found: ${sessionID}` }
@@ -2258,10 +2304,6 @@ async function replaySession(request: Request): Promise<Response> {
     return { id: request.id, type: "response", ok: false, error: "No recorded model streams found (session may predate Phase 1 recording)" }
   }
 
-  // 构造 RecordingProvider 并重跑 AgentExecutor（完善版）
-  const { RecordingProvider } = await import("../../../src/core/providers/recording-provider")
-  const recordingProvider = new RecordingProvider(recordedTurns)
-
   // 提取原始对话历史
   const originalConversation = await eventStore.loadConversation(sessionID)
 
@@ -2271,15 +2313,17 @@ async function replaySession(request: Request): Promise<Response> {
 
   for (let i = 0; i < recordedTurns.length; i++) {
     const recorded = recordedTurns[i]
+    if (!recorded) continue
     const originalTurn = originalConversation[recorded.turnSequence]
 
-    // 简化版对比：检查 delta 数量和类型
     if (!originalTurn) {
       divergences.push({ turnIndex: i, reason: '原始 turn 不存在' })
       continue
     }
 
-    // 统计 tool_call 数量
+    // 已知限制：会话消息只保留纯文本，结构化 tool_calls 不在其中，所以这里的
+    // "<tool_call>" 文本匹配对正常会话恒为 0 —— 工具调用数比对目前不可靠，
+    // consistency 只能当作"录制流是否还在"的粗略信号，不能作为一致性判据。
     const recordedToolCalls = recorded.deltas.filter((d) => d.type === 'tool_call').length
     const originalToolCalls = (originalTurn.content?.match(/<tool_call>/g) || []).length
 
@@ -2427,13 +2471,35 @@ async function handle(request: Request): Promise<void> {
   // version. Reply with an explicit error (naming the method) so an old or
   // mismatched client degrades cleanly instead of hanging on a silent enqueue.
   if (request.method !== "session.run" && request.method !== "session.enqueue") {
-    respond({ id: request.id, type: "response", ok: false, error: `Unsupported method: ${request.method} (call \"health\" for the capability list)` })
+    respond({ id: request.id, type: "response", ok: false, error: `Unsupported method: ${request.method} (call "health" for the capability list)` })
     return
   }
   // A run request receives exactly one terminal response after the turn;
   // queued runs never emit a misleading immediate success response.
   await enqueue(request)
 }
+
+/** 把任意抛出物转成一句可读错误；调用方负责再脱敏。 */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** 最后一道网。真正的防线是"每个请求各自 catch"（见下方 stdin 循环）——
+ *  这一层只保证真有漏网异常时 sidecar 不会无声消失：写 stderr（Rust 侧会转成
+ *  runtime-error 事件）后以非零码退出。未捕获异常后进程状态未定义，继续跑可能
+ *  把会话事件日志写坏，所以这里选择退出而不是硬撑。 */
+function installCrashGuards(): void {
+  const fatal = (kind: string, reason: unknown): void => {
+    process.stderr.write(`${redact(`${kind}: ${describeError(reason)}`)}\n`)
+    process.exit(1)
+  }
+  process.on("uncaughtException", (error) => fatal("uncaughtException", error))
+  process.on("unhandledRejection", (reason) => fatal("unhandledRejection", reason))
+  // 父进程（Tauri）退出后写 stdout 会触发 EPIPE；没有监听器时它同样是未捕获异常。
+  process.stdout.on("error", () => undefined)
+}
+
+installCrashGuards()
 
 if (process.argv.includes("--terminal-daemon")) {
   const socketIndex = process.argv.indexOf("--socket")
@@ -2486,8 +2552,19 @@ if (process.argv.includes("--terminal-daemon")) {
     buffer = lines.pop() ?? ""
     for (const line of lines) {
       if (!line.trim()) continue
-      try { void handle(JSON.parse(line) as Request) }
-      catch { respond({ id: "unknown", type: "response", ok: false, error: "invalid JSON request" }) }
+      let request: Request
+      try {
+        request = JSON.parse(line) as Request
+      } catch {
+        respond({ id: "unknown", type: "response", ok: false, error: "invalid JSON request" })
+        continue
+      }
+      // 每个请求各自兜底：handler 里的 async 失败必须变成一条错误响应，
+      // 而不是未处理的 rejection —— 那会（在崩溃守卫下）带走整个 sidecar，
+      // 把同一进程里所有会话一起终止。调用方也能立刻拿到失败而不是等超时。
+      void handle(request).catch((error: unknown) => {
+        respond({ id: request.id, type: "response", ok: false, sessionID: request.params?.sessionID, error: redact(describeError(error)) })
+      })
     }
   })
 }
