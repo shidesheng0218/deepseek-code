@@ -27,6 +27,9 @@ function printHelp(stream = process.stdout) {
     '  deepseek config list|get|set|unset ...     Manage layered configuration\n' +
     '  deepseek doctor [--json]                   Diagnose runtime and connectivity\n' +
     '  deepseek diff [--stat] [--json]            Show working tree changes\n' +
+    '  deepseek checkpoint [list|show|undo]       Manage task checkpoints\n' +
+    '  deepseek undo <checkpoint-id>              Revert agent changes safely\n' +
+    '  deepseek review [--json]                   Read-only review of the working tree diff\n' +
     '  deepseek session list|show|search|rename|archive|attach|resume ...\n' +
     '  deepseek session fork|branches|replay ...  Branch or replay a session\n' +
     '  deepseek receipt verify <file>             Verify a delivery receipt\n\n' +
@@ -433,6 +436,81 @@ async function interactive(options = {}) {
   await terminalSession({ runtime, root, settings, interactive: true });
 }
 
+async function checkpointCommand(args) {
+  const [sub, ...rest] = args;
+  const checkpointRoot = join(process.env.DEEPSEEK_PROJECT || process.cwd(), '.deepseek');
+  const { listCheckpoints, undoCheckpoint, diffAgainstCheckpoint } = await import('./checkpoint.mjs');
+  if (sub === 'list' || !sub) {
+    const items = await listCheckpoints(checkpointRoot);
+    if (rest.includes('--json') || args.includes('--json')) { process.stdout.write(JSON.stringify(items, null, 2) + '\n'); return; }
+    if (items.length === 0) { process.stdout.write('（无检查点）\n'); return; }
+    for (const item of items) process.stdout.write(`${item.id}\t${item.createdAt}\t${item.fileCount}文件\t${item.label}\n`);
+    return;
+  }
+  if (sub === 'show' && rest[0]) {
+    const cp = JSON.parse(await readFile(join(checkpointRoot, 'checkpoints', `${rest[0]}.json`), 'utf8').catch(() => { process.stderr.write('Checkpoint not found\n'); process.exit(1); }));
+    const changed = await diffAgainstCheckpoint(cp);
+    process.stdout.write(`Checkpoint ${cp.id}\n标签: ${cp.label}\n时间: ${cp.createdAt}\nHEAD: ${cp.head || '-'}\n快照文件: ${Object.keys(cp.entries).length}\n自快照以来变更: ${changed.length}\n`);
+    for (const path of changed.slice(0, 30)) process.stdout.write(`  ${path}\n`);
+    return;
+  }
+  if (sub === 'undo' && rest[0]) {
+    const cpFile = join(checkpointRoot, 'checkpoints', `${rest[0]}.json`);
+    const cp = JSON.parse(await readFile(cpFile, 'utf8').catch(() => { process.stderr.write('Checkpoint not found\n'); process.exit(1); }));
+    const changesFile = join(checkpointRoot, 'checkpoints', `${rest[0]}.changes.json`);
+    let agentAfter = {};
+    try { agentAfter = JSON.parse(await readFile(changesFile, 'utf8')).agentAfter ?? {}; }
+    catch { process.stderr.write('该检查点没有记录的 Agent 变更（可能本轮没有修改文件）。\n'); process.exit(1); }
+    const { restored, conflicts } = await undoCheckpoint({ checkpoint: cp, agentAfter });
+    if (conflicts.length > 0) {
+      process.stderr.write(`以下文件在 Agent 修改后又被改动，未撤销：\n${conflicts.map((p) => `  ${p}`).join('\n')}\n`);
+      process.exitCode = 1;
+    }
+    process.stdout.write(restored.length > 0 ? `已恢复 ${restored.length} 个文件：\n${restored.map((p) => `  ${p}`).join('\n')}\n` : '没有需要恢复的文件。\n');
+    return;
+  }
+  process.stderr.write('Usage: deepseek checkpoint [list] [--json] | show <id> | undo <id>\n');
+  process.exit(2);
+}
+
+async function reviewCommand(args) {
+  const json = args.includes('--json');
+  const projectPath = resolvePath(process.env.DEEPSEEK_PROJECT || process.cwd());
+  const run = async (gitArgs) => {
+    try { return (await execFileAsync('git', gitArgs, { cwd: projectPath, maxBuffer: 10_000_000 })).stdout; }
+    catch { return ''; }
+  };
+  const diff = await run(['diff', 'HEAD']);
+  if (!diff.trim()) {
+    const msg = '工作区无变更，无需审查。';
+    if (json) process.stdout.write(JSON.stringify({ ok: true, message: msg, findings: [] }, null, 2) + '\n');
+    else process.stdout.write(msg + '\n');
+    return;
+  }
+  const settings = await runSettings({ projectPath });
+  const prompt = [
+    '你是只读代码审查者。审查以下工作区 diff，不要修改任何文件。',
+    '按严重度列出发现：critical（正确性/安全/数据丢失）、warning（回归风险/缺失测试）、note（可读性/风格）。',
+    '每个发现给：文件路径、行号（若可推断）、一句话问题、建议修复。',
+    '若无发现问题，明确说"未发现问题"并说明检查了哪些方面。',
+    '只输出审查结论，不要寒暄。',
+    '',
+    '```diff',
+    diff.slice(0, 50000),
+    '```'
+  ].join('\n');
+  const reviewSession = `review-${Date.now()}`;
+  await terminalSession({
+    runtime, root,
+    settings: { ...settings, sessionID: reviewSession, mode: 'plan' },
+    prompt,
+    interactive: false,
+    json
+  });
+}
+
+export const EXIT = { ok: 0, error: 1, usage: 2, approval: 3, cancelled: 4, incompatible: 5, gateFailed: 6 };
+
 const [command, ...args] = process.argv.slice(2);
 try {
   if (command === undefined || command === 'chat' || (command.startsWith('--') && !['--help', '--version'].includes(command))) {
@@ -445,6 +523,9 @@ try {
   else if (command === 'init') await initCommand();
   else if (command === 'config') await configCommand(args);
   else if (command === 'diff') await diffCommand(args);
+  else if (command === 'checkpoint') await checkpointCommand(args);
+  else if (command === 'undo' && args[0]) await checkpointCommand(['undo', args[0]]);
+  else if (command === 'review') await reviewCommand(args);
   else if (command === 'ask' || command === 'run') {
     const parsed = parseRunOptions(args);
     if (!parsed.prompt) {

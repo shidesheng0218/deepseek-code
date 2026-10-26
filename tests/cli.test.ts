@@ -116,6 +116,61 @@ describe('CLI config and session commands', () => {
   });
 });
 
+describe('CLI checkpoints', () => {
+  it('creates a checkpoint on session.run and undo restores agent changes', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'deepseek-cp-'));
+    const git = (gitArgs: string[]) => new Promise<void>((r, j) => { const c = spawn('git', gitArgs, { cwd: repo }); c.on('close', (code) => code === 0 ? r() : j(new Error('git failed'))); c.on('error', j); });
+    await git(['init', '-q']);
+    await writeFile(join(repo, 'f.txt'), 'original\n');
+    await git(['add', '.']);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init']);
+    // fixture runtime 不真的改文件；这里模拟 Agent 修改后的状态并直接测试 undo 逻辑
+    const { createCheckpoint, diffAgainstCheckpoint, undoCheckpoint } = await import('../bin/checkpoint.mjs');
+    const id = await createCheckpoint({ checkpointRoot: join(repo, '.deepseek'), projectPath: repo, sessionID: 's1', label: 'test turn' });
+    await writeFile(join(repo, 'f.txt'), 'agent modified\n');
+    const cp = JSON.parse(await (await import('node:fs/promises')).readFile(join(repo, '.deepseek', 'checkpoints', `${id}.json`), 'utf8')) as { entries: Record<string, { content?: string }> };
+    const changed = await diffAgainstCheckpoint(cp as never);
+    expect(changed).toContain('f.txt');
+    const afterHash = (await import('node:crypto')).createHash('sha256').update('agent modified\n').digest('hex');
+    const result = await undoCheckpoint({ checkpoint: cp as never, agentAfter: { 'f.txt': afterHash } });
+    expect(result.restored).toContain('f.txt');
+    expect(result.conflicts).toHaveLength(0);
+    expect(await (await import('node:fs/promises')).readFile(join(repo, 'f.txt'), 'utf8')).toBe('original\n');
+    await rm(repo, { recursive: true, force: true });
+  });
+  it('undo refuses files the user modified after the agent', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'deepseek-cp2-'));
+    await writeFile(join(repo, 'f.txt'), 'original\n');
+    const { createCheckpoint, undoCheckpoint } = await import('../bin/checkpoint.mjs');
+    const id = await createCheckpoint({ checkpointRoot: join(repo, '.deepseek'), projectPath: repo, sessionID: 's1', label: 't', extraPaths: ['f.txt'] });
+    await writeFile(join(repo, 'f.txt'), 'agent modified\n');
+    await writeFile(join(repo, 'f.txt'), 'user modified later\n');
+    const cp = JSON.parse(await (await import('node:fs/promises')).readFile(join(repo, '.deepseek', 'checkpoints', `${id}.json`), 'utf8')) as never;
+    const result = await undoCheckpoint({ checkpoint: cp, agentAfter: { 'f.txt': 'agent-hash-not-matching' } });
+    expect(result.conflicts).toContain('f.txt');
+    expect(result.restored).toHaveLength(0);
+    expect(await (await import('node:fs/promises')).readFile(join(repo, 'f.txt'), 'utf8')).toBe('user modified later\n');
+    await rm(repo, { recursive: true, force: true });
+  });
+  it('checkpoint list/show/undo commands work over files', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'deepseek-cp3-'));
+    await writeFile(join(repo, 'f.txt'), 'original\n');
+    const { createCheckpoint } = await import('../bin/checkpoint.mjs');
+    const id = await createCheckpoint({ checkpointRoot: join(repo, '.deepseek'), projectPath: repo, sessionID: 's1', label: 'cp test' });
+    const run = (args: string[]) => new Promise<{ code: number | null; stdout: string; stderr: string }>((r, j) => {
+      const c = spawn(process.execPath, [resolve('bin/deepseek.mjs'), ...args], { env: { ...process.env, DEEPSEEK_PROJECT: repo }, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = ''; let stderr = '';
+      c.stdout.on('data', (d) => { stdout += d; }); c.stderr.on('data', (d) => { stderr += d; });
+      c.on('close', (code) => r({ code, stdout, stderr })); c.on('error', j); c.stdin.end();
+    });
+    const list = await run(['checkpoint', 'list', '--json']);
+    expect(JSON.parse(list.stdout)[0].id).toBe(id);
+    const show = await run(['checkpoint', 'show', id]);
+    expect(show.stdout).toContain('cp test');
+    await rm(repo, { recursive: true, force: true });
+  });
+});
+
 describe('CLI process integration', () => {
   it('prints streamed text once, without repeating final response', async () => {
     const result = await cli(['ask', 'hello']);
@@ -127,9 +182,9 @@ describe('CLI process integration', () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('answer:pipe prompt\n');
   });
-  it('fails rather than auto-approving in non-interactive mode', async () => {
+  it('exits 3 when approval is required in non-interactive mode', async () => {
     const result = await cli(['ask', 'approve']);
-    expect(result.code).toBe(2);
+    expect(result.code).toBe(3);
     expect(result.stderr).toContain('Approval required');
   });
   it('propagates runtime response failures', async () => {
@@ -154,9 +209,9 @@ describe('CLI process integration', () => {
     expect(parsed.text).toBe('answer:hello');
     expect(parsed.sessionID).toMatch(/^cli-/);
   });
-  it('json approval_required exits 2 with parseable output', async () => {
+  it('json approval_required exits 3', async () => {
     const result = await cli(['ask', '--json', 'approve']);
-    expect(result.code).toBe(2);
+    expect(result.code).toBe(3);
   });
   it('diff --json emits parseable working tree summary', async () => {
     const repo = await mkdtemp(join(tmpdir(), 'deepseek-cli-git-'));

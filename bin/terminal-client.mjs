@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
 
 function display(value) {
   // Terminal control sequences are intentionally removed before output.
@@ -120,6 +121,9 @@ export class RuntimeClient {
 
 export async function terminalSession({ runtime, root, settings, prompt, interactive, pendingApproval, json = false }) {
   if (interactive && !process.stdin.isTTY) throw new Error('Interactive chat requires a terminal. Pipe a prompt to deepseek ask instead.');
+  const { createCheckpoint } = await import('./checkpoint.mjs');
+  let turnCheckpoint = null;
+  const agentChanges = {};
   // The iterator is created immediately so fast, pasted lines are not lost.
   const input = process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stderr, terminal: true }) : undefined;
   const lines = input?.[Symbol.asyncIterator]();
@@ -132,7 +136,9 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
   const handshake = await client.request('health', {}).then((info) => ({ ok: true, info })).catch((error) => ({ ok: false, error }));
   if (handshake.ok && handshake.info && typeof handshake.info.protocolVersion === 'number' && handshake.info.protocolVersion > 2) {
     await client.close();
-    throw new Error(`Runtime protocol v${handshake.info.protocolVersion} is newer than this CLI supports (v2). Upgrade the CLI.`);
+    const error = new Error(`Runtime protocol v${handshake.info.protocolVersion} is newer than this CLI supports (v2). Upgrade the CLI.`);
+    error.exitCode = 5;
+    throw error;
   }
   if (!handshake.ok) {
     await client.close();
@@ -144,7 +150,7 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
   const cancel = () => {
     if (interrupted) { void client.close(); input?.close(); return; }
     interrupted = true;
-    process.exitCode = 130;
+    process.exitCode = 4;
     input?.close();
     if (active) void client.request('session.cancel', { sessionID: settings.sessionID }).catch(() => {});
     cancelTimer = setTimeout(() => { void client.close(); }, 1500);
@@ -171,6 +177,16 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
     while (!interrupted) {
       streamed = false;
       approval = undefined;
+      if (method === 'session.run') {
+        try {
+          turnCheckpoint = await createCheckpoint({
+            checkpointRoot: join(settings.projectPath, '.deepseek'),
+            projectPath: settings.projectPath,
+            sessionID: settings.sessionID,
+            label: String(extra?.prompt ?? '').slice(0, 80)
+          });
+        } catch { turnCheckpoint = null; }
+      }
       active = true;
       let result;
       try { result = await client.request(method, { ...settings, ...extra }); }
@@ -181,13 +197,14 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
         if (streamed || result?.text) process.stdout.write('\n');
       }
       if (result?.status !== 'waiting_approval') {
-        if (result?.status === 'cancelled') process.exitCode = 1;
+        if (result?.status === 'cancelled') process.exitCode = 4;
+        else if (result?.delivery === 'needsRepair' || result?.delivery === 'needsAttention') process.exitCode = 6;
         return;
       }
       if (!approval?.id) throw new Error('Runtime requested approval without an approval ID.');
       if (!input) {
         process.stderr.write(`Approval required: ${display(approval.tool)}. Resume in a terminal: deepseek session resume ${settings.sessionID}\n`);
-        process.exitCode = 2;
+        process.exitCode = 3;
         return;
       }
       process.stderr.write(`\nApproval: ${display(approval.tool)} (${display(approval.risk)})\n${display(approval.preview || '')}\n`);
@@ -206,6 +223,22 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
       if (!interrupted) await turn('session.resolveApproval', { approvalID: pendingApproval.approvalID, decision: /^(y|yes)$/i.test(answer || '') ? 'allow' : 'deny' });
     }
     if (prompt && !interrupted) await turn('session.run', { prompt });
+    // 记录 Agent 在本轮改过的文件及其修改后哈希，供 undo 精确回滚。
+    if (turnCheckpoint && !interrupted) {
+      try {
+        const { diffAgainstCheckpoint } = await import('./checkpoint.mjs');
+        const cp = JSON.parse(await readFile(join(settings.projectPath, '.deepseek', 'checkpoints', `${turnCheckpoint}.json`), 'utf8'));
+        const changed = await diffAgainstCheckpoint(cp);
+        const { createHash } = await import('node:crypto');
+        for (const path of changed) {
+          try { agentChanges[path] = createHash('sha256').update(await readFile(join(settings.projectPath, path), 'utf8')).digest('hex'); }
+          catch { agentChanges[path] = null; }
+        }
+        if (Object.keys(agentChanges).length > 0) {
+          await writeFile(join(settings.projectPath, '.deepseek', 'checkpoints', `${turnCheckpoint}.changes.json`), JSON.stringify({ agentAfter: agentChanges, sessionID: settings.sessionID }), 'utf8');
+        }
+      } catch { /* checkpoint bookkeeping must never break a turn */ }
+    }
     if (json && !interactive && !interrupted) {
       const status = finalResult?.status ?? 'unknown';
       process.stdout.write(JSON.stringify({

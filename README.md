@@ -43,6 +43,9 @@ deepseek init                         首次配置引导（交互式）
 deepseek config list|get|set|unset    分层配置（用户级/项目级）
 deepseek doctor [--json]              诊断 runtime、凭据与端点连通性
 deepseek diff [--stat] [--json]       查看工作区变更
+deepseek checkpoint [list|show|undo]  任务检查点管理
+deepseek undo <checkpoint-id>         安全撤销 Agent 修改（用户后改过的文件不覆盖）
+deepseek review [--json]              只读审查当前工作区 diff（plan 模式，不改文件）
 deepseek session list [--json]        列出 Session（轮次/状态/标题）
 deepseek session show <id>            Session 详情（待审批、项目、状态）
 deepseek session search <keyword>     按标题或 ID 搜索
@@ -58,6 +61,10 @@ deepseek --help / --version           帮助与版本
 配置优先级：命令行参数 > 环境变量 > 项目 `.deepseek/config.json` > 用户 `~/.config/deepseek/config.json` > 默认值。API Key 只通过环境变量提供，不写入配置文件。
 
 `deepseek ask --json` 输出稳定结构（`sessionID`、`status`、`text`、`delivery`、`tools`、`error`），可供脚本与 `jq` 消费。
+
+退出码：`0` 正常完成；`1` 执行失败或运行时崩溃；`2` 参数/配置错误；`3` 需要人工审批（非交互模式）；`4` 用户取消；`5` CLI 与 Runtime 协议不兼容；`6` 交付门禁未通过（needsRepair/needsAttention）。
+
+每个 `session.run` 前自动创建工作区检查点（git 跟踪文件 + 会话涉及文件的哈希与内容快照），存储在项目 `.deepseek/checkpoints/`；`deepseek undo <id>` 只恢复 Agent 改过的文件，若用户在 Agent 修改后又改了同一文件则拒绝覆盖并列出冲突。
 
 ## 本地开发
 
