@@ -11,6 +11,7 @@ test('captures deterministic browser evidence for a local web repair task', asyn
     if (response.status() >= 400) networkFailures.push(`${response.status()} ${response.url()}`)
   })
 
+  await mkdir('e2e/artifacts', { recursive: true })
   await page.goto('/')
   await page.getByRole('button', { name: 'Load status' }).click()
   await expect(page.getByRole('status')).toHaveText('Service ready')

@@ -2,7 +2,7 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['**/dist/**', '**/coverage/**', '**/node_modules/**', '**/vendor/**', 'vendor/**', '**/venv/**', '**/__pycache__/**', '**/test-results/**', '**/.vite/**', '**/target/**', '**/src-tauri/resources/**', 'benchmarks/versus/corpus/**'] },
+  { ignores: ['**/dist/**', '**/coverage/**', '**/node_modules/**', '**/vendor/**', 'vendor/**', '**/venv/**', '**/__pycache__/**', '**/test-results/**', '**/.vite/**', '**/target/**', 'apps/deepseek-code-desktop/**', 'benchmarks/versus/corpus/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -16,7 +16,7 @@ export default tseslint.config(
   {
     files: ['bin/**/*.mjs'],
     languageOptions: {
-      globals: { process: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly' }
+      globals: { process: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly', fetch: 'readonly', AbortController: 'readonly' }
     }
   },
   {

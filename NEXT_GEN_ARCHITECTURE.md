@@ -1,3 +1,5 @@
+> 历史设计/状态快照：本文保留作参考，不代表当前 CLI 产品能力或交付承诺。当前入口和安装说明以 README.md 为准。
+
 # DeepSeek Code 下一代架构：可证明、可回放、可编排的编码 Agent
 
 > 目标：在 Claude Code、Codex、OpenCode、pi 的包围中建立**可持续的技术领先**。
