@@ -23,6 +23,7 @@ assert.strictEqual(metadata.artifact, artifact)
 assert.strictEqual(metadata.runtime, 'bun-compiled-agent-runtime')
 assert.strictEqual(metadata.target, 'darwin-arm64')
 NODE
+set -x
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 tar -xzf "$artifact" -C "$stage"
