@@ -46,6 +46,12 @@ deepseek diff [--stat] [--json]       查看工作区变更
 deepseek checkpoint [list|show|undo]  任务检查点管理
 deepseek undo <checkpoint-id>         安全撤销 Agent 修改（用户后改过的文件不覆盖）
 deepseek review [--json]              只读审查当前工作区 diff（plan 模式，不改文件）
+deepseek task submit [--priority N]   提交后台任务到队列
+deepseek task list [--json]           查看任务队列
+deepseek task cancel <ticket-id>      取消任务
+deepseek mcp list [--json]            项目 MCP 服务器（密钥脱敏）
+deepseek skills list [--json]         可用 skills
+deepseek detect                       检测项目 test/build/lint/typecheck 命令
 deepseek session list [--json]        列出 Session（轮次/状态/标题）
 deepseek session show <id>            Session 详情（待审批、项目、状态）
 deepseek session search <keyword>     按标题或 ID 搜索
@@ -63,6 +69,8 @@ deepseek --help / --version           帮助与版本
 `deepseek ask --json` 输出稳定结构（`sessionID`、`status`、`text`、`delivery`、`tools`、`error`），可供脚本与 `jq` 消费。
 
 退出码：`0` 正常完成；`1` 执行失败或运行时崩溃；`2` 参数/配置错误；`3` 需要人工审批（非交互模式）；`4` 用户取消；`5` CLI 与 Runtime 协议不兼容；`6` 交付门禁未通过（needsRepair/needsAttention）。
+
+`deepseek ask` 支持 `--repair-attempts N`（交付门禁未过时自动追加修复轮，超预算后停止并输出证据）与 `--verify`（任务完成后运行 `DEEPSEEK_VERIFY_COMMAND` 指定的项目检查命令作为交付证据）。`deepseek detect` 可自动识别 npm/pnpm/yarn/bun、Cargo、Go、Python 项目的检查命令。
 
 每个 `session.run` 前自动创建工作区检查点（git 跟踪文件 + 会话涉及文件的哈希与内容快照），存储在项目 `.deepseek/checkpoints/`；`deepseek undo <id>` 只恢复 Agent 改过的文件，若用户在 Agent 修改后又改了同一文件则拒绝覆盖并列出冲突。
 

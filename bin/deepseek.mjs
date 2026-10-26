@@ -30,6 +30,10 @@ function printHelp(stream = process.stdout) {
     '  deepseek checkpoint [list|show|undo]       Manage task checkpoints\n' +
     '  deepseek undo <checkpoint-id>              Revert agent changes safely\n' +
     '  deepseek review [--json]                   Read-only review of the working tree diff\n' +
+    '  deepseek task submit|list|cancel           Background task queue\n' +
+    '  deepseek mcp list [--json]                 Configured MCP servers (secrets masked)\n' +
+    '  deepseek skills list [--json]              Available skills\n' +
+    '  deepseek detect                            Detect project test/build/lint commands\n' +
     '  deepseek session list|show|search|rename|archive|attach|resume ...\n' +
     '  deepseek session fork|branches|replay ...  Branch or replay a session\n' +
     '  deepseek receipt verify <file>             Verify a delivery receipt\n\n' +
@@ -52,7 +56,7 @@ function usage() {
 }
 
 function parseRunOptions(args) {
-  const options = { projectPath: undefined, model: undefined, baseURL: undefined, protocol: undefined, mode: undefined, sessionID: undefined, fastModel: undefined, json: false };
+  const options = { projectPath: undefined, model: undefined, baseURL: undefined, protocol: undefined, mode: undefined, sessionID: undefined, fastModel: undefined, json: false, repairAttempts: undefined, verify: false };
   const prompt = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -60,6 +64,8 @@ function parseRunOptions(args) {
     if (arg === '--') { prompt.push(...args.slice(index + 1)); break; }
     if (arg === '-h' || arg === '--help') { printHelp(); process.exit(0); }
     if (arg === '--json') { options.json = true; continue; }
+    if (arg === '--verify') { options.verify = true; continue; }
+    if (arg === '--repair-attempts') { options.repairAttempts = Number.parseInt(next, 10); if (!Number.isFinite(options.repairAttempts)) usage(); index += 1; continue; }
     if (arg === '--project') options.projectPath = next;
     else if (arg === '--model') options.model = next;
     else if (arg === '--base-url') options.baseURL = next;
@@ -511,6 +517,95 @@ async function reviewCommand(args) {
 
 export const EXIT = { ok: 0, error: 1, usage: 2, approval: 3, cancelled: 4, incompatible: 5, gateFailed: 6 };
 
+async function taskCommand(args) {
+  const [sub, ...rest] = args;
+  if (sub === 'submit') {
+    const parsed = parseRunOptions(rest.filter((a, i) => !(rest[i - 1] === '--priority' || a === '--priority')));
+    const priorityIndex = rest.indexOf('--priority');
+    const priority = priorityIndex >= 0 ? Number.parseInt(rest[priorityIndex + 1], 10) : 0;
+    const prompt = parsed.prompt || (rest.filter((a) => !a.startsWith('--') && rest[rest.indexOf(a) - 1] !== '--priority').join(' ').trim());
+    if (!prompt) { process.stderr.write('Usage: deepseek task submit [--priority N] <prompt>\n'); process.exit(2); }
+    const settings = await runSettings({ ...parsed.options });
+    const response = await requestSidecar('task.enqueue', { ...settings, prompt, priority });
+    if (!response.ok) { process.stderr.write(`${response.error ?? 'enqueue failed'}\n`); process.exit(1); }
+    process.stdout.write(`${response.result.ticketID}\t${response.result.state}\n`);
+    return;
+  }
+  if (sub === 'list') {
+    const response = await requestSidecar('task.list', {});
+    if (!response.ok) { process.stderr.write(`${response.error ?? 'list failed'}\n`); process.exit(1); }
+    const tickets = response.result.tickets ?? [];
+    if (rest.includes('--json')) { process.stdout.write(JSON.stringify(tickets, null, 2) + '\n'); return; }
+    if (tickets.length === 0) { process.stdout.write('（无任务）\n'); return; }
+    for (const t of tickets) process.stdout.write(`${t.ticketID}\t${t.state}\tP${t.priority}\t${t.prompt.slice(0, 56)}\n`);
+    return;
+  }
+  if (sub === 'cancel' && rest[0]) {
+    const response = await requestSidecar('task.cancel', { ticketID: rest[0] });
+    if (!response.ok) { process.stderr.write(`${response.error ?? 'cancel failed'}\n`); process.exit(1); }
+    process.stdout.write(`${response.result.ticketID}\t${response.result.state}\n`);
+    return;
+  }
+  process.stderr.write('Usage: deepseek task submit [--priority N] <prompt> | list [--json] | cancel <ticket-id>\n');
+  process.exit(2);
+}
+
+async function mcpCommand(args) {
+  const [sub, ...rest] = args;
+  if (sub === 'list') {
+    const { loadMCPServerConfigs } = await import('../src/core/mcp-config.ts');
+    const projectPath = resolvePath(process.env.DEEPSEEK_PROJECT || process.cwd());
+    const configs = await loadMCPServerConfigs(projectPath).catch(() => []);
+    if (rest.includes('--json')) { process.stdout.write(JSON.stringify(configsToSafe(configs), null, 2) + '\n'); return; }
+    if (configs.length === 0) { process.stdout.write('（项目未配置 MCP 服务器：.mcp.json）\n'); return; }
+    for (const c of configs) process.stdout.write(`${c.name ?? c.id ?? 'server'}\t${c.command ?? c.url ?? '-'}\n`);
+    return;
+  }
+  process.stderr.write('Usage: deepseek mcp list [--json]\n');
+  process.exit(2);
+}
+
+function configsToSafe(configs) {
+  return configs.map((c) => ({ ...c, env: c.env ? Object.fromEntries(Object.keys(c.env).map((k) => [k, '***'])) : undefined, headers: c.headers ? Object.fromEntries(Object.keys(c.headers).map((k) => [k, '***'])) : undefined }));
+}
+
+async function skillsCommand(args) {
+  const [sub] = args;
+  if (sub === 'list' || !sub) {
+    const { loadSkills } = await import('../src/core/skills.ts');
+    const projectPath = resolvePath(process.env.DEEPSEEK_PROJECT || process.cwd());
+    const skills = await loadSkills(projectPath).catch(() => []);
+    if (args.includes('--json')) { process.stdout.write(JSON.stringify(skills.map((s) => ({ name: s.name, description: s.description, location: s.location })), null, 2) + '\n'); return; }
+    if (skills.length === 0) { process.stdout.write('（未发现 skills）\n'); return; }
+    for (const s of skills) process.stdout.write(`/${s.name}\t${s.description ?? ''}\t${s.location ?? ''}\n`);
+    return;
+  }
+  process.stderr.write('Usage: deepseek skills list [--json]\n');
+  process.exit(2);
+}
+
+async function detectCommand() {
+  const projectPath = resolvePath(process.env.DEEPSEEK_PROJECT || process.cwd());
+  const detected = { packageManager: null, test: null, build: null, lint: null, typecheck: null };
+  const has = async (file) => access(join(projectPath, file)).then(() => true).catch(() => false);
+  if (await has('pnpm-lock.yaml')) detected.packageManager = 'pnpm';
+  else if (await has('bun.lockb') || await has('bun.lock')) detected.packageManager = 'bun';
+  else if (await has('yarn.lock')) detected.packageManager = 'yarn';
+  else if (await has('package-lock.json') || await has('package.json')) detected.packageManager = 'npm';
+  if (await has('package.json')) {
+    const pkg = JSON.parse(await readFile(join(projectPath, 'package.json'), 'utf8').catch(() => '{}'));
+    const pm = detected.packageManager ?? 'npm';
+    const runScript = (manager, script) => manager === 'npm' ? `npm run ${script}` : `${manager} ${script}`;
+    for (const [script, key] of [['test', 'test'], ['build', 'build'], ['lint', 'lint'], ['typecheck', 'typecheck']]) {
+      if (pkg.scripts?.[script]) detected[key] = script === 'test' ? `${pm} test` : runScript(pm, script);
+    }
+  }
+  if (await has('Cargo.toml')) { detected.test = 'cargo test'; detected.build = 'cargo build'; detected.lint = 'cargo clippy'; }
+  if (await has('go.mod')) { detected.test = 'go test ./...'; detected.build = 'go build ./...'; }
+  if (await has('pyproject.toml') || await has('pytest.ini')) detected.test = 'pytest';
+  process.stdout.write(JSON.stringify({ projectPath, ...detected }, null, 2) + '\n');
+}
+
 const [command, ...args] = process.argv.slice(2);
 try {
   if (command === undefined || command === 'chat' || (command.startsWith('--') && !['--help', '--version'].includes(command))) {
@@ -526,6 +621,10 @@ try {
   else if (command === 'checkpoint') await checkpointCommand(args);
   else if (command === 'undo' && args[0]) await checkpointCommand(['undo', args[0]]);
   else if (command === 'review') await reviewCommand(args);
+  else if (command === 'task') await taskCommand(args);
+  else if (command === 'mcp') await mcpCommand(args);
+  else if (command === 'skills') await skillsCommand(args);
+  else if (command === 'detect') await detectCommand();
   else if (command === 'ask' || command === 'run') {
     const parsed = parseRunOptions(args);
     if (!parsed.prompt) {

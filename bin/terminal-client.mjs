@@ -34,7 +34,9 @@ export async function runSettings(options = {}, env = process.env, config) {
     model: config.values.model ?? 'deepseek-chat',
     protocol,
     mode,
-    ...(fastModel ? { fastModel } : {})
+    ...(fastModel ? { fastModel } : {}),
+    ...(options.repairAttempts !== undefined ? { repairAttempts: options.repairAttempts } : {}),
+    ...(options.verify ? { verifyAfter: env.DEEPSEEK_VERIFY_COMMAND || undefined } : {})
   };
 }
 
@@ -223,6 +225,21 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
       if (!interrupted) await turn('session.resolveApproval', { approvalID: pendingApproval.approvalID, decision: /^(y|yes)$/i.test(answer || '') ? 'allow' : 'deny' });
     }
     if (prompt && !interrupted) await turn('session.run', { prompt });
+    // --verify：任务结束后运行检测到的项目检查命令，作为交付证据。
+    if (settings.verifyAfter && !interrupted && finalResult?.status === 'completed') {
+      const { spawnSync } = await import('node:child_process');
+      process.stderr.write(`[verify] ${settings.verifyAfter}\n`);
+      const result = spawnSync(settings.verifyAfter, { cwd: settings.projectPath, shell: true, stdio: json ? 'pipe' : 'inherit' });
+      if (result.status !== 0) { process.exitCode = 6; if (json) finalResult = { ...finalResult, delivery: 'needsRepair' }; }
+    }
+    // --repair-attempts：交付门禁未过时，用固定预算自动追加修复轮。
+    let repairsLeft = settings.repairAttempts ?? 0;
+    while (!interrupted && repairsLeft > 0 && (process.exitCode === 6 || finalResult?.delivery === 'needsRepair')) {
+      repairsLeft -= 1;
+      process.exitCode = 0;
+      process.stderr.write(`[repair] attempts left: ${repairsLeft}\n`);
+      await turn('session.run', { prompt: '上一轮交付门禁未通过。请查看失败输出，修复问题，并重新验证。' });
+    }
     // 记录 Agent 在本轮改过的文件及其修改后哈希，供 undo 精确回滚。
     if (turnCheckpoint && !interrupted) {
       try {
