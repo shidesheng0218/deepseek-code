@@ -37,21 +37,27 @@ export DEEPSEEK_PROJECT="$PWD"
 
 ```text
 deepseek chat                         进入交互式会话（默认命令）
-deepseek ask <prompt>                 执行一次任务
+deepseek ask <prompt>                 执行一次任务（支持 --json）
 deepseek run <prompt>                 ask 的脚本友好别名
-deepseek session list                 列出 Session
-deepseek session resume <id>          恢复 Session
-deepseek session attach <id>          查看 Session 事件日志
-deepseek session fork <id>            从 Session 创建分支
-deepseek session branches <id>        列出 Session 分支
-deepseek session replay <id>          回放 Session
-deepseek doctor                       检查 runtime
+deepseek init                         首次配置引导（交互式）
+deepseek config list|get|set|unset    分层配置（用户级/项目级）
+deepseek doctor [--json]              诊断 runtime、凭据与端点连通性
+deepseek diff [--stat] [--json]       查看工作区变更
+deepseek session list [--json]        列出 Session（轮次/状态/标题）
+deepseek session show <id>            Session 详情（待审批、项目、状态）
+deepseek session search <keyword>     按标题或 ID 搜索
+deepseek session rename <id> <title>  重命名
+deepseek session archive <id>         归档
+deepseek session attach <id>          查看 Session 对话回放
+deepseek session resume <id>          恢复 Session（含待审批续跑）
+deepseek session fork|branches|replay Session 分叉与回放
 deepseek receipt verify <file>        离线校验交付回执
-deepseek --help                       查看完整选项
-deepseek --version                    查看版本
+deepseek --help / --version           帮助与版本
 ```
 
-Session 日志默认保存在 `DEEPSEEK_SESSION_ROOT` 指定的目录；未设置时使用用户数据目录。未知副作用不会自动重放。
+配置优先级：命令行参数 > 环境变量 > 项目 `.deepseek/config.json` > 用户 `~/.config/deepseek/config.json` > 默认值。API Key 只通过环境变量提供，不写入配置文件。
+
+`deepseek ask --json` 输出稳定结构（`sessionID`、`status`、`text`、`delivery`、`tools`、`error`），可供脚本与 `jq` 消费。
 
 ## 本地开发
 

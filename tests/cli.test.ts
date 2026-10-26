@@ -6,8 +6,8 @@ import { spawn } from 'node:child_process';
 import { runSettings } from '../bin/terminal-client.mjs';
 
 describe('CLI settings', () => {
-  it('maps CLI options to runtime params without exposing secrets', () => {
-    const settings = runSettings({ projectPath: '.', model: 'fixture', mode: 'acceptEdits', protocol: 'anthropic-messages', sessionID: 'cli-test' }, { DEEPSEEK_API_KEY: 'secret' });
+  it('maps CLI options to runtime params without exposing secrets', async () => {
+    const settings = await runSettings({ projectPath: '.', model: 'fixture', mode: 'acceptEdits', protocol: 'anthropic-messages', sessionID: 'cli-test' }, { DEEPSEEK_API_KEY: 'secret' });
     expect(settings.projectPath).toBe(process.cwd());
     expect(settings.model).toBe('fixture');
     expect(settings.mode).toBe('accept_edits');
@@ -15,9 +15,9 @@ describe('CLI settings', () => {
     expect(settings).not.toHaveProperty('password');
   });
 
-  it('rejects invalid modes and session IDs', () => {
-    expect(() => runSettings({ mode: 'unsafe' }, { DEEPSEEK_API_KEY: 'secret' })).toThrow('Invalid mode');
-    expect(() => runSettings({ sessionID: 'bad/id' }, { DEEPSEEK_API_KEY: 'secret' })).toThrow('Invalid session ID');
+  it('rejects invalid modes and session IDs', async () => {
+    await expect(runSettings({ mode: 'unsafe' }, { DEEPSEEK_API_KEY: 'secret' })).rejects.toThrow('Invalid mode');
+    await expect(runSettings({ sessionID: 'bad/id' }, { DEEPSEEK_API_KEY: 'secret' })).rejects.toThrow('Invalid session ID');
   });
 });
 
@@ -63,6 +63,59 @@ function cli(args: string[], input = '', runtime = binary): Promise<{ code: numb
   });
 }
 
+describe('CLI config and session commands', () => {
+  it('config list shows defaults with sources', async () => {
+    const result = await cli(['config', 'list']);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('model\tdeepseek-chat\tdefault');
+  });
+  it('session list --json emits a parseable array', async () => {
+    const events = [
+      { sequence: 1, type: 'turn_started', payload: { prompt: 'fix login flow', projectPath: '/tmp/x' } },
+      { sequence: 2, type: 'turn_ended', payload: { status: 'completed' } }
+    ];
+    await writeFile(join(fixture, 'sess-a.jsonl'), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    const result = await cli(['session', 'list', '--json']);
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout) as Array<{ sessionID: string; turns: number; lastStatus: string }>;
+    expect(parsed[0]?.sessionID).toBe('sess-a');
+    expect(parsed[0]?.turns).toBe(1);
+    expect(parsed[0]?.lastStatus).toBe('completed');
+  });
+  it('session show reports pending approvals', async () => {
+    await writeFile(join(fixture, 'sess-b.jsonl'), [
+      { sequence: 1, type: 'turn_started', payload: { prompt: 'p', projectPath: '/tmp/x' } },
+      { sequence: 2, type: 'approval_pending', payload: { approvalID: 'a1', tool: 'run_command' } }
+    ].map((e: Record<string, unknown>) => JSON.stringify(e)).join('\n') + '\n');
+    const result = await cli(['session', 'show', 'sess-b']);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('待审批:    1');
+  });
+  it('session search filters by title', async () => {
+    const result = await cli(['session', 'search', 'login']);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('sess-a');
+  });
+  it('session rename writes meta without touching the log', async () => {
+    const result = await cli(['session', 'rename', 'sess-a', '登录修复']);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(await (await import('node:fs/promises')).readFile(join(fixture, '.meta.json'), 'utf8'))['sess-a'].title).toBe('登录修复');
+  });
+  it('session archive moves the log out of the active list', async () => {
+    const result = await cli(['session', 'archive', 'sess-b']);
+    expect(result.code).toBe(0);
+    const list = JSON.parse((await cli(['session', 'list', '--json'])).stdout) as Array<{ sessionID: string }>;
+    expect(list.some((e) => e.sessionID === 'sess-b')).toBe(false);
+  });
+  it('config set/get round-trips a project-scoped value', async () => {
+    const setResult = await cli(['config', 'set', 'model', 'fixture-model', '--scope', 'project']);
+    expect(setResult.code).toBe(0);
+    const getResult = await cli(['config', 'get', 'model']);
+    expect(getResult.stdout.trim()).toBe('fixture-model');
+    await cli(['config', 'unset', 'model', '--scope', 'project']);
+  });
+});
+
 describe('CLI process integration', () => {
   it('prints streamed text once, without repeating final response', async () => {
     const result = await cli(['ask', 'hello']);
@@ -92,6 +145,42 @@ describe('CLI process integration', () => {
   it('does not hang when the runtime executable is missing', async () => {
     const result = await cli(['ask', 'hello'], '', join(fixture, 'missing'));
     expect(result.code).toBe(1);
+  });
+  it('emits parseable --json output for ask', async () => {
+    const result = await cli(['ask', '--json', 'hello']);
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.status).toBe('completed');
+    expect(parsed.text).toBe('answer:hello');
+    expect(parsed.sessionID).toMatch(/^cli-/);
+  });
+  it('json approval_required exits 2 with parseable output', async () => {
+    const result = await cli(['ask', '--json', 'approve']);
+    expect(result.code).toBe(2);
+  });
+  it('diff --json emits parseable working tree summary', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'deepseek-cli-git-'));
+    const git = (gitArgs: string[]) => new Promise((r, j) => { const c = spawn('git', gitArgs, { cwd: repo }); c.on('close', (code) => code === 0 ? r(undefined) : j(new Error(`git ${gitArgs[0]} exit ${code}`))); c.on('error', j); });
+    await git(['init', '-q']);
+    await writeFile(join(repo, 'a.txt'), 'one\n');
+    await git(['add', '.']);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init']);
+    await writeFile(join(repo, 'a.txt'), 'one\ntwo\n');
+    const diffResult = await new Promise<{ code: number | null; stdout: string }>((resolveResult, rejectRun) => {
+      const c = spawn(process.execPath, [resolve('bin/deepseek.mjs'), 'diff', '--json'], {
+        env: { ...process.env, DEEPSEEK_PROJECT: repo }, stdio: ['pipe', 'pipe', 'pipe']
+      });
+      let stdout = '';
+      c.stdout.on('data', (d) => { stdout += d; });
+      c.on('close', (code) => resolveResult({ code, stdout }));
+      c.on('error', rejectRun);
+      c.stdin.end();
+    });
+    expect(diffResult.code).toBe(0);
+    const parsed = JSON.parse(diffResult.stdout) as { files: Array<{ path: string }>; shortstat: string };
+    expect(parsed.files.some((f) => f.path === 'a.txt')).toBe(true);
+    expect(parsed.shortstat).toContain('1 insertion');
+    await rm(repo, { recursive: true, force: true });
   });
   it('rejects empty piped prompts', async () => {
     expect((await cli(['ask'])).code).toBe(2);

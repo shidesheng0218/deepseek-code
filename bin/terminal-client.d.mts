@@ -7,7 +7,7 @@ export type RunOptions = {
   sessionID?: string;
   fastModel?: string;
 };
-export function runSettings(options?: RunOptions, env?: NodeJS.ProcessEnv): {
+export function runSettings(options?: RunOptions, env?: NodeJS.ProcessEnv, config?: { values: Record<string, string | undefined> }): Promise<{
   sessionID: string;
   projectPath: string;
   baseURL: string;
@@ -16,7 +16,7 @@ export function runSettings(options?: RunOptions, env?: NodeJS.ProcessEnv): {
   protocol: string;
   mode: string;
   fastModel?: string;
-};
+}>;
 export function terminalSession(options: Record<string, unknown>): Promise<void>;
 export class RuntimeClient {
   constructor(binary: string, cwd: string, sessionID: string);

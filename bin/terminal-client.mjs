@@ -9,25 +9,30 @@ function display(value) {
   return String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 }
 
-export function runSettings(options = {}, env = process.env) {
-  const mode = options.mode || env.DEEPSEEK_MODE || 'auto';
-  const protocol = options.protocol || env.DEEPSEEK_PROTOCOL || 'openai-compatible';
-  const normalizedMode = mode === 'acceptEdits' ? 'accept_edits' : mode;
-  if (!['plan', 'manual', 'accept_edits', 'auto'].includes(normalizedMode)) throw new Error(`Invalid mode: ${mode}`);
+export async function runSettings(options = {}, env = process.env, config) {
+  if (!config) {
+    const { loadConfig } = await import('./cli-config.mjs');
+    const projectPath = resolve(options.projectPath || env.DEEPSEEK_PROJECT || process.cwd());
+    config = await loadConfig({ projectPath, env, overrides: options });
+  }
+  const mode = config.values.mode ?? 'auto';
+  const protocol = config.values.protocol ?? 'openai-compatible';
+  if (!['plan', 'manual', 'accept_edits', 'auto'].includes(mode)) throw new Error(`Invalid mode: ${mode}`);
   if (!['openai-compatible', 'anthropic-messages'].includes(protocol)) throw new Error(`Invalid protocol: ${protocol}`);
   const apiKey = env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error('Set DEEPSEEK_API_KEY before starting a session.');
+  if (!apiKey) throw new Error('Set DEEPSEEK_API_KEY before starting a session. Run `deepseek init` for setup guidance.');
   const sessionID = options.sessionID || env.DEEPSEEK_SESSION_ID || `cli-${randomUUID()}`;
   if (!/^[A-Za-z0-9._-]+$/.test(sessionID)) throw new Error('Invalid session ID');
-  const fastModel = options.fastModel || env.DEEPSEEK_FAST_MODEL;
+  const projectPath = resolve(options.projectPath || env.DEEPSEEK_PROJECT || process.cwd());
+  const fastModel = config.values.fastModel;
   return {
     sessionID,
-    projectPath: resolve(options.projectPath || env.DEEPSEEK_PROJECT || process.cwd()),
-    baseURL: options.baseURL || env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1',
+    projectPath,
+    baseURL: config.values.baseURL ?? 'https://api.deepseek.com/v1',
     apiKey,
-    model: options.model || env.DEEPSEEK_MODEL || 'deepseek-chat',
+    model: config.values.model ?? 'deepseek-chat',
     protocol,
-    mode: normalizedMode,
+    mode,
     ...(fastModel ? { fastModel } : {})
   };
 }
@@ -113,7 +118,7 @@ export class RuntimeClient {
   }
 }
 
-export async function terminalSession({ runtime, root, settings, prompt, interactive, pendingApproval }) {
+export async function terminalSession({ runtime, root, settings, prompt, interactive, pendingApproval, json = false }) {
   if (interactive && !process.stdin.isTTY) throw new Error('Interactive chat requires a terminal. Pipe a prompt to deepseek ask instead.');
   // The iterator is created immediately so fast, pasted lines are not lost.
   const input = process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stderr, terminal: true }) : undefined;
@@ -124,6 +129,15 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
     return answer.done ? undefined : answer.value.trim();
   };
   const client = new RuntimeClient(runtime, root, settings.sessionID);
+  const handshake = await client.request('health', {}).then((info) => ({ ok: true, info })).catch((error) => ({ ok: false, error }));
+  if (handshake.ok && handshake.info && typeof handshake.info.protocolVersion === 'number' && handshake.info.protocolVersion > 2) {
+    await client.close();
+    throw new Error(`Runtime protocol v${handshake.info.protocolVersion} is newer than this CLI supports (v2). Upgrade the CLI.`);
+  }
+  if (!handshake.ok) {
+    await client.close();
+    throw handshake.error;
+  }
   let interrupted = false;
   let cancelTimer;
   let active = false;
@@ -139,14 +153,19 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
   input?.on('SIGINT', cancel);
   let streamed = false;
   let approval;
+  let finalResult;
+  let textBuffer = '';
+  const tools = [];
   client.onEvent = (event) => {
     if (event.type === 'assistant_text' && typeof event.text === 'string') {
       streamed = true;
-      process.stdout.write(display(event.text));
+      textBuffer += event.text;
+      if (!json) process.stdout.write(display(event.text));
     } else if (event.type === 'approval_required') approval = event;
-    else if (event.type === 'tool_started') process.stderr.write(`\n[tool] ${display(event.tool)}\n`);
-    else if (event.type === 'model_retrying') process.stderr.write(`\n[retry ${event.attempt}/${event.maxAttempts}] ${display(event.error)}\n`);
-    else if (event.type === 'recovery_attention') process.stderr.write(`\n[attention] ${display(event.message)}\n`);
+    else if (event.type === 'tool_started') { tools.push({ tool: event.tool, id: event.id }); if (!json) process.stderr.write(`\n[tool] ${display(event.tool)}\n`); }
+    else if (event.type === 'tool_completed' || event.type === 'tool_failed') { const t = tools.find((item) => item.id === event.id); if (t) t.ok = event.type === 'tool_completed'; }
+    else if (event.type === 'model_retrying' && !json) process.stderr.write(`\n[retry ${event.attempt}/${event.maxAttempts}] ${display(event.error)}\n`);
+    else if (event.type === 'recovery_attention' && !json) process.stderr.write(`\n[attention] ${display(event.message)}\n`);
   };
   async function turn(method, extra) {
     while (!interrupted) {
@@ -156,8 +175,11 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
       let result;
       try { result = await client.request(method, { ...settings, ...extra }); }
       finally { active = false; }
-      if (!streamed && typeof result?.text === 'string') process.stdout.write(display(result.text));
-      if (streamed || result?.text) process.stdout.write('\n');
+      finalResult = result;
+      if (!json) {
+        if (!streamed && typeof result?.text === 'string') process.stdout.write(display(result.text));
+        if (streamed || result?.text) process.stdout.write('\n');
+      }
       if (result?.status !== 'waiting_approval') {
         if (result?.status === 'cancelled') process.exitCode = 1;
         return;
@@ -184,6 +206,17 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
       if (!interrupted) await turn('session.resolveApproval', { approvalID: pendingApproval.approvalID, decision: /^(y|yes)$/i.test(answer || '') ? 'allow' : 'deny' });
     }
     if (prompt && !interrupted) await turn('session.run', { prompt });
+    if (json && !interactive && !interrupted) {
+      const status = finalResult?.status ?? 'unknown';
+      process.stdout.write(JSON.stringify({
+        sessionID: settings.sessionID,
+        status,
+        text: typeof finalResult?.text === 'string' ? finalResult.text : (textBuffer || null),
+        delivery: finalResult?.delivery ?? null,
+        tools,
+        error: null
+      }, null, 2) + '\n');
+    }
     if (interactive) {
       process.stderr.write('DeepSeek Code · /help for commands · Ctrl+C to cancel\n');
       while (!interrupted) {
