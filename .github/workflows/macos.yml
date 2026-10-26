@@ -11,7 +11,7 @@ on:
         default: "0.2.0"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-and-release:
@@ -57,3 +57,15 @@ jobs:
             dist/DeepSeek-Code-*.tar.gz
             dist/SHA256SUMS.txt
             dist/release-metadata.json
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          assets=(dist/DeepSeek-Code-*.tar.gz dist/SHA256SUMS.txt dist/release-metadata.json)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --generate-notes --title "DeepSeek Code CLI ${{ steps.version.outputs.version }}"
+          fi
