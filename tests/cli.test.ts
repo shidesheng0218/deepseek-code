@@ -171,6 +171,32 @@ describe('CLI checkpoints', () => {
   });
 });
 
+describe('CLI permissions store', () => {
+  it('add/list/remove round-trips a project rule', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'deepseek-perm-'));
+    const { loadPermissionRules, addPermissionRule, removePermissionRule, isAllowedByRule } = await import('../bin/permissions-store.mjs');
+    await addPermissionRule(repo, 'run_command');
+    expect(await loadPermissionRules(repo)).toContain('run_command');
+    expect(isAllowedByRule(await loadPermissionRules(repo), 'run_command')).toBe(true);
+    expect(isAllowedByRule(await loadPermissionRules(repo), 'apply_patch')).toBe(false);
+    await removePermissionRule(repo, 'run_command');
+    expect(await loadPermissionRules(repo)).toHaveLength(0);
+    await rm(repo, { recursive: true, force: true });
+  });
+  it('session export renders markdown transcript', async () => {
+    await writeFile(join(fixture, 'sess-export.jsonl'), [
+      { sequence: 1, type: 'turn_started', payload: { prompt: 'fix bug' } },
+      { sequence: 2, type: 'assistant_text', payload: { text: 'done' } },
+      { sequence: 3, type: 'turn_ended', payload: { status: 'completed' } }
+    ].map((e: Record<string, unknown>) => JSON.stringify(e)).join('\n') + '\n');
+    const result = await cli(['session', 'export', 'sess-export']);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('# Session sess-export');
+    expect(result.stdout).toContain('fix bug');
+    expect(result.stdout).toContain('done');
+  });
+});
+
 describe('CLI process integration', () => {
   it('prints streamed text once, without repeating final response', async () => {
     const result = await cli(['ask', 'hello']);

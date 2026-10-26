@@ -121,7 +121,7 @@ export class RuntimeClient {
   }
 }
 
-export async function terminalSession({ runtime, root, settings, prompt, interactive, pendingApproval, json = false }) {
+export async function terminalSession({ runtime, root, settings, prompt, interactive, pendingApproval, json = false, streamJson = false }) {
   if (interactive && !process.stdin.isTTY) throw new Error('Interactive chat requires a terminal. Pipe a prompt to deepseek ask instead.');
   const { createCheckpoint } = await import('./checkpoint.mjs');
   let turnCheckpoint = null;
@@ -165,12 +165,13 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
   let textBuffer = '';
   const tools = [];
   client.onEvent = (event) => {
+    if (streamJson) { process.stdout.write(JSON.stringify({ sessionID: settings.sessionID, event }) + '\n'); }
     if (event.type === 'assistant_text' && typeof event.text === 'string') {
       streamed = true;
       textBuffer += event.text;
-      if (!json) process.stdout.write(display(event.text));
+      if (!json && !streamJson) process.stdout.write(display(event.text));
     } else if (event.type === 'approval_required') approval = event;
-    else if (event.type === 'tool_started') { tools.push({ tool: event.tool, id: event.id }); if (!json) process.stderr.write(`\n[tool] ${display(event.tool)}\n`); }
+    else if (event.type === 'tool_started') { tools.push({ tool: event.tool, id: event.id }); if (!json && !streamJson) process.stderr.write(`\n[tool] ${display(event.tool)}\n`); }
     else if (event.type === 'tool_completed' || event.type === 'tool_failed') { const t = tools.find((item) => item.id === event.id); if (t) t.ok = event.type === 'tool_completed'; }
     else if (event.type === 'model_retrying' && !json) process.stderr.write(`\n[retry ${event.attempt}/${event.maxAttempts}] ${display(event.error)}\n`);
     else if (event.type === 'recovery_attention' && !json) process.stderr.write(`\n[attention] ${display(event.message)}\n`);
@@ -209,11 +210,25 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
         process.exitCode = 3;
         return;
       }
+      const { loadPermissionRules, addPermissionRule, isAllowedByRule } = await import('./permissions-store.mjs');
+      const rules = await loadPermissionRules(settings.projectPath).catch(() => []);
+      if (isAllowedByRule(rules, approval.tool)) {
+        process.stderr.write(`[auto-allowed by project rule] ${display(approval.tool)}\n`);
+        method = 'session.resolveApproval';
+        extra = { approvalID: approval.id, decision: 'allow' };
+        continue;
+      }
       process.stderr.write(`\nApproval: ${display(approval.tool)} (${display(approval.risk)})\n${display(approval.preview || '')}\n`);
-      const answer = await question('Allow this operation? [y/N] ');
+      const answer = await question('Allow? [y]es / [n]o / [a]lways for this project: ');
       if (interrupted) return;
+      const normalized = (answer || '').toLowerCase();
+      const decision = normalized === 'a' || normalized === 'always' || normalized === 'y' || normalized === 'yes' ? 'allow' : 'deny';
+      if (normalized === 'a' || normalized === 'always') {
+        await addPermissionRule(settings.projectPath, approval.tool).catch(() => undefined);
+        process.stderr.write(`规则已保存：本项目始终允许 ${display(approval.tool)}（deepseek permissions remove 可撤销）\n`);
+      }
       method = 'session.resolveApproval';
-      extra = { approvalID: approval.id, decision: /^(y|yes)$/i.test(answer || '') ? 'allow' : 'deny' };
+      extra = { approvalID: approval.id, decision };
     }
   }
   try {
@@ -269,16 +284,75 @@ export async function terminalSession({ runtime, root, settings, prompt, interac
     }
     if (interactive) {
       process.stderr.write('DeepSeek Code · /help for commands · Ctrl+C to cancel\n');
+      let sessionUsage = { input: 0, output: 0, cost: 0 };
+      const baseOnEvent = client.onEvent;
+      client.onEvent = (event) => {
+        if (event.type === 'usage_recorded') {
+          sessionUsage.input += typeof event.inputTokens === 'number' ? event.inputTokens : 0;
+          sessionUsage.output += typeof event.outputTokens === 'number' ? event.outputTokens : 0;
+          sessionUsage.cost += typeof event.estimatedCost === 'number' ? event.estimatedCost : 0;
+        }
+        baseOnEvent(event);
+      };
       while (!interrupted) {
         const text = await question('\n你 > ');
         if (text === undefined || text === '/exit' || text === '/quit') break;
         if (!text) continue;
-        if (text === '/help') { process.stderr.write('/exit /quit: close · /session: session ID · /mode <mode>: permissions · /help: help\nOther slash commands are sent to project skills.\n'); continue; }
+        if (text === '/help') { process.stderr.write('/exit /quit 退出 · /session 会话 ID · /clear 新会话 · /mode <mode> 权限模式 · /model <name> 换模型 · /cost 用量 · /diff 变更 · /undo 撤销上轮 · /review 审查 · /help 帮助\n其他斜杠命令按项目 skills 处理。\n'); continue; }
         if (text === '/session') { process.stderr.write(`${settings.sessionID}\n`); continue; }
+        if (text === '/clear') {
+          settings.sessionID = `cli-${randomUUID()}`;
+          client.sessionID = settings.sessionID;
+          textBuffer = '';
+          process.stderr.write(`新会话：${settings.sessionID}\n`);
+          continue;
+        }
+        if (text === '/cost') { process.stderr.write(`输入 ${sessionUsage.input} tokens · 输出 ${sessionUsage.output} tokens · 估算成本 $${sessionUsage.cost.toFixed(4)}\n`); continue; }
+        if (text === '/diff') {
+          const { execFileSync } = await import('node:child_process');
+          try { process.stdout.write(execFileSync('git', ['diff', '--stat', 'HEAD'], { cwd: settings.projectPath, encoding: 'utf8' })); }
+          catch { process.stderr.write('（不是 git 仓库或无变更）\n'); }
+          continue;
+        }
+        if (text === '/undo') {
+          if (!turnCheckpoint) { process.stderr.write('本轮没有可撤销的检查点。\n'); continue; }
+          const { undoCheckpoint } = await import('./checkpoint.mjs');
+          try {
+            const cpFile = join(settings.projectPath, '.deepseek', 'checkpoints', `${turnCheckpoint}.json`);
+            const changesFile = join(settings.projectPath, '.deepseek', 'checkpoints', `${turnCheckpoint}.changes.json`);
+            const cp = JSON.parse(await readFile(cpFile, 'utf8'));
+            const agentAfter = JSON.parse(await readFile(changesFile, 'utf8')).agentAfter ?? {};
+            const { restored, conflicts } = await undoCheckpoint({ checkpoint: cp, agentAfter });
+            if (conflicts.length) process.stderr.write(`冲突未撤销：${conflicts.join(', ')}\n`);
+            process.stderr.write(restored.length ? `已恢复：${restored.join(', ')}\n` : '没有需要恢复的文件。\n');
+          } catch { process.stderr.write('撤销失败：检查点记录不存在。\n'); }
+          continue;
+        }
+        if (text === '/review') {
+          const { execFileSync } = await import('node:child_process');
+          let diffText = '';
+          try { diffText = execFileSync('git', ['diff', 'HEAD'], { cwd: settings.projectPath, encoding: 'utf8', maxBuffer: 10_000_000 }); } catch { /* ignore */ }
+          if (!diffText.trim()) { process.stderr.write('工作区无变更。\n'); continue; }
+          await turn('session.run', { prompt: `以只读方式审查以下 diff，按 critical/warning/note 分级列出发现，不要修改文件：\n\`\`\`diff\n${diffText.slice(0, 40000)}\n\`\`\`` });
+          continue;
+        }
+        if (text.startsWith('/model ')) {
+          const model = text.slice(7).trim();
+          if (!model) process.stderr.write(`当前模型：${settings.model}\n`);
+          else { settings.model = model; process.stderr.write(`模型切换为：${model}\n`); }
+          continue;
+        }
         if (text.startsWith('/mode ')) {
           const mode = text.slice(6).trim().replace('acceptEdits', 'accept_edits');
           if (!['plan', 'manual', 'accept_edits', 'auto'].includes(mode)) process.stderr.write('Mode must be plan, manual, accept_edits or auto.\n');
           else { settings.mode = mode; process.stderr.write(`Mode: ${mode}\n`); }
+          continue;
+        }
+        // Agent 正在运行时用户输入 → 排队进同一 Session Inbox，不丢失。
+        if (active) {
+          void client.request('session.enqueue', { ...settings, prompt: text }).then(() => {
+            process.stderr.write('[queued] 已加入当前会话队列\n');
+          }).catch((error) => process.stderr.write(`[queue failed] ${display(error.message)}\n`));
           continue;
         }
         await turn('session.run', { prompt: text });

@@ -1,7 +1,7 @@
 import { readFile, realpath } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 
-const instructionNames = ['AGENTS.md', 'CLAUDE.md', '.deepseek.md'];
+const instructionNames = ['DEEPSEEK.md', 'AGENTS.md', 'CLAUDE.md', '.deepseek.md'];
 const maxInstructionBytes = 32_000;
 
 export async function loadProjectInstructions(workspacePath: string, projectRoot = workspacePath): Promise<string> {

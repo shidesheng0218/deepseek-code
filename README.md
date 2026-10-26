@@ -52,6 +52,10 @@ deepseek task cancel <ticket-id>      取消任务
 deepseek mcp list [--json]            项目 MCP 服务器（密钥脱敏）
 deepseek skills list [--json]         可用 skills
 deepseek detect                       检测项目 test/build/lint/typecheck 命令
+deepseek permissions list|add|remove  项目级持久放行规则（审批时选 [a]lways 自动写入）
+deepseek preset deepseek|bailian|anthropic  一键应用 Provider 预设
+deepseek completion zsh|bash          生成 shell 补全脚本
+deepseek session export <id>          导出 Session 为 Markdown（--json 导出原始事件）
 deepseek session list [--json]        列出 Session（轮次/状态/标题）
 deepseek session show <id>            Session 详情（待审批、项目、状态）
 deepseek session search <keyword>     按标题或 ID 搜索
@@ -67,6 +71,8 @@ deepseek --help / --version           帮助与版本
 配置优先级：命令行参数 > 环境变量 > 项目 `.deepseek/config.json` > 用户 `~/.config/deepseek/config.json` > 默认值。API Key 只通过环境变量提供，不写入配置文件。
 
 `deepseek ask --json` 输出稳定结构（`sessionID`、`status`、`text`、`delivery`、`tools`、`error`），可供脚本与 `jq` 消费。
+
+交互会话内支持斜杠命令：`/model` `/mode` `/cost` `/diff` `/undo` `/review` `/clear` `/session` `/help`；Agent 运行中的输入自动排队进会话（不丢失）。`deepseek doctor` 会顺带检查 GitHub 最新版本并提示升级。`--stream-json` 逐事件输出 JSON 行，供编辑器/IDE 集成。
 
 退出码：`0` 正常完成；`1` 执行失败或运行时崩溃；`2` 参数/配置错误；`3` 需要人工审批（非交互模式）；`4` 用户取消；`5` CLI 与 Runtime 协议不兼容；`6` 交付门禁未通过（needsRepair/needsAttention）。
 

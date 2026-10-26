@@ -31,6 +31,7 @@ function printHelp(stream = process.stdout) {
     '  deepseek undo <checkpoint-id>              Revert agent changes safely\n' +
     '  deepseek review [--json]                   Read-only review of the working tree diff\n' +
     '  deepseek task submit|list|cancel           Background task queue\n' +
+    '  deepseek permissions list|add|remove       Persistent allow rules (per project)\n' +
     '  deepseek mcp list [--json]                 Configured MCP servers (secrets masked)\n' +
     '  deepseek skills list [--json]              Available skills\n' +
     '  deepseek detect                            Detect project test/build/lint commands\n' +
@@ -56,7 +57,7 @@ function usage() {
 }
 
 function parseRunOptions(args) {
-  const options = { projectPath: undefined, model: undefined, baseURL: undefined, protocol: undefined, mode: undefined, sessionID: undefined, fastModel: undefined, json: false, repairAttempts: undefined, verify: false };
+  const options = { projectPath: undefined, model: undefined, baseURL: undefined, protocol: undefined, mode: undefined, sessionID: undefined, fastModel: undefined, json: false, streamJson: false, repairAttempts: undefined, verify: false };
   const prompt = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -64,6 +65,7 @@ function parseRunOptions(args) {
     if (arg === '--') { prompt.push(...args.slice(index + 1)); break; }
     if (arg === '-h' || arg === '--help') { printHelp(); process.exit(0); }
     if (arg === '--json') { options.json = true; continue; }
+    if (arg === '--stream-json') { options.streamJson = true; continue; }
     if (arg === '--verify') { options.verify = true; continue; }
     if (arg === '--repair-attempts') { options.repairAttempts = Number.parseInt(next, 10); if (!Number.isFinite(options.repairAttempts)) usage(); index += 1; continue; }
     if (arg === '--project') options.projectPath = next;
@@ -219,6 +221,18 @@ async function doctor({ json = false } = {}) {
   }
   add('endpoint', endpointOk, `${values.baseURL} → ${endpointDetail}`, endpointOk ? 'ok' : 'fail');
 
+  // 更新检查：访问 GitHub latest release，失败不阻塞诊断
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const rel = await fetch('https://api.github.com/repos/shidesheng0218/deepseek-code/releases/latest', { signal: controller.signal, headers: { 'user-agent': 'deepseek-code-cli' } }).finally(() => clearTimeout(timer));
+    if (rel.ok) {
+      const latest = (await rel.json()).tag_name?.replace(/^v/, '');
+      const outdated = latest && latest !== version && latest.localeCompare(version, undefined, { numeric: true }) > 0;
+      add('update', !outdated, outdated ? `有新版本 v${latest}（当前 v${version}）→ 到 Releases 下载` : `已是最新 v${version}`, outdated ? 'warn' : 'ok');
+    }
+  } catch { add('update', true, '更新检查不可用（离线）', 'warn'); }
+
   const browserDir = process.env.DEEPSEEK_BROWSER_RUNTIME_DIR;
   add('browser-runtime', Boolean(browserDir), browserDir ? browserDir : 'optional; set DEEPSEEK_BROWSER_RUNTIME_DIR for Browser Evidence', browserDir ? 'ok' : 'warn');
 
@@ -249,6 +263,16 @@ async function initCommand() {
     await setConfigValue('protocol', protocol, { scope, projectPath: process.cwd() });
     if (!process.env.DEEPSEEK_API_KEY) {
       process.stderr.write('\n未检测到 DEEPSEEK_API_KEY。请在 shell 中设置：\n  export DEEPSEEK_API_KEY="sk-..."\n');
+    }
+    // 生成项目指令文件初版（已存在则跳过）
+    const instructionFile = join(process.cwd(), 'DEEPSEEK.md');
+    const exists = await access(instructionFile).then(() => true).catch(() => false);
+    if (!exists) {
+      const pkgRaw = await readFile(join(process.cwd(), 'package.json'), 'utf8').catch(() => '');
+      const pkg = pkgRaw ? JSON.parse(pkgRaw) : null;
+      const scriptsLine = pkg?.scripts ? Object.keys(pkg.scripts).map((k) => `- \`npm run ${k}\``).join('\n') : '- （待补充）';
+      await writeFile(instructionFile, `# 项目指令\n\n## 构建与测试\n${scriptsLine}\n\n## 约定\n- （待补充：目录结构、代码风格、禁止事项）\n`, 'utf8');
+      process.stderr.write('\n已生成 DEEPSEEK.md 初版，请补充项目约定。\n');
     }
     process.stderr.write('\n配置已保存。运行 deepseek doctor 验证。\n');
     await doctor({});
@@ -365,8 +389,21 @@ async function showSession(sessionID, { json = false } = {}) {
   const id = safeSessionID(sessionID);
   const entry = (await sessionEntries()).find((item) => item.sessionID === id);
   if (!entry) { process.stderr.write('Session not found\n'); process.exit(1); }
+  const text = await readFile(join(sessionsRoot, `${id}.jsonl`), 'utf8');
+  let inputTokens = 0; let outputTokens = 0; let cost = 0;
+  for (const line of text.split('\n')) {
+    try {
+      const event = JSON.parse(line);
+      if (event.type === 'usage_recorded') {
+        inputTokens += typeof event.payload?.inputTokens === 'number' ? event.payload.inputTokens : 0;
+        outputTokens += typeof event.payload?.outputTokens === 'number' ? event.payload.outputTokens : 0;
+        cost += typeof event.payload?.estimatedCost === 'number' ? event.payload.estimatedCost : 0;
+      }
+    } catch { /* ignore partial lines */ }
+  }
+  entry.usage = { inputTokens, outputTokens, estimatedCost: cost };
   if (json) { process.stdout.write(JSON.stringify(entry, null, 2) + '\n'); return; }
-  process.stdout.write(`Session:   ${entry.sessionID}\n标题:      ${entry.title}\n项目:      ${entry.projectPath ?? '-'}\n轮次:      ${entry.turns}\n状态:      ${entry.lastStatus ?? '-'}\n待审批:    ${entry.pendingApprovals}\n更新时间:  ${entry.updatedAt ?? '-'}\n`);
+  process.stdout.write(`Session:   ${entry.sessionID}\n标题:      ${entry.title}\n项目:      ${entry.projectPath ?? '-'}\n轮次:      ${entry.turns}\n状态:      ${entry.lastStatus ?? '-'}\n待审批:    ${entry.pendingApprovals}\n用量:      输入 ${inputTokens} / 输出 ${outputTokens} tokens · $${cost.toFixed(4)}\n更新时间:  ${entry.updatedAt ?? '-'}\n`);
 }
 
 async function searchSessions(keyword) {
@@ -390,6 +427,29 @@ async function renameSession(sessionID, title) {
   meta[id] = { ...(meta[id] ?? {}), title };
   await writeFile(metaFile, JSON.stringify(meta, null, 2) + '\n', { mode: 0o600 });
   process.stdout.write(`${id}\t${title}\n`);
+}
+
+async function exportSession(sessionID, format = 'md') {
+  const id = safeSessionID(sessionID);
+  const file = join(sessionsRoot, `${id}.jsonl`);
+  const text = await readFile(file, 'utf8').catch(() => '');
+  if (!text) { process.stderr.write('Session not found\n'); process.exit(1); }
+  const events = text.split('\n').filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
+  if (format === 'json') { process.stdout.write(JSON.stringify(events, null, 2) + '\n'); return; }
+  let out = `# Session ${id}\n\n`;
+  let assistant = '';
+  const flush = () => { if (assistant) { out += `**DeepSeek**：${assistant}\n\n`; assistant = ''; } };
+  for (const event of events) {
+    const p = event.payload ?? {};
+    if (event.type === 'turn_started') { flush(); out += `## 你\n\n${p.prompt ?? ''}\n\n`; }
+    else if (event.type === 'assistant_text' && typeof p.text === 'string') assistant += p.text;
+    else if (event.type === 'turn_ended') flush();
+    else if (event.type === 'tool_completed' && p.tool) out += `> 工具 \`${p.tool}\` ${p.ok === false ? '✗' : '✓'}\n\n`;
+    else if (event.type === 'verification_passed') out += `> ✓ 验证通过：${p.command ?? p.kind ?? ''}\n\n`;
+    else if (event.type === 'delivery_evaluated') out += `> 交付门禁：${p.state}\n\n`;
+  }
+  flush();
+  process.stdout.write(out);
 }
 
 async function archiveSession(sessionID) {
@@ -434,7 +494,7 @@ async function resumeSession(sessionID, options = {}) {
 
 async function runPrompt(prompt, options = {}) {
   const settings = await runSettings(options);
-  await terminalSession({ runtime, root, settings, prompt, interactive: false, json: options.json });
+  await terminalSession({ runtime, root, settings, prompt, interactive: false, json: options.json, streamJson: options.streamJson });
 }
 
 async function interactive(options = {}) {
@@ -517,6 +577,41 @@ async function reviewCommand(args) {
 
 export const EXIT = { ok: 0, error: 1, usage: 2, approval: 3, cancelled: 4, incompatible: 5, gateFailed: 6 };
 
+const PROVIDER_PRESETS = {
+  deepseek: { baseURL: 'https://api.deepseek.com/v1', protocol: 'openai-compatible', model: 'deepseek-chat' },
+  bailian: { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1', protocol: 'openai-compatible', model: 'qwen-plus' },
+  anthropic: { baseURL: 'https://api.anthropic.com', protocol: 'anthropic-messages', model: 'claude-sonnet-4-5' },
+};
+
+async function presetCommand(args) {
+  const name = args[0];
+  if (!name || !PROVIDER_PRESETS[name]) {
+    process.stderr.write(`Usage: deepseek preset <${Object.keys(PROVIDER_PRESETS).join('|')}> [--scope user|project]\n`);
+    process.exit(2);
+  }
+  const parsed = parseScope(args.slice(1));
+  const preset = PROVIDER_PRESETS[name];
+  for (const [key, value] of Object.entries(preset)) await setConfigValue(key, value, { scope: parsed.scope, projectPath: process.cwd() });
+  process.stdout.write(`已应用预设 ${name}（${parsed.scope}）：${preset.baseURL} · ${preset.model} · ${preset.protocol}\n`);
+  process.stdout.write('记得设置对应的 DEEPSEEK_API_KEY。\n');
+}
+
+async function permissionsCommand(args) {
+  const [sub, ...rest] = args;
+  const projectPath = resolvePath(process.env.DEEPSEEK_PROJECT || process.cwd());
+  const { loadPermissionRules, addPermissionRule, removePermissionRule } = await import('./permissions-store.mjs');
+  if (sub === 'list' || !sub) {
+    const rules = await loadPermissionRules(projectPath);
+    if (rules.length === 0) { process.stdout.write('（本项目无持久放行规则）\n'); return; }
+    for (const rule of rules) process.stdout.write(`${rule}\n`);
+    return;
+  }
+  if (sub === 'add' && rest[0]) { await addPermissionRule(projectPath, rest[0]); process.stdout.write(`已放行：${rest[0]}\n`); return; }
+  if (sub === 'remove' && rest[0]) { await removePermissionRule(projectPath, rest[0]); process.stdout.write(`已移除：${rest[0]}\n`); return; }
+  process.stderr.write('Usage: deepseek permissions [list] | add <tool> | remove <tool>\n');
+  process.exit(2);
+}
+
 async function taskCommand(args) {
   const [sub, ...rest] = args;
   if (sub === 'submit') {
@@ -540,13 +635,22 @@ async function taskCommand(args) {
     for (const t of tickets) process.stdout.write(`${t.ticketID}\t${t.state}\tP${t.priority}\t${t.prompt.slice(0, 56)}\n`);
     return;
   }
+  if (sub === 'show' && rest[0]) {
+    const response = await requestSidecar('task.list', {});
+    if (!response.ok) { process.stderr.write(`${response.error ?? 'list failed'}\n`); process.exit(1); }
+    const ticket = (response.result.tickets ?? []).find((t) => t.ticketID === rest[0]);
+    if (!ticket) { process.stderr.write('Ticket not found\n'); process.exit(1); }
+    if (rest.includes('--json')) { process.stdout.write(JSON.stringify(ticket, null, 2) + '\n'); return; }
+    process.stdout.write(`Ticket: ${ticket.ticketID}\n状态:   ${ticket.state}\n优先级: ${ticket.priority}\n任务:   ${ticket.prompt}\n创建:   ${ticket.createdAt}\n更新:   ${ticket.updatedAt}${ticket.error ? `\n错误:   ${ticket.error}` : ''}\n`);
+    return;
+  }
   if (sub === 'cancel' && rest[0]) {
     const response = await requestSidecar('task.cancel', { ticketID: rest[0] });
     if (!response.ok) { process.stderr.write(`${response.error ?? 'cancel failed'}\n`); process.exit(1); }
     process.stdout.write(`${response.result.ticketID}\t${response.result.state}\n`);
     return;
   }
-  process.stderr.write('Usage: deepseek task submit [--priority N] <prompt> | list [--json] | cancel <ticket-id>\n');
+  process.stderr.write('Usage: deepseek task submit [--priority N] <prompt> | list [--json] | show <ticket-id> [--json] | cancel <ticket-id>\n');
   process.exit(2);
 }
 
@@ -581,6 +685,21 @@ async function skillsCommand(args) {
     return;
   }
   process.stderr.write('Usage: deepseek skills list [--json]\n');
+  process.exit(2);
+}
+
+async function completionCommand(shell) {
+  const name = 'deepseek';
+  const commands = ['chat', 'ask', 'run', 'init', 'config', 'doctor', 'diff', 'checkpoint', 'undo', 'review', 'task', 'mcp', 'skills', 'detect', 'session', 'permissions', 'receipt', 'completion', '--help', '--version'];
+  if (shell === 'zsh') {
+    process.stdout.write(`#compdef ${name}\n_${name}() {\n  local -a cmds\n  cmds=(${commands.map((c) => `'${c}'`).join(' ')})\n  _describe 'command' cmds\n}\n_${name} "$@"\n`);
+    return;
+  }
+  if (shell === 'bash') {
+    process.stdout.write(`_${name}() {\n  local cur="\${COMP_WORDS[COMP_CWORD]}"\n  COMPREPLY=( $(compgen -W "${commands.join(' ')}" -- "$cur") )\n}\ncomplete -F _${name} ${name}\n`);
+    return;
+  }
+  process.stderr.write('Usage: deepseek completion zsh|bash\n');
   process.exit(2);
 }
 
@@ -622,9 +741,12 @@ try {
   else if (command === 'undo' && args[0]) await checkpointCommand(['undo', args[0]]);
   else if (command === 'review') await reviewCommand(args);
   else if (command === 'task') await taskCommand(args);
+  else if (command === 'permissions') await permissionsCommand(args);
+  else if (command === 'preset') await presetCommand(args);
   else if (command === 'mcp') await mcpCommand(args);
   else if (command === 'skills') await skillsCommand(args);
   else if (command === 'detect') await detectCommand();
+  else if (command === 'completion') await completionCommand(args[0]);
   else if (command === 'ask' || command === 'run') {
     const parsed = parseRunOptions(args);
     if (!parsed.prompt) {
@@ -638,6 +760,7 @@ try {
   else if (command === 'session' && args[0] === 'search' && args[1]) await searchSessions(args[1]);
   else if (command === 'session' && args[0] === 'rename' && args[1] && args[2]) await renameSession(args[1], args.slice(2).join(' '));
   else if (command === 'session' && args[0] === 'archive' && args[1]) await archiveSession(args[1]);
+  else if (command === 'session' && args[0] === 'export' && args[1]) await exportSession(args[1], args.includes('--json') ? 'json' : 'md');
   else if (command === 'session' && args[0] === 'attach' && args[1]) await attachSession(args[1]);
   else if (command === 'session' && args[0] === 'resume' && args[1]) {
     const parsed = parseRunOptions(args.slice(2));

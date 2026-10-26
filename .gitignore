@@ -22,3 +22,4 @@ test-results/
 playwright-report/
 .deepseek/config.json
 .deepseek/checkpoints/
+.deepseek/permissions.json
