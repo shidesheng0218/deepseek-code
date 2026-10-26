@@ -32,7 +32,7 @@ fs.writeFileSync(file, JSON.stringify(manifest, null, 2) + '\n')
 NODE
 chmod +x "$stage/bin/deepseek.mjs" "$stage/apps/deepseek-agent-runtime/dist/deepseek-agent-runtime"
 tar -C "$work" -czf "$artifact" deepseek-code-cli
-shasum -a 256 "$artifact" > "$release_dir/SHA256SUMS.txt"
+(cd "$release_dir" && shasum -a 256 "$(basename "$artifact")" > SHA256SUMS.txt)
 node - "$release_dir/release-metadata.json" "$version" "$(basename "$artifact")" "$(git -C "$root" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" <<'NODE'
 const fs = require('fs')
 const [output, version, artifact, revision] = process.argv.slice(2)
